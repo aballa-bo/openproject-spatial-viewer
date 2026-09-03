@@ -1,0 +1,174 @@
+<% html_title "#{@spatial_model.title} - 3D Viewer" %>
+
+<div class="spatial-viewer-app" id="spatialViewerApp" data-api-url="<%= api_data_project_spatial_model_path(@project, @spatial_model) %>" data-csrf-token="<%= form_authenticity_token %>">
+
+  <div class="spatial-toolbar">
+    <div class="toolbar-section toolbar-title-group">
+      <a href="<%= project_spatial_models_path(@project) %>" class="toolbar-btn" title="Back to models list">
+        <i class="icon-arrow-left1"></i>
+      </a>
+      <span class="toolbar-model-title"><%= @spatial_model.title %></span>
+      <span class="badge -primary"><%= @spatial_model.model_format.upcase %></span>
+    </div>
+
+    <div class="toolbar-section">
+      <button type="button" class="toolbar-btn" id="btnHome" title="Reset Initial View (Home)">
+        <i class="icon-home"></i>
+      </button>
+      <button type="button" class="toolbar-btn" id="btnFit" title="Fit to View">
+        <i class="icon-zoom-in"></i>
+      </button>
+      <div class="toolbar-dropdown">
+        <button type="button" class="toolbar-btn" id="btnViews" title="Preset Views">
+          <i class="icon-op-view-threed"></i> Views <i class="icon-arrow-down1"></i>
+        </button>
+        <div class="toolbar-dropdown-menu" id="viewsDropdownMenu">
+          <a href="#" data-view="top">Top View</a>
+          <a href="#" data-view="front">Front View</a>
+          <a href="#" data-view="right">Right View</a>
+          <a href="#" data-view="iso">Isometric (3D Iso)</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="toolbar-section toolbar-tools-group">
+      <button type="button" class="toolbar-btn tool-btn" id="toolOrbit" title="Navigate / Orbit Camera" data-tool="orbit">
+        <i class="icon-cursor-move"></i> Navigate
+      </button>
+      <button type="button" class="toolbar-btn tool-btn" id="toolPin" title="Place 3D Pin on Surface" data-tool="pin">
+        <i class="icon-milestone"></i> 3D Pin
+      </button>
+      <button type="button" class="toolbar-btn tool-btn" id="toolDraw" title="Draw Polyline on 3D Mesh" data-tool="draw">
+        <i class="icon-edit"></i> Draw on Mesh
+      </button>
+      <button type="button" class="toolbar-btn tool-btn" id="toolLasso" title="Lasso / Region Selection on Mesh" data-tool="lasso">
+        <i class="icon-target"></i> Mesh Lasso
+      </button>
+      <button type="button" class="toolbar-btn tool-btn" id="toolMeasure" title="Measure 3D Distance" data-tool="measure">
+        <i class="icon-ruler"></i> Measure
+      </button>
+      <button type="button" class="toolbar-btn text-danger" id="toolClear" title="Clear Active Drawing">
+        <i class="icon-delete"></i>
+      </button>
+    </div>
+
+    <div class="toolbar-section">
+      <button type="button" class="toolbar-btn" id="btnSliceToggle" title="3D Section & Clipping Planes">
+        <i class="icon-scissors"></i> Sections
+      </button>
+      <button type="button" class="toolbar-btn" id="btnWireframe" title="Toggle Wireframe">
+        <i class="icon-grid"></i>
+      </button>
+      <button type="button" class="toolbar-btn" id="btnSidePanelToggle" title="Toggle Side Panel">
+        <i class="icon-task"></i> Tickets & Annotations (<span id="annotationCountHeader"><%= @annotations.count %></span>)
+      </button>
+    </div>
+  </div>
+
+  <div class="spatial-main-container">
+    <div class="spatial-viewport" id="spatialViewport">
+      <div class="viewer-loader" id="viewerLoader">
+        <div class="spinner"></div>
+        <div class="loader-text" id="loaderText">Loading 3D model...</div>
+      </div>
+
+      <div class="slicing-panel" id="slicingPanel" style="display: none;">
+        <div class="slicing-header">
+          <span>3D Section Planes</span>
+          <button type="button" class="close-btn" id="closeSliceBtn">&times;</button>
+        </div>
+        <div class="slicing-body">
+          <label>X Plane: <input type="range" id="clipX" min="-50" max="50" value="50" step="0.5"></label>
+          <label>Y Plane: <input type="range" id="clipY" min="-50" max="50" value="50" step="0.5"></label>
+          <label>Z Plane: <input type="range" id="clipZ" min="-50" max="50" value="50" step="0.5"></label>
+          <button type="button" class="button -small" id="resetClipBtn">Reset Sections</button>
+        </div>
+      </div>
+
+      <div class="drawing-tooltip" id="drawingTooltip" style="display: none;">
+        Click on the mesh surface to place a point or drag to draw.
+      </div>
+
+      <canvas id="threeCanvas" class="three-canvas"></canvas>
+    </div>
+
+    <div class="spatial-side-panel" id="spatialSidePanel">
+      <div class="side-panel-tabs">
+        <button type="button" class="tab-btn active" data-tab="annotationsTab">3D Annotations</button>
+        <button type="button" class="tab-btn" data-tab="workPackagesTab">Work Packages</button>
+      </div>
+
+      <div class="tab-content active" id="annotationsTab">
+        <div class="annotations-list" id="annotationsList"></div>
+      </div>
+
+      <div class="tab-content" id="workPackagesTab">
+        <div class="wp-list" id="workPackagesList"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="spatial-modal-backdrop" id="annotationModal" style="display: none;">
+    <div class="spatial-modal">
+      <div class="spatial-modal-header">
+        <h3 id="modalTitle">New 3D Annotation & Work Package</h3>
+        <button type="button" class="close-modal-btn" id="closeModalBtn">&times;</button>
+      </div>
+      <div class="spatial-modal-body">
+        <div class="modal-split">
+          <div class="modal-form-col">
+            <div class="form-group">
+              <label>Annotation Title *</label>
+              <input type="text" id="modalAnnotTitle" class="form-input" placeholder="e.g., Structural joint inspection">
+            </div>
+            <div class="form-group">
+              <label>Description / Notes</label>
+              <textarea id="modalAnnotDesc" class="form-textarea" rows="3" placeholder="Details and inspection instructions..."></textarea>
+            </div>
+            <div class="form-group">
+              <label>Highlight Color</label>
+              <div class="color-picker-group">
+                <button type="button" class="color-dot active" data-color="#3b82f6" style="background:#3b82f6"></button>
+                <button type="button" class="color-dot" data-color="#ef4444" style="background:#ef4444"></button>
+                <button type="button" class="color-dot" data-color="#10b981" style="background:#10b981"></button>
+                <button type="button" class="color-dot" data-color="#f59e0b" style="background:#f59e0b"></button>
+                <button type="button" class="color-dot" data-color="#8b5cf6" style="background:#8b5cf6"></button>
+              </div>
+            </div>
+            <hr>
+            <div class="form-group">
+              <label class="checkbox-label">
+                <input type="checkbox" id="modalCreateWpCheck" checked>
+                Create a new Work Package (Ticket) with this annotation
+              </label>
+            </div>
+            <div id="wpFieldsGroup">
+              <div class="form-group">
+                <label>Ticket Subject</label>
+                <input type="text" id="modalWpSubject" class="form-input" placeholder="Work Package Subject">
+              </div>
+            </div>
+            <div class="form-group" id="linkExistingWpGroup" style="display: none;">
+              <label>Or link to an existing Work Package:</label>
+              <select id="modalSelectExistingWp" class="form-select">
+                <option value="">-- No link --</option>
+                <% @work_packages.each do |wp| %>
+                  <option value="<%= wp.id %>">#<%= wp.id %> - <%= wp.subject %></option>
+                <% end %>
+              </select>
+            </div>
+          </div>
+          <div class="modal-preview-col">
+            <label>3D Viewpoint Preview</label>
+            <img id="modalThumbnailPreview" class="thumbnail-preview" alt="3D Snapshot">
+          </div>
+        </div>
+      </div>
+      <div class="spatial-modal-footer">
+        <button type="button" class="button" id="modalCancelBtn">Cancel</button>
+        <button type="button" class="button -primary" id="modalSaveBtn">Save & Link</button>
+      </div>
+    </div>
+  </div>
+
+</div>

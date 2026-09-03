@@ -1,0 +1,77 @@
+<% html_title t('spatial_viewer.title_models') %>
+
+<div class="op-page-header">
+  <div class="op-page-header--title-container">
+    <h1 class="op-page-header--title"><%= t('spatial_viewer.title_models') %></h1>
+  </div>
+  <% if @project && User.current.allowed_in_project?(:manage_spatial_models, @project) %>
+    <div class="op-page-header--actions">
+      <%= link_to new_project_spatial_model_path(@project), class: 'button -primary' do %>
+        <i class="icon-add"></i> <%= t('spatial_viewer.new_model') %>
+      <% end %>
+    </div>
+  <% end %>
+</div>
+
+<div class="generic-table--container">
+  <% if @models.empty? %>
+    <div class="op-toast -info">
+      <div class="op-toast--content">
+        <p><%= t('spatial_viewer.no_models') %></p>
+        <% if @project && User.current.allowed_in_project?(:manage_spatial_models, @project) %>
+          <p><%= link_to t('spatial_viewer.new_model'), new_project_spatial_model_path(@project) %></p>
+        <% end %>
+      </div>
+    </div>
+  <% else %>
+    <table class="generic-table">
+      <thead>
+        <tr>
+          <th><%= SpatialModel.human_attribute_name(:title) %></th>
+          <th><%= t('spatial_viewer.model_format') %></th>
+          <th><%= t('spatial_viewer.annotations_count') %></th>
+          <th><%= SpatialModel.human_attribute_name(:uploader) %></th>
+          <th><%= SpatialModel.human_attribute_name(:created_at) %></th>
+          <th class="generic-table--actions-header"></th>
+        </tr>
+      </thead>
+      <tbody>
+        <% @models.each do |model| %>
+          <tr>
+            <td>
+              <%= link_to model.title, project_spatial_model_path(model.project, model), class: 'font-weight-bold' %>
+              <% if model.is_default? %>
+                <span class="badge -success">Default</span>
+              <% end %>
+              <div class="text-muted small"><%= model.description %></div>
+            </td>
+            <td>
+              <span class="badge -primary"><%= model.model_format.upcase %></span>
+              <span class="text-muted small">(<%= model.formatted_size %>)</span>
+            </td>
+            <td>
+              <span class="badge"><%= model.spatial_annotations.count %></span>
+            </td>
+            <td><%= model.uploader&.name %></td>
+            <td><%= model.created_at.strftime('%Y-%m-%d %H:%M') %></td>
+            <td class="buttons">
+              <%= link_to project_spatial_model_path(model.project, model), class: 'button -highlight', title: t('spatial_viewer.view_model') do %>
+                <i class="icon-op-view-threed"></i> <%= t('spatial_viewer.view_model') %>
+              <% end %>
+              <% if User.current.allowed_in_project?(:manage_spatial_models, model.project) %>
+                <%= link_to edit_project_spatial_model_path(model.project, model), class: 'icon icon-edit', title: 'Edit' do %><% end %>
+                <%= button_to project_spatial_model_path(model.project, model),
+                              method: :delete,
+                              form_class: 'd-inline',
+                              class: 'button -transparent icon icon-delete text-danger p-0 border-0 bg-transparent',
+                              title: 'Delete 3D model',
+                              data: { turbo_confirm: "Are you sure you want to delete the 3D model \"#{escape_javascript(model.title)}\" and all its annotations?" } do %>
+                <% end %>
+              <% end %>
+            </td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% end %>
+</div>

@@ -1,0 +1,22 @@
+# Ruby / Bundler
+*.gem
+.bundle/
+/pkg/
+/vendor/bundle/
+Gemfile.lock
+
+# Logs & temp
+*.log
+/tmp/
+/coverage/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Node (only if a JS build is ever added)
+node_modules/
