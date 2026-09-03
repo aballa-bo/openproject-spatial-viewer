@@ -55,14 +55,14 @@ echo "[6/7] Clearing cache & checking IFC conversion toolchain..."
 openproject run rake tmp:cache:clear
 
 if [ -x "$OP_DIR/bin/IfcConvert" ] || command -v IfcConvert >/dev/null 2>&1; then
-  echo "[+] IfcConvert trovato: la conversione IFC -> GLB e attiva."
+  echo "[+] IfcConvert found: IFC -> GLB conversion is enabled."
 else
-  echo "[!] IfcConvert NON trovato. I modelli IFC non potranno essere convertiti."
-  echo "    Installa IfcOpenShell oppure il modulo BIM di OpenProject (che lo include),"
-  echo "    o imposta la variabile d'ambiente IFCCONVERT_BIN."
+  echo "[!] IfcConvert NOT found. IFC models cannot be converted."
+  echo "    Install IfcOpenShell or the OpenProject BIM module (which bundles it),"
+  echo "    or set the IFCCONVERT_BIN environment variable."
 fi
 
-# Cartella cache dei modelli convertiti (IFC -> GLB)
+# Cache directory for converted models (IFC -> GLB)
 CONV_DIR="$(openproject run bundle exec rails runner 'print OpenProject::Configuration.attachments_storage_path' 2>/dev/null)/spatial_viewer"
 mkdir -p "$CONV_DIR" 2>/dev/null && chown -R openproject:openproject "$CONV_DIR" 2>/dev/null || true
 

@@ -64,7 +64,7 @@
         if (++attempts > 150) { // ~30s
           delete container.dataset.spatialBooting;
           var lt = document.getElementById('loaderText');
-          if (lt) lt.innerText = 'Errore: il motore 3D (Three.js) non si e caricato. Ricarica la pagina.';
+          if (lt) lt.innerText = 'Error: the 3D engine (Three.js) failed to load. Please reload the page.';
           return;
         }
         setTimeout(pollForEngine, 200);
@@ -77,18 +77,18 @@
 
   function bootSpatialViewer(container) {
     if (container.dataset.spatialInit === '1') return;
+    // Claim the node up-front so a second Turbo event cannot start a parallel
+    // init (which would bind every UI listener twice).
+    container.dataset.spatialInit = '1';
     destroyExistingViewer();
     console.log('[SpatialViewer] Initializing 3D viewer');
     try {
       window.spatialViewerApp = new SpatialViewerApp('spatialViewerApp');
-      // Only mark as initialised AFTER a successful construction, so that a
-      // failed attempt can still be retried by a later Turbo event.
-      container.dataset.spatialInit = '1';
     } catch (err) {
       console.error('[SpatialViewer] init failed, will retry on next event:', err);
-      delete container.dataset.spatialInit;
+      container.dataset.spatialInit = ''; // release so a later Turbo event can retry
       var lt = document.getElementById('loaderText');
-      if (lt) lt.innerText = 'Errore inizializzazione viewer: ' + (err.message || err);
+      if (lt) lt.innerText = 'Viewer initialization error: ' + (err.message || err);
     }
   }
 
@@ -251,10 +251,10 @@
         var conv = data.conversion;
         if (conv && conv.status && conv.status !== 'completed') {
           if (conv.status === 'error') {
-            self.showLoader('Conversione IFC non riuscita: ' + (conv.message || 'errore sconosciuto'));
+            self.showLoader('IFC conversion failed: ' + (conv.message || 'unknown error'));
             return;
           }
-          self.showLoader('Conversione IFC in corso sul server (puo richiedere alcuni minuti)...');
+          self.showLoader('Converting IFC on the server (this may take a few minutes)...');
           clearTimeout(self._conversionPoll);
           self._conversionPoll = setTimeout(function() { self.loadProjectData(); }, 8000);
           return;
@@ -274,9 +274,8 @@
       // uploaded file exceeded OpenProject's "Attachment max. size" setting
       // (default 5 MB) and was silently rejected when the model was created.
       console.warn('[SpatialViewer] No model_url returned by api_data - the model has no attachment.');
-      this.showLoader('Nessun file 3D allegato a questo modello. ' +
-        'Verifica il caricamento (limite "Dimensione max allegati" in Amministrazione > Allegati; ' +
-        'gli IFC di solito superano i 5 MB di default). Mostro un modello di esempio.');
+      this.showLoader('No 3D file attached to this model. Check the upload, then edit the model to add a file. ' +
+        'Showing a demo model.');
       var self = this;
       setTimeout(function() { self.hideLoader(); self.createDemoModel(); }, 4000);
       return;
@@ -301,9 +300,9 @@
         if (ct.indexOf('application/json') !== -1) {
           return response.json().then(function(j) {
             if (j && j.status === 'error') {
-              self.showLoader('Conversione non riuscita: ' + (j.message || 'errore sconosciuto'));
+              self.showLoader('Conversion failed: ' + (j.message || 'unknown error'));
             } else {
-              self.showLoader('Conversione del modello in corso sul server...');
+              self.showLoader('Converting the model on the server...');
               clearTimeout(self._conversionPoll);
               self._conversionPoll = setTimeout(function() { self.load3DModel(url, format); }, 8000);
             }
@@ -512,6 +511,13 @@
   };
 
   SpatialViewerApp.prototype.initEvents = function() {
+    // Bind DOM listeners at most once per #spatialViewerApp node. Without this,
+    // a second init on the same node (Turbo re-render race) would attach every
+    // handler twice — e.g. the side-panel toggle would fire toggle() twice and
+    // appear dead.
+    if (this.container.dataset.spatialListeners === '1') return;
+    this.container.dataset.spatialListeners = '1';
+
     var self = this;
     this._resizeHandler = function() {
       var w = self.viewport.clientWidth;
@@ -775,6 +781,9 @@
   };
 
   SpatialViewerApp.prototype.initUI = function() {
+    if (this.container.dataset.spatialUi === '1') return;
+    this.container.dataset.spatialUi = '1';
+
     var self = this;
     document.querySelectorAll('.tool-btn').forEach(function(btn) {
       btn.addEventListener('click', function() {

@@ -1,60 +1,70 @@
 # OpenProject Spatial Viewer
 
-Modulo di progetto per OpenProject che aggiunge un **visualizzatore 3D** con
-strumenti di **annotazione** collegabili ai Work Package.
+Project module for OpenProject that adds a **3D viewer** with **annotation**
+tools that link to Work Packages.
 
-Formati supportati:
+Supported formats:
 
-| Formato | Stato |
+| Format | Status |
 |---|---|
-| glTF / GLB | funzionante (`THREE.GLTFLoader`) |
-| OBJ / Wavefront | funzionante (`THREE.OBJLoader`) |
-| PLY / Gaussian Splatting (`.ply`, `.splat`, `.ksplat`) | funzionante come point cloud |
-| IFC (BIM) | conversione server-side IFC → GLB con `IfcConvert` — vedi *IFC* |
+| glTF / GLB | working (`THREE.GLTFLoader`) |
+| OBJ / Wavefront | working (`THREE.OBJLoader`) |
+| PLY / Gaussian Splatting (`.ply`, `.splat`, `.ksplat`) | working as a point cloud |
+| IFC (BIM) | server-side `IfcConvert` → GLB, then rendered as GLB — see *IFC* |
 
-Testato su OpenProject 16.6.
+Tested on OpenProject 16.6.
 
-## Funzionalità
+## Features
 
-- Viewer WebGL basato su Three.js r128 (bundle in `app/assets/javascripts/openproject_spatial_viewer/vendor.bundle.js`).
-- Strumenti di markup 3D: pin sulla superficie, polilinea sulla mesh, lazo/selezione regione, misura distanza.
-- Ogni annotazione salva un viewpoint camera + thumbnail e può creare o collegare un Work Package.
-- Piani di sezione (clipping X/Y/Z), viste preimpostate (top/front/right/iso).
-- Permessi dedicati: `view_spatial_models`, `manage_spatial_models`, `create_spatial_annotations`.
+- WebGL viewer built on Three.js r128 (bundled in
+  `app/assets/javascripts/openproject_spatial_viewer/vendor.bundle.js`).
+- 3D markup tools: surface pin, polyline on mesh, lasso/region selection,
+  distance measurement.
+- Each annotation stores a camera viewpoint + thumbnail and can create or link
+  a Work Package.
+- Section planes (X/Y/Z clipping), preset views (top/front/right/iso).
+- Dedicated permissions: `view_spatial_models`, `manage_spatial_models`,
+  `create_spatial_annotations`.
 
-## Struttura
+## Layout
 
 ```
 app/
   controllers/   spatial_models_controller.rb, spatial_annotations_controller.rb
   models/        spatial_model.rb (acts_as_attachable), spatial_annotation.rb
-  views/spatial_models/   index, new, edit, _form, show (show.html.erb = il viewer)
+  services/spatial_viewer/   ifc_converter.rb
+  workers/spatial_viewer/    convert_ifc_job.rb
+  views/spatial_models/      index, new, edit, _form, show (show.html.erb = the viewer)
   assets/
     javascripts/openproject_spatial_viewer/
-      viewer_engine.js     logica viewer + integrazione Turbo Drive
+      viewer_engine.js     viewer logic + Turbo Drive integration
       vendor.bundle.js     THREE + OrbitControls + GLTFLoader + OBJLoader + PLYLoader
-      vendor/              loader singoli + web-ifc (non ancora integrati nel bundle)
+      vendor/              standalone loaders + web-ifc (currently unused)
     stylesheets/openproject_spatial_viewer/viewer.css
 config/
-  routes.rb, locales/{en,it}.yml
+  routes.rb, locales/en.yml
 db/migrate/     create_spatial_models, create_spatial_annotations
 lib/open_project/spatial_viewer/
-  engine.rb      registrazione modulo, menu, permessi
-  hooks.rb       inietta CSS/JS nell'head (solo sulle pagine del viewer)
+  engine.rb      module registration, menu, permissions
+  hooks.rb       injects CSS/JS into <head> (only on the viewer pages)
   patches/       project_patch.rb, attachment_patch.rb
 ```
 
-## Installazione
+All user-facing strings are English. `en.yml` is the fallback for every
+locale; there is intentionally no per-language locale file.
+
+## Installation
 
 ```bash
 sudo bash install.sh
 ```
 
-Lo script copia il plugin in `/opt/openproject/modules/spatial_viewer`, lo aggiunge
-a `Gemfile.modules`, esegue `bundle install`, `db:migrate`, copia gli asset statici
-in `public/assets/openproject_spatial_viewer/` e riavvia i servizi.
+Copies the plugin to `/opt/openproject/modules/spatial_viewer`, adds it to
+`Gemfile.modules`, runs `bundle install` and `db:migrate`, copies static assets
+to `public/assets/openproject_spatial_viewer/`, checks for `IfcConvert`, and
+restarts the services (`openproject-web-1` and `openproject-worker-1`).
 
-### Deploy rapido di un solo file modificato
+### Quick redeploy of a single changed file
 
 ```bash
 sudo cp app/assets/javascripts/openproject_spatial_viewer/viewer_engine.js \
@@ -65,61 +75,54 @@ sudo -u openproject bash -lc 'cd /opt/openproject && bundle exec rake tmp:cache:
 sudo systemctl restart openproject-web-1 openproject-worker-1
 ```
 
-## Note operative
-
-- **Dimensione allegati**: OpenProject limita gli allegati a 5 MB di default
-  (`attachment_max_size`). Gli IFC quasi sempre lo superano: se il file viene
-  rifiutato il modello resta senza allegato e il viewer mostra un modello di
-  esempio. Alzare il limite in *Amministrazione → Allegati*.
-- Gli script/JS sono iniettati nell'`<head>` da `hooks.rb` e caricati in modo
-  asincrono; `viewer_engine.js` attende che `THREE` sia disponibile prima di
-  inizializzare, per compatibilità con le navigazioni Turbo Drive.
+Then hard-reload the browser (Ctrl+Shift+R) so the new `viewer_engine.js` is
+fetched instead of the cached copy.
 
 ## IFC
 
-Gli IFC non sono renderizzati lato client: vengono **convertiti sul server in
-GLB** e il viewer carica il GLB (che già funziona).
+IFC is not rendered client-side: it is **converted to GLB on the server** and
+the viewer loads the GLB (which already works).
 
 Pipeline:
 
-1. All'upload (`create`/`update`) o alla prima apertura, `SpatialModel#enqueue_conversion`
-   accoda `SpatialViewer::ConvertIfcJob`.
-2. Il job invoca `SpatialViewer::IfcConverter`, che esegue
+1. On upload (`create`/`update`) or first open, `SpatialModel#enqueue_conversion`
+   schedules `SpatialViewer::ConvertIfcJob`.
+2. The job runs `SpatialViewer::IfcConverter`:
    `IfcConvert -q -y --no-progress --center-model <in.ifc> <out.glb>`.
-3. Il GLB viene messo in cache in
+3. The GLB is cached at
    `<attachments_storage_path>/spatial_viewer/<model_id>/model.glb`.
-4. Lo stato (`pending` / `processing` / `completed` / `error` + messaggio) è
-   salvato in `spatial_models.settings["conversion"]` ed esposto da `api_data`
-   nel campo `conversion`. Finché non è `completed`, `model_file` risponde JSON
-   e il viewer fa polling mostrando "Conversione in corso".
-5. La cache viene invalidata automaticamente quando cambia l'allegato
-   (`conversion.attachment_id`) e rimossa alla cancellazione del modello.
+4. Status (`pending` / `processing` / `completed` / `error` + message) is stored
+   in `spatial_models.settings["conversion"]` and exposed by `api_data` in the
+   `conversion` field. Until it is `completed`, `model_file` returns JSON and the
+   viewer polls, showing "Converting IFC on the server".
+5. The cache is invalidated automatically when the attachment changes
+   (`conversion.attachment_id`) and removed when the model is deleted.
 
-### Requisiti / configurazione
+### Requirements / configuration
 
-- Binario `IfcConvert` (IfcOpenShell). Cercato in: `IFCCONVERT_BIN`,
+- The `IfcConvert` binary (IfcOpenShell). Looked up in: `IFCCONVERT_BIN`,
   `<Rails.root>/bin/IfcConvert`, `/opt/openproject/bin/IfcConvert`, `$PATH`.
-  Il modulo BIM di OpenProject lo installa già in `bin/IfcConvert`.
-- `attachment_max_size`: per il modulo spatial il limite è **bypassato**
-  (`AttachmentPatch#internal_container?`), quindi gli IFC grandi si allegano
-  comunque. Attenzione però allo spazio disco.
-- Variabili d'ambiente:
-  - `SPATIAL_VIEWER_MAX_IFC_MB` (default `300`) — sopra questa soglia la
-    conversione viene rifiutata con un messaggio che rimanda al modulo BIM.
-  - `SPATIAL_VIEWER_CONVERT_TIMEOUT` (default `1800` s).
+  The OpenProject BIM module already installs it at `bin/IfcConvert`.
+- `attachment_max_size`: for this module the limit is **bypassed**
+  (`AttachmentPatch#internal_container?`), so large IFC files still attach.
+  Watch disk space.
+- Environment variables:
+  - `SPATIAL_VIEWER_MAX_IFC_MB` (default `300`) — above this the conversion is
+    rejected with a message pointing to the BIM module.
+  - `SPATIAL_VIEWER_CONVERT_TIMEOUT` (default `1800` seconds).
 
-### Limiti noti
+### Known limits
 
-- Modelli molto grandi (es. export Revit da centinaia di MB) producono GLB
-  troppo pesanti per il browser: usare il visualizzatore IFC nativo del
-  modulo BIM di OpenProject (basato su XKT/xeokit, pensato per quei volumi).
-- `IfcConvert` può loggare `Triangulation missing for face` su geometrie
-  problematiche: sono warning, la conversione prosegue.
-- I file client-side `vendor/web-ifc*.js`, `vendor/IFCLoader*.js` non sono più
-  usati (restano per un'eventuale futura resa lato client).
+- Very large models (e.g. multi-hundred-MB Revit exports) produce GLB files too
+  heavy for the browser: use the native IFC viewer in the OpenProject BIM module
+  (XKT/xeokit, designed for that scale).
+- `IfcConvert` may log `Triangulation missing for face` on problematic geometry:
+  these are warnings, conversion continues.
+- `vendor/web-ifc*.js` and `vendor/IFCLoader*.js` are currently unused (kept for
+  a possible future client-side path).
 
-## Storico
+## History
 
-Il plugin era in origine generato da script Python (`build_plugin.py`,
-`write_spatial_engine.py`, …). Quell'approccio è stato **abbandonato**: il
-sorgente autoritativo è ora questo repository. Non rigenerare da quegli script.
+The plugin was originally generated by Python scripts (`build_plugin.py`,
+`write_spatial_engine.py`, …). That approach was **abandoned**: this repository
+is now the source of truth. Do not regenerate from those scripts.

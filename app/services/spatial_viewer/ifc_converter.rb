@@ -28,17 +28,17 @@ module SpatialViewer
 
     def call
       attachment = @model.model_attachment
-      raise ConversionError, "Nessun file IFC allegato al modello" unless attachment
+      raise ConversionError, "No IFC file attached to the model" unless attachment
 
       source = local_ifc_path(attachment)
-      raise ConversionError, "File IFC non trovato su disco" unless source && File.file?(source)
+      raise ConversionError, "IFC file not found on disk" unless source && File.file?(source)
 
       size_mb = File.size(source) / 1_048_576.0
       if size_mb > max_mb
         raise ConversionError,
-              "IFC troppo grande (#{size_mb.round} MB, limite #{max_mb} MB). " \
-              "Per modelli di queste dimensioni usa il modulo BIM di OpenProject, " \
-              "oppure aumenta la variabile d'ambiente SPATIAL_VIEWER_MAX_IFC_MB."
+              "IFC file too large (#{size_mb.round} MB, limit #{max_mb} MB). " \
+              "Use the OpenProject BIM module for models of this size, " \
+              "or raise the SPATIAL_VIEWER_MAX_IFC_MB environment variable."
       end
 
       ensure_free_disk!(source)
@@ -51,7 +51,7 @@ module SpatialViewer
         run_ifcconvert!(linked, output)
 
         unless File.file?(output) && File.size(output).positive?
-          raise ConversionError, "IfcConvert non ha prodotto alcun output (nessuna geometria?)"
+          raise ConversionError, "IfcConvert produced no output (no geometry?)"
         end
 
         FileUtils.mkdir_p(@model.conversion_dir)
@@ -78,7 +78,7 @@ module SpatialViewer
       bin = ifcconvert_bin
       unless bin
         raise ConversionError,
-              "IfcConvert non trovato. Installa IfcOpenShell o imposta la variabile IFCCONVERT_BIN."
+              "IfcConvert not found. Install IfcOpenShell or set the IFCCONVERT_BIN environment variable."
       end
 
       cmd = [bin, "-q", "-y", "--no-progress", "--center-model", input, output]
@@ -90,13 +90,13 @@ module SpatialViewer
           stdout, stderr, status = Open3.capture3(*cmd)
         end
       rescue Timeout::Error
-        raise ConversionError, "Conversione IFC scaduta dopo #{(timeout_seconds / 60.0).round} minuti"
+        raise ConversionError, "IFC conversion timed out after #{(timeout_seconds / 60.0).round} minutes"
       end
 
       return if status&.success?
 
       detail = (stderr.presence || stdout).to_s.strip[0, 500]
-      raise ConversionError, "IfcConvert terminato con codice #{status&.exitstatus}: #{detail}"
+      raise ConversionError, "IfcConvert exited with code #{status&.exitstatus}: #{detail}"
     end
 
     def ifcconvert_bin
@@ -130,8 +130,8 @@ module SpatialViewer
       needed_kb = (File.size(source) / 1024) * 3
       if free_kb.positive? && free_kb < needed_kb
         raise ConversionError,
-              "Spazio su disco insufficiente per la conversione " \
-              "(#{(free_kb / 1_048_576.0).round(1)} GB liberi, ne servono ~#{(needed_kb / 1_048_576.0).round(1)} GB)"
+              "Not enough free disk space for the conversion " \
+              "(#{(free_kb / 1_048_576.0).round(1)} GB free, ~#{(needed_kb / 1_048_576.0).round(1)} GB needed)"
       end
     rescue ConversionError
       raise

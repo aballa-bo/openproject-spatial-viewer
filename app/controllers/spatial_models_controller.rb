@@ -131,7 +131,7 @@ class SpatialModelsController < ApplicationController
     return nil unless @spatial_model.needs_conversion?
 
     if @spatial_model.model_attachment.blank?
-      return { status: "error", message: "Nessun file IFC allegato a questo modello." }
+      return { status: "error", message: "No IFC file is attached to this model." }
     end
 
     state = @spatial_model.conversion_state
