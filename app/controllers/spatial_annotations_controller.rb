@@ -100,14 +100,20 @@ class SpatialAnnotationsController < ApplicationController
               params.dig(:spatial_annotation, :title).presence ||
               "3D annotation"
 
-    type = @project.types.where(is_default: true).first || @project.types.order(:position).first
+    type = @project.types.find_by(id: params[:wp_type_id]) ||
+           @project.types.where(is_default: true).first ||
+           @project.types.order(:position).first
 
-    call = ::WorkPackages::CreateService.new(user: User.current).call(
+    attributes = {
       project: @project,
       type:,
       subject: subject.to_s.truncate(255),
       description: params[:wp_description].presence
-    )
+    }
+    attributes[:assigned_to_id] = params[:wp_assigned_to_id] if params[:wp_assigned_to_id].present?
+    attributes[:priority_id] = params[:wp_priority_id] if params[:wp_priority_id].present?
+
+    call = ::WorkPackages::CreateService.new(user: User.current).call(**attributes)
 
     if call.success?
       call.result

@@ -650,59 +650,98 @@
     return this.renderer.domElement.toDataURL('image/png');
   };
 
+  // Opens the inline "New Work Package" panel beside the viewer (BCF-style
+  // split view) instead of a modal overlay.
   SpatialViewerApp.prototype.openAnnotationModal = function(gd) {
     this.pendingGeometry = gd;
-    var modal = document.getElementById('annotationModal');
-    var preview = document.getElementById('modalThumbnailPreview');
-    var titleInput = document.getElementById('modalAnnotTitle');
-    var descInput = document.getElementById('modalAnnotDesc');
-    var wpSubject = document.getElementById('modalWpSubject');
-
     this.pendingThumbnail = this.captureSnapshot();
-    if (preview) preview.src = this.pendingThumbnail;
 
-    if (titleInput) {
-      var titles = { pin: '3D Pin Marker', draw_polyline: 'Mesh Inspection Drawing', lasso_selection: 'Mesh Region Selection' };
-      titleInput.value = titles[gd.type] || (gd.type === 'measurement' ? '3D Measurement: ' + gd.dist + ' m' : 'Annotation');
-    }
-    if (wpSubject && titleInput) wpSubject.value = titleInput.value;
+    var panel = document.getElementById('spatialSidePanel');
+    var snap = document.getElementById('caSnapshot');
+    var subject = document.getElementById('caSubject');
+    var descInput = document.getElementById('caDesc');
+    var titleEl = document.getElementById('createPanelTitle');
+
+    if (snap) snap.src = this.pendingThumbnail;
+
+    var labels = {
+      pin: '3D pin', draw_polyline: 'Mesh drawing',
+      lasso_selection: 'Mesh region', measurement: 'Measurement'
+    };
+    var suggested = gd.type === 'measurement'
+      ? ('Measurement: ' + gd.dist + ' m')
+      : ((labels[gd.type] || 'Annotation') + ' — ' + (this.projectData && this.projectData.title ? this.projectData.title : '3D model'));
+
+    if (subject) subject.value = suggested;
     if (descInput) descInput.value = '';
-    if (modal) modal.style.display = 'flex';
+    if (titleEl) titleEl.innerText = 'New Work Package';
+
+    // Reset mode to "new"
+    var newRadio = document.querySelector('input[name="caMode"][value="new"]');
+    if (newRadio) { newRadio.checked = true; this.updateCreateMode('new'); }
+
+    if (panel) {
+      panel.classList.remove('collapsed');
+      panel.classList.add('creating');
+    }
+    if (subject) subject.focus();
+  };
+
+  SpatialViewerApp.prototype.updateCreateMode = function(mode) {
+    var ng = document.getElementById('caNewGroup');
+    var eg = document.getElementById('caExistingGroup');
+    if (ng) ng.style.display = (mode === 'existing') ? 'none' : 'block';
+    if (eg) eg.style.display = (mode === 'existing') ? 'block' : 'none';
+  };
+
+  SpatialViewerApp.prototype.closeAnnotationForm = function() {
+    var panel = document.getElementById('spatialSidePanel');
+    if (panel) panel.classList.remove('creating');
+    this.clearTempMarkup();
+    this.pendingGeometry = null;
   };
 
   SpatialViewerApp.prototype.saveAnnotation = function() {
-    var title = (document.getElementById('modalAnnotTitle').value || '').trim();
-    var desc = document.getElementById('modalAnnotDesc').value;
-    var cwpEl = document.getElementById('modalCreateWpCheck');
-    var createWp = cwpEl ? cwpEl.checked : true;
-    var wpSubject = document.getElementById('modalWpSubject').value;
-    var ewpEl = document.getElementById('modalSelectExistingWp');
-    var existingWpId = ewpEl ? ewpEl.value : '';
     var self = this;
+    var gd = this.pendingGeometry;
+    if (!gd) return;
 
-    if (!title) { alert('Please enter an annotation title.'); return; }
-    if (!createWp && !existingWpId) {
-      alert('Select an existing Work Package, or tick "Create a new Work Package".');
-      return;
-    }
+    var mode = (document.querySelector('input[name="caMode"]:checked') || {}).value || 'new';
+    var subject = (document.getElementById('caSubject').value || '').trim();
+    var desc = document.getElementById('caDesc').value;
+    var typeId = document.getElementById('caType') ? document.getElementById('caType').value : '';
+    var priorityId = document.getElementById('caPriority') ? document.getElementById('caPriority').value : '';
+    var assigneeId = document.getElementById('caAssignee') ? document.getElementById('caAssignee').value : '';
+    var existingWpId = document.getElementById('caExistingWp') ? document.getElementById('caExistingWp').value : '';
+
+    if (mode === 'existing' && !existingWpId) { alert('Select a Work Package to link.'); return; }
+    if (mode === 'new' && !subject) { alert('Enter a subject for the Work Package.'); return; }
 
     var payload = {
       spatial_annotation: {
-        title: title, description: desc,
-        annotation_type: this.pendingGeometry.type,
+        title: (mode === 'new' ? subject : (subject || 'Annotation')),
+        description: desc,
+        annotation_type: gd.type,
         color: this.activeColor,
-        work_package_id: existingWpId || null,
+        work_package_id: (mode === 'existing') ? existingWpId : null,
         thumbnail_base64: this.pendingThumbnail,
         camera_viewpoint: {
           eye: [this.camera.position.x, this.camera.position.y, this.camera.position.z],
           target: [this.controls.target.x, this.controls.target.y, this.controls.target.z],
           up: [this.camera.up.x, this.camera.up.y, this.camera.up.z]
         },
-        geometry_data: this.pendingGeometry
+        geometry_data: gd
       },
-      create_work_package: (createWp && !existingWpId) ? 'true' : 'false',
-      wp_subject: wpSubject || title
+      create_work_package: (mode === 'new') ? 'true' : 'false',
+      wp_subject: subject,
+      wp_description: desc,
+      wp_type_id: typeId,
+      wp_priority_id: priorityId,
+      wp_assigned_to_id: assigneeId
     };
+
+    var saveBtn = document.getElementById('caSaveBtn');
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.innerText = 'Creating…'; }
 
     fetch(this.apiUrl.replace('/api_data', '/spatial_annotations'), {
       method: 'POST',
@@ -711,18 +750,24 @@
     })
     .then(function(r) { return r.json(); })
     .then(function(result) {
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.innerText = 'Create'; }
       if (result.success) {
-        self.closeModal(); self.clearTempMarkup();
+        self.closeAnnotationForm();
         self.projectData.annotations.unshift(result.annotation);
         self.renderAnnotationsList(self.projectData.annotations);
         self.renderExisting3DAnnotations();
         var c = document.getElementById('annotationCountHeader');
         if (c) c.innerText = self.projectData.annotations.length;
+        var annTab = document.querySelector('.tab-btn[data-tab="annotationsTab"]');
+        if (annTab) annTab.click();
       } else {
         alert('Save error: ' + (result.errors || []).join(', '));
       }
     })
-    .catch(function(err) { alert('Network error: ' + err); });
+    .catch(function(err) {
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.innerText = 'Create'; }
+      alert('Network error: ' + err);
+    });
   };
 
   SpatialViewerApp.prototype.renderExisting3DAnnotations = function() {
@@ -907,10 +952,17 @@
     var spBtn = document.getElementById('btnSidePanelToggle'), sp = document.getElementById('spatialSidePanel');
     if (spBtn && sp) spBtn.addEventListener('click', function() { sp.classList.toggle('collapsed'); });
 
-    var cancelBtn = document.getElementById('modalCancelBtn'), closeMBtn = document.getElementById('closeModalBtn'), saveBtn = document.getElementById('modalSaveBtn');
-    if (cancelBtn) cancelBtn.addEventListener('click', function() { self.closeModal(); });
-    if (closeMBtn) closeMBtn.addEventListener('click', function() { self.closeModal(); });
-    if (saveBtn) saveBtn.addEventListener('click', function() { self.saveAnnotation(); });
+    // Inline "New Work Package" create panel
+    var caCancel = document.getElementById('caCancelBtn');
+    var caCancel2 = document.getElementById('caCancelBtn2');
+    var caSave = document.getElementById('caSaveBtn');
+    if (caCancel) caCancel.addEventListener('click', function() { self.closeAnnotationForm(); });
+    if (caCancel2) caCancel2.addEventListener('click', function() { self.closeAnnotationForm(); });
+    if (caSave) caSave.addEventListener('click', function() { self.saveAnnotation(); });
+
+    document.querySelectorAll('input[name="caMode"]').forEach(function(r) {
+      r.addEventListener('change', function() { self.updateCreateMode(r.value); });
+    });
 
     document.querySelectorAll('.color-dot').forEach(function(dot) {
       dot.addEventListener('click', function() {
@@ -918,12 +970,6 @@
         dot.classList.add('active');
         self.activeColor = dot.dataset.color;
       });
-    });
-
-    var cwp = document.getElementById('modalCreateWpCheck'), wpf = document.getElementById('wpFieldsGroup'), lwp = document.getElementById('linkExistingWpGroup');
-    if (cwp) cwp.addEventListener('change', function(e) {
-      if (wpf) wpf.style.display = e.target.checked ? 'block' : 'none';
-      if (lwp) lwp.style.display = e.target.checked ? 'none' : 'block';
     });
 
     this.initVR();
@@ -1015,10 +1061,9 @@
     while (this.tempMarkupGroup.children.length > 0) this.tempMarkupGroup.remove(this.tempMarkupGroup.children[0]);
   };
 
+  // Back-compat alias
   SpatialViewerApp.prototype.closeModal = function() {
-    var m = document.getElementById('annotationModal');
-    if (m) m.style.display = 'none';
-    this.clearTempMarkup();
+    this.closeAnnotationForm();
   };
 
   SpatialViewerApp.prototype.showLoader = function(text) {

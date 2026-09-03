@@ -350,39 +350,7 @@
   margin-top: 6px;
 }
 
-.spatial-modal-backdrop {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.7);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 9999;
-  backdrop-filter: blur(5px);
-}
-
-.spatial-modal {
-  background: #1e293b;
-  border: 1px solid #334155;
-  border-radius: 10px;
-  width: 750px;
-  max-width: 95vw;
-  box-shadow: 0 20px 50px rgba(0,0,0,0.6);
-  color: #f8fafc;
-}
-
-.spatial-modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 16px 20px;
-  border-bottom: 1px solid #334155;
-}
-
-.close-modal-btn, .close-btn {
+.close-btn {
   background: transparent;
   border: none;
   color: #94a3b8;
@@ -390,32 +358,88 @@
   cursor: pointer;
 }
 
-.spatial-modal-body {
-  padding: 20px;
-}
+/* ---- Inline "New Work Package" panel (beside the viewer) ---------------- */
 
-.modal-split {
-  display: flex;
-  gap: 20px;
-}
-
-.modal-form-col {
-  flex: 1.2;
-}
-
-.modal-preview-col {
-  flex: 0.8;
-  display: flex;
+.annotation-create-panel {
+  display: none;
   flex-direction: column;
+  height: 100%;
+  min-height: 0;
 }
 
-.thumbnail-preview {
+.spatial-side-panel.creating {
+  width: 440px;
+}
+
+.spatial-side-panel.creating .side-panel-tabs,
+.spatial-side-panel.creating .tab-content {
+  display: none;
+}
+
+.spatial-side-panel.creating .annotation-create-panel {
+  display: flex;
+}
+
+.create-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 16px;
+  border-bottom: 1px solid #334155;
+}
+
+.create-panel-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  color: #f1f5f9;
+}
+
+.create-panel-body {
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.create-panel-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid #334155;
+}
+
+.ca-snapshot {
   width: 100%;
-  height: 180px;
+  height: 150px;
   object-fit: cover;
   border-radius: 6px;
   border: 1px solid #334155;
   background: #0f172a;
+  margin-bottom: 14px;
+}
+
+.ca-mode-switch {
+  display: flex;
+  gap: 14px;
+  margin-bottom: 14px;
+  font-size: 0.85rem;
+  color: #cbd5e1;
+}
+
+.ca-mode-switch label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+
+.form-row {
+  display: flex;
+  gap: 10px;
+}
+
+.form-row .form-group {
+  flex: 1;
 }
 
 .form-group {

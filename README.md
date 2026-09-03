@@ -90,10 +90,16 @@ Every annotation is a **viewpoint tied to a Work Package**, mirroring the BCF
 | `SpatialAnnotation#json_viewpoint` | BCF 2.1 viewpoint JSON (built in `to_bcf_viewpoint_json`) |
 | snapshot attachment (`description: "snapshot"`) | BCF viewpoint snapshot |
 
+Placing a pin / drawing / measuring opens an inline **"New Work Package"
+panel beside the viewer** (like the BCF split view), not a modal overlay:
+subject, type, priority, assignee, description — or "Link existing" to pick
+a Work Package. The 3D viewport stays interactive on the left.
+
 Flow on save (`SpatialAnnotationsController#create`):
 
-1. A Work Package is resolved — the one selected in the modal, or a new one
-   created from the annotation title. `work_package` is mandatory.
+1. A Work Package is resolved — the one selected, or a new one created via
+   `WorkPackages::CreateService` from the panel fields. `work_package` is
+   mandatory.
 2. The canvas snapshot (data URI) is stored as a real attachment.
 3. `json_viewpoint` is computed from the camera + drawing geometry, converting
    the viewer's Y-up coordinates to the BCF/IFC Z-up convention.

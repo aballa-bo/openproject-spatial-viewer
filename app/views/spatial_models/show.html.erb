@@ -111,55 +111,66 @@
       <div class="tab-content" id="workPackagesTab">
         <div class="wp-list" id="workPackagesList"></div>
       </div>
-    </div>
-  </div>
 
-  <div class="spatial-modal-backdrop" id="annotationModal" style="display: none;">
-    <div class="spatial-modal">
-      <div class="spatial-modal-header">
-        <h3 id="modalTitle">New viewpoint annotation</h3>
-        <button type="button" class="close-modal-btn" id="closeModalBtn">&times;</button>
-      </div>
-      <div class="spatial-modal-body">
-        <div class="modal-split">
-          <div class="modal-form-col">
+      <%# Inline "New Work Package" panel — shown beside the viewer while
+          creating an annotation, like the BCF split view. %>
+      <div class="annotation-create-panel" id="annotationCreatePanel">
+        <div class="create-panel-header">
+          <h3 id="createPanelTitle">New Work Package</h3>
+          <button type="button" class="close-btn" id="caCancelBtn" title="Cancel">&times;</button>
+        </div>
+
+        <div class="create-panel-body">
+          <img id="caSnapshot" class="ca-snapshot" alt="Viewpoint snapshot">
+
+          <div class="ca-mode-switch">
+            <label><input type="radio" name="caMode" value="new" checked> New Work Package</label>
+            <label><input type="radio" name="caMode" value="existing"> Link existing</label>
+          </div>
+
+          <div id="caNewGroup">
             <div class="form-group">
-              <label>Annotation Title *</label>
-              <input type="text" id="modalAnnotTitle" class="form-input" placeholder="e.g., Structural joint inspection">
+              <label>Subject *</label>
+              <input type="text" id="caSubject" class="form-input" placeholder="Work Package subject">
             </div>
-            <div class="form-group">
-              <label>Description / Notes</label>
-              <textarea id="modalAnnotDesc" class="form-textarea" rows="3" placeholder="Details and inspection instructions..."></textarea>
-            </div>
-            <div class="form-group">
-              <label>Highlight Color</label>
-              <div class="color-picker-group">
-                <button type="button" class="color-dot active" data-color="#3b82f6" style="background:#3b82f6"></button>
-                <button type="button" class="color-dot" data-color="#ef4444" style="background:#ef4444"></button>
-                <button type="button" class="color-dot" data-color="#10b981" style="background:#10b981"></button>
-                <button type="button" class="color-dot" data-color="#f59e0b" style="background:#f59e0b"></button>
-                <button type="button" class="color-dot" data-color="#8b5cf6" style="background:#8b5cf6"></button>
-              </div>
-            </div>
-            <hr>
-            <p class="form--field-instructions">
-              Every annotation is linked to a Work Package, like a BCF topic and its viewpoint.
-            </p>
-            <div class="form-group">
-              <label class="checkbox-label">
-                <input type="checkbox" id="modalCreateWpCheck" checked>
-                Create a new Work Package for this annotation
-              </label>
-            </div>
-            <div id="wpFieldsGroup">
+            <div class="form-row">
               <div class="form-group">
-                <label>New Work Package subject</label>
-                <input type="text" id="modalWpSubject" class="form-input" placeholder="Work Package subject">
+                <label>Type</label>
+                <select id="caType" class="form-select">
+                  <% @wp_types.each do |t| %>
+                    <option value="<%= t.id %>" <%= 'selected' if t.is_default %>><%= t.name %></option>
+                  <% end %>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Priority</label>
+                <select id="caPriority" class="form-select">
+                  <option value="">Default</option>
+                  <% @wp_priorities.each do |p| %>
+                    <option value="<%= p.id %>"><%= p.name %></option>
+                  <% end %>
+                </select>
               </div>
             </div>
-            <div class="form-group" id="linkExistingWpGroup" style="display: none;">
-              <label>Link to an existing Work Package</label>
-              <select id="modalSelectExistingWp" class="form-select">
+            <div class="form-group">
+              <label>Assignee</label>
+              <select id="caAssignee" class="form-select">
+                <option value="">Unassigned</option>
+                <% @wp_assignees.each do |u| %>
+                  <option value="<%= u.id %>"><%= u.name %></option>
+                <% end %>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Description</label>
+              <textarea id="caDesc" class="form-textarea" rows="4" placeholder="Description / notes"></textarea>
+            </div>
+          </div>
+
+          <div id="caExistingGroup" style="display: none;">
+            <div class="form-group">
+              <label>Work Package</label>
+              <select id="caExistingWp" class="form-select">
                 <option value="">-- Select a Work Package --</option>
                 <% @work_packages.each do |wp| %>
                   <option value="<%= wp.id %>">#<%= wp.id %> - <%= wp.subject %></option>
@@ -167,15 +178,23 @@
               </select>
             </div>
           </div>
-          <div class="modal-preview-col">
-            <label>3D Viewpoint Preview</label>
-            <img id="modalThumbnailPreview" class="thumbnail-preview" alt="3D Snapshot">
+
+          <div class="form-group">
+            <label>Annotation colour</label>
+            <div class="color-picker-group">
+              <button type="button" class="color-dot active" data-color="#3b82f6" style="background:#3b82f6"></button>
+              <button type="button" class="color-dot" data-color="#ef4444" style="background:#ef4444"></button>
+              <button type="button" class="color-dot" data-color="#10b981" style="background:#10b981"></button>
+              <button type="button" class="color-dot" data-color="#f59e0b" style="background:#f59e0b"></button>
+              <button type="button" class="color-dot" data-color="#8b5cf6" style="background:#8b5cf6"></button>
+            </div>
           </div>
         </div>
-      </div>
-      <div class="spatial-modal-footer">
-        <button type="button" class="button" id="modalCancelBtn">Cancel</button>
-        <button type="button" class="button -primary" id="modalSaveBtn">Save & Link</button>
+
+        <div class="create-panel-footer">
+          <button type="button" class="button" id="caCancelBtn2">Cancel</button>
+          <button type="button" class="button -primary" id="caSaveBtn">Create</button>
+        </div>
       </div>
     </div>
   </div>

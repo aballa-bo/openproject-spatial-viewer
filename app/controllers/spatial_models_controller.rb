@@ -14,7 +14,13 @@ class SpatialModelsController < ApplicationController
 
   def show
     @annotations = @spatial_model.spatial_annotations.includes(:work_package, :author).order(created_at: :desc)
-    @work_packages = @project.work_packages.visible.order(updated_at: :desc).limit(50)
+    @work_packages = @project.work_packages.visible.order(updated_at: :desc).limit(100)
+
+    # Data for the inline "New Work Package" panel shown beside the viewer.
+    @wp_types = @project.types.order(:position)
+    @wp_priorities = IssuePriority.active.order(:position)
+    @wp_assignees = Principal.possible_assignee(@project).ordered_by_name.limit(200)
+
     @spatial_model.enqueue_conversion
   end
 
