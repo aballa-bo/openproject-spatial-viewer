@@ -59,6 +59,12 @@
       <button type="button" class="toolbar-btn" id="btnWireframe" title="Toggle Wireframe">
         <i class="icon-grid"></i>
       </button>
+      <button type="button" class="toolbar-btn" id="btnVR" title="Enter VR" style="display: none;">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true" focusable="false">
+          <path d="M21 6H3a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h5.2a2 2 0 0 0 1.7-.9l1.3-2c.3-.45.95-.45 1.25 0l1.3 2a2 2 0 0 0 1.7.9H21a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zM7.5 14A2.5 2.5 0 1 1 10 11.5 2.5 2.5 0 0 1 7.5 14zm9 0a2.5 2.5 0 1 1 2.5-2.5 2.5 2.5 0 0 1-2.5 2.5z"/>
+        </svg>
+        VR
+      </button>
       <button type="button" class="toolbar-btn" id="btnSidePanelToggle" title="Toggle Side Panel">
         <i class="icon-task"></i> Tickets & Annotations (<span id="annotationCountHeader"><%= @annotations.count %></span>)
       </button>

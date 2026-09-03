@@ -20,7 +20,9 @@
         var app = window.spatialViewerApp;
         if (app._animFrameId) cancelAnimationFrame(app._animFrameId);
         if (app._conversionPoll) clearTimeout(app._conversionPoll);
+        if (app._xrSession) { try { app._xrSession.end(); } catch (ignore2) {} }
         if (app.renderer) {
+          app.renderer.setAnimationLoop(null);
           app.renderer.dispose();
           app.renderer.forceContextLoss();
         }
@@ -189,6 +191,15 @@
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
     this.renderer.localClippingEnabled = true;
+    this.renderer.xr.enabled = true; // WebXR / VR headset support
+
+    // Dolly rig: the camera is parented to a group so we can place the VR
+    // "player" near the model when entering immersive mode. Outside VR the
+    // dolly stays at the origin, so camera local space == world space and
+    // OrbitControls / raycasting behave exactly as before.
+    this.xrDolly = new THREE.Group();
+    this.xrDolly.add(this.camera);
+    this.scene.add(this.xrDolly);
 
     this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
@@ -224,14 +235,15 @@
     ];
 
     var self = this;
-    function animate() {
-      self._animFrameId = requestAnimationFrame(animate);
-      if (self.controls) self.controls.update();
+    // setAnimationLoop (not requestAnimationFrame) is required for WebXR:
+    // during an immersive session the browser drives the frame timing.
+    this.renderer.setAnimationLoop(function() {
+      var presenting = self.renderer.xr && self.renderer.xr.isPresenting;
+      if (self.controls && !presenting) self.controls.update();
       if (self.renderer && self.scene && self.camera) {
         self.renderer.render(self.scene, self.camera);
       }
-    }
-    animate();
+    });
   };
 
   SpatialViewerApp.prototype.loadProjectData = function() {
@@ -865,6 +877,77 @@
     if (cwp) cwp.addEventListener('change', function(e) {
       if (wpf) wpf.style.display = e.target.checked ? 'block' : 'none';
       if (lwp) lwp.style.display = e.target.checked ? 'none' : 'block';
+    });
+
+    this.initVR();
+  };
+
+  // ---- WebXR / VR headsets --------------------------------------------------
+  SpatialViewerApp.prototype.initVR = function() {
+    var self = this;
+    var btn = document.getElementById('btnVR');
+    if (!btn) return;
+
+    // WebXR needs a secure context (HTTPS or localhost) and browser support.
+    if (!window.isSecureContext || !navigator.xr || !navigator.xr.isSessionSupported) {
+      btn.style.display = 'none';
+      return;
+    }
+
+    btn.disabled = true;
+    btn.title = 'Checking VR support...';
+
+    navigator.xr.isSessionSupported('immersive-vr').then(function(supported) {
+      if (!supported) { btn.style.display = 'none'; return; }
+      btn.style.display = '';
+      btn.disabled = false;
+      btn.title = 'Enter VR';
+    }).catch(function() { btn.style.display = 'none'; });
+
+    function endVR() {
+      if (self._xrSession) { try { self._xrSession.end(); } catch (ignore) {} }
+    }
+
+    function onSessionEnded() {
+      if (self._xrSession) self._xrSession.removeEventListener('end', onSessionEnded);
+      self._xrSession = null;
+      self.xrDolly.position.set(0, 0, 0);
+      btn.disabled = false;
+      btn.classList.remove('active');
+      btn.title = 'Enter VR';
+    }
+
+    btn.addEventListener('click', function() {
+      if (self._xrSession) { endVR(); return; }
+
+      btn.disabled = true;
+      navigator.xr.requestSession('immersive-vr', {
+        optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
+      }).then(function(session) {
+        self._xrSession = session;
+        session.addEventListener('end', onSessionEnded);
+
+        // Stand the player ~1.6 m below and 3 m back from the current focus
+        // point so the model is in front of them on entry.
+        var t = self.controls ? self.controls.target : new THREE.Vector3();
+        self.xrDolly.position.set(t.x, t.y - 1.6, t.z + 3);
+
+        try { self.renderer.xr.setReferenceSpaceType('local-floor'); } catch (ignore) {}
+        return self.renderer.xr.setSession(session).then(function() {
+          btn.disabled = false;
+          btn.classList.add('active');
+          btn.title = 'Exit VR';
+        });
+      }).catch(function(err) {
+        console.error('[SpatialViewer] Could not start VR session:', err);
+        if (self._xrSession) { try { self._xrSession.end(); } catch (ignore) {} }
+        self._xrSession = null;
+        self.xrDolly.position.set(0, 0, 0);
+        btn.disabled = false;
+        btn.classList.remove('active');
+        btn.title = 'Enter VR';
+        alert('Could not start VR: ' + (err.message || err));
+      });
     });
   };
 

@@ -67,6 +67,15 @@
   box-shadow: 0 0 10px rgba(37, 99, 235, 0.4);
 }
 
+.toolbar-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.toolbar-btn svg {
+  display: block;
+}
+
 .toolbar-dropdown {
   position: relative;
 }
