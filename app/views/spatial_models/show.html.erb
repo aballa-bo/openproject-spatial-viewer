@@ -117,7 +117,7 @@
   <div class="spatial-modal-backdrop" id="annotationModal" style="display: none;">
     <div class="spatial-modal">
       <div class="spatial-modal-header">
-        <h3 id="modalTitle">New 3D Annotation & Work Package</h3>
+        <h3 id="modalTitle">New viewpoint annotation</h3>
         <button type="button" class="close-modal-btn" id="closeModalBtn">&times;</button>
       </div>
       <div class="spatial-modal-body">
@@ -142,22 +142,25 @@
               </div>
             </div>
             <hr>
+            <p class="form--field-instructions">
+              Every annotation is linked to a Work Package, like a BCF topic and its viewpoint.
+            </p>
             <div class="form-group">
               <label class="checkbox-label">
                 <input type="checkbox" id="modalCreateWpCheck" checked>
-                Create a new Work Package (Ticket) with this annotation
+                Create a new Work Package for this annotation
               </label>
             </div>
             <div id="wpFieldsGroup">
               <div class="form-group">
-                <label>Ticket Subject</label>
-                <input type="text" id="modalWpSubject" class="form-input" placeholder="Work Package Subject">
+                <label>New Work Package subject</label>
+                <input type="text" id="modalWpSubject" class="form-input" placeholder="Work Package subject">
               </div>
             </div>
             <div class="form-group" id="linkExistingWpGroup" style="display: none;">
-              <label>Or link to an existing Work Package:</label>
+              <label>Link to an existing Work Package</label>
               <select id="modalSelectExistingWp" class="form-select">
-                <option value="">-- No link --</option>
+                <option value="">-- Select a Work Package --</option>
                 <% @work_packages.each do |wp| %>
                   <option value="<%= wp.id %>">#<%= wp.id %> - <%= wp.subject %></option>
                 <% end %>

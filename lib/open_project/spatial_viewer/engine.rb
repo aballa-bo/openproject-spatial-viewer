@@ -14,7 +14,8 @@ module OpenProject
 
         project_module :spatial_viewer do
           permission :view_spatial_models,
-                     { spatial_models: %i[index show api_data model_file], spatial_annotations: %i[index] },
+                     { spatial_models: %i[index show api_data model_file],
+                       spatial_annotations: %i[index snapshot] },
                      permissible_on: :project,
                      public: true
 

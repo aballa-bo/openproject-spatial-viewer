@@ -20,8 +20,8 @@ Tested on OpenProject 16.6.
   `app/assets/javascripts/openproject_spatial_viewer/vendor.bundle.js`).
 - 3D markup tools: surface pin, polyline on mesh, lasso/region selection,
   distance measurement.
-- Each annotation stores a camera viewpoint + thumbnail and can create or link
-  a Work Package.
+- Annotations follow the **BCF** data model and are always tied to a Work
+  Package — see *Annotations & BCF*.
 - Section planes (X/Y/Z clipping), preset views (top/front/right/iso).
 - Dedicated permissions: `view_spatial_models`, `manage_spatial_models`,
   `create_spatial_annotations`.
@@ -31,9 +31,9 @@ Tested on OpenProject 16.6.
 ```
 app/
   controllers/   spatial_models_controller.rb, spatial_annotations_controller.rb
-  models/        spatial_model.rb (acts_as_attachable), spatial_annotation.rb
-  services/spatial_viewer/   ifc_converter.rb
-  workers/spatial_viewer/    convert_ifc_job.rb
+  models/        spatial_model.rb, spatial_annotation.rb  (both acts_as_attachable)
+  services/spatial_viewer/   ifc_converter.rb, annotation_bcf_sync.rb
+  workers/spatial_viewer/    convert_ifc_job.rb, sync_annotation_bcf_job.rb
   views/spatial_models/      index, new, edit, _form, show (show.html.erb = the viewer)
   assets/
     javascripts/openproject_spatial_viewer/
@@ -77,6 +77,50 @@ sudo systemctl restart openproject-web-1 openproject-worker-1
 
 Then hard-reload the browser (Ctrl+Shift+R) so the new `viewer_engine.js` is
 fetched instead of the cached copy.
+
+## Annotations & BCF
+
+Every annotation is a **viewpoint tied to a Work Package**, mirroring the BCF
+2.1 structure used by OpenProject's BIM module:
+
+| Plugin | BCF equivalent |
+|---|---|
+| `SpatialAnnotation` | `Bim::Bcf::Viewpoint` (camera, lines, clipping planes, snapshot) |
+| `SpatialAnnotation#work_package` | `Bim::Bcf::Issue#work_package` (the topic) |
+| `SpatialAnnotation#json_viewpoint` | BCF 2.1 viewpoint JSON (built in `to_bcf_viewpoint_json`) |
+| snapshot attachment (`description: "snapshot"`) | BCF viewpoint snapshot |
+
+Flow on save (`SpatialAnnotationsController#create`):
+
+1. A Work Package is resolved — the one selected in the modal, or a new one
+   created from the annotation title. `work_package` is mandatory.
+2. The canvas snapshot (data URI) is stored as a real attachment.
+3. `json_viewpoint` is computed from the camera + drawing geometry, converting
+   the viewer's Y-up coordinates to the BCF/IFC Z-up convention.
+4. `SpatialViewer::SyncAnnotationBcfJob` mirrors the annotation into
+   `Bim::Bcf::Issue` + `Bim::Bcf::Viewpoint` (keyed by `viewpoint_uuid`),
+   running as the system user. The snapshot is copied to the BCF viewpoint.
+
+Result: the annotation shows up in the **"BCF" section of the Work Package
+page** (thumbnail gallery), and in the plugin viewer's side panel (thumbnail +
+WP link; click restores the camera).
+
+### Requirements / degradation
+
+- The `Bim::Bcf` models are always present (bundled module), but the BCF group
+  only appears on the WP page when the project has the **BIM module enabled**
+  and the role has `view_linked_issues`.
+- Without BIM, the mirror step is a no-op and annotations live only in the
+  plugin viewer's panel (still linked to the WP, reachable via its link).
+
+### Known limits
+
+- Component selection/coloring (`ifc_guid`) is not populated — our OBJ/PLY
+  models have no IFC GUIDs, and IFC is served as converted GLB.
+- Clicking a viewpoint thumbnail *on the WP page* targets OpenProject's own IFC
+  viewer, not this plugin's viewer. Camera restore across the two viewers is
+  best-effort (axis conventions differ).
+- BCF comments ↔ Work Package journal are not wired yet (follow-up).
 
 ## IFC
 

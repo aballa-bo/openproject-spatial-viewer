@@ -13,6 +13,12 @@
   if (window.__spatialViewerRegistered) return;
   window.__spatialViewerRegistered = true;
 
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
   // ---- Cleanup previous viewer instance ----
   function destroyExistingViewer() {
     if (window.spatialViewerApp) {
@@ -665,14 +671,20 @@
   };
 
   SpatialViewerApp.prototype.saveAnnotation = function() {
-    var title = document.getElementById('modalAnnotTitle').value;
+    var title = (document.getElementById('modalAnnotTitle').value || '').trim();
     var desc = document.getElementById('modalAnnotDesc').value;
     var cwpEl = document.getElementById('modalCreateWpCheck');
-    var createWp = cwpEl ? cwpEl.checked : false;
+    var createWp = cwpEl ? cwpEl.checked : true;
     var wpSubject = document.getElementById('modalWpSubject').value;
     var ewpEl = document.getElementById('modalSelectExistingWp');
     var existingWpId = ewpEl ? ewpEl.value : '';
     var self = this;
+
+    if (!title) { alert('Please enter an annotation title.'); return; }
+    if (!createWp && !existingWpId) {
+      alert('Select an existing Work Package, or tick "Create a new Work Package".');
+      return;
+    }
 
     var payload = {
       spatial_annotation: {
@@ -688,8 +700,8 @@
         },
         geometry_data: this.pendingGeometry
       },
-      create_work_package: createWp ? 'true' : 'false',
-      wp_subject: wpSubject
+      create_work_package: (createWp && !existingWpId) ? 'true' : 'false',
+      wp_subject: wpSubject || title
     };
 
     fetch(this.apiUrl.replace('/api_data', '/spatial_annotations'), {
@@ -767,11 +779,37 @@
     annotations.forEach(function(a) {
       var card = document.createElement('div');
       card.className = 'annotation-card';
-      card.innerHTML = '<div class="annotation-card-header"><span class="annotation-title">' + a.title + '</span><span class="annotation-type-badge" style="background:' + a.color + ';color:#fff;">' + a.annotation_type.toUpperCase() + '</span></div>' +
-        (a.description ? '<div class="annotation-desc">' + a.description + '</div>' : '') +
-        (a.work_package_id ? '<div class="badge -success mt-1">Ticket #' + a.work_package_id + '</div>' : '') +
-        '<div class="annotation-meta"><span>' + (a.author_name||'') + '</span><span>' + (a.created_at||'') + '</span></div>';
-      card.addEventListener('click', function() { self.flyToAnnotation(a); });
+
+      var wpLabel = a.work_package_id
+        ? ('WP #' + a.work_package_id + (a.work_package_status ? ' · ' + esc(a.work_package_status) : ''))
+        : '';
+
+      var html = '';
+      if (a.snapshot_url) {
+        html += '<img class="annotation-thumb" src="' + esc(a.snapshot_url) + '" alt="viewpoint snapshot">';
+      }
+      html += '<div class="annotation-card-body">' +
+        '<div class="annotation-card-header">' +
+          '<span class="annotation-title">' + esc(a.title) + '</span>' +
+          '<span class="annotation-type-badge" style="background:' + esc(a.color || '#3b82f6') + ';color:#fff;">' +
+            esc(String(a.annotation_type || '').toUpperCase()) + '</span>' +
+        '</div>' +
+        (a.description ? '<div class="annotation-desc">' + esc(a.description) + '</div>' : '') +
+        (a.work_package_id
+          ? '<a class="annotation-wp-link" href="' + esc(a.work_package_url || ('/work_packages/' + a.work_package_id)) +
+              '" target="_blank" rel="noopener" title="' + esc(a.work_package_subject || '') + '">' +
+              '<i class="icon-relations"></i> ' + esc(wpLabel) + '</a>'
+          : '') +
+        '<div class="annotation-meta"><span>' + esc(a.author_name || '') + '</span><span>' + esc(a.created_at || '') + '</span></div>' +
+      '</div>';
+
+      card.innerHTML = html;
+
+      // Clicking the card (but not the WP link) restores the viewpoint.
+      card.addEventListener('click', function(e) {
+        if (e.target.closest && e.target.closest('.annotation-wp-link')) return;
+        self.flyToAnnotation(a);
+      });
       list.appendChild(card);
     });
   };
@@ -785,9 +823,18 @@
       return;
     }
     wps.forEach(function(wp) {
-      var card = document.createElement('div');
+      var card = document.createElement('a');
       card.className = 'annotation-card';
-      card.innerHTML = '<div class="annotation-card-header"><span class="annotation-title">#' + wp.id + ' - ' + wp.subject + '</span><span class="badge -info">' + (wp.type||'Task') + '</span></div><div class="annotation-meta"><span>Status: ' + (wp.status||'New') + '</span><span>Assigned: ' + (wp.assigned_to||'-') + '</span></div>';
+      card.href = '/work_packages/' + wp.id;
+      card.target = '_blank';
+      card.rel = 'noopener';
+      card.style.display = 'block';
+      card.style.textDecoration = 'none';
+      card.innerHTML = '<div class="annotation-card-body">' +
+        '<div class="annotation-card-header"><span class="annotation-title">#' + wp.id + ' – ' + esc(wp.subject) + '</span>' +
+        '<span class="badge -info">' + esc(wp.type || 'Task') + '</span></div>' +
+        '<div class="annotation-meta"><span>Status: ' + esc(wp.status || 'New') + '</span><span>Assignee: ' + esc(wp.assigned_to || '-') + '</span></div>' +
+        '</div>';
       list.appendChild(card);
     });
   };

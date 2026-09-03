@@ -90,7 +90,10 @@ class SpatialModelsController < ApplicationController
   end
 
   def api_data
-    annotations_json = @spatial_model.spatial_annotations.includes(:work_package, :author).map(&:as_json_payload)
+    annotations_json = @spatial_model.spatial_annotations
+                                     .includes(:work_package, :author, :attachments)
+                                     .order(created_at: :desc)
+                                     .map(&:as_json_payload)
     work_packages_json = @project.work_packages.visible.order(updated_at: :desc).limit(100).map do |wp|
       {
         id: wp.id,

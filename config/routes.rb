@@ -7,7 +7,11 @@ OpenProject::Application.routes.draw do
         get :api_data
         get :model_file
       end
-      resources :spatial_annotations, controller: 'spatial_annotations', only: [:index, :create, :update, :destroy]
+      resources :spatial_annotations, controller: 'spatial_annotations', only: [:index, :create, :update, :destroy] do
+        member do
+          get :snapshot
+        end
+      end
     end
   end
 
