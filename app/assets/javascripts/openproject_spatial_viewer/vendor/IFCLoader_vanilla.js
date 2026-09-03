@@ -1,1 +1,0 @@
-Couldn't find the requested file /examples/js/loaders/IFCLoader.js in three.

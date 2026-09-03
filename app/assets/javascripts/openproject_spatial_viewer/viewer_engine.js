@@ -19,6 +19,7 @@
       try {
         var app = window.spatialViewerApp;
         if (app._animFrameId) cancelAnimationFrame(app._animFrameId);
+        if (app._conversionPoll) clearTimeout(app._conversionPoll);
         if (app.renderer) {
           app.renderer.dispose();
           app.renderer.forceContextLoss();
@@ -245,6 +246,20 @@
         self.projectData = data;
         self.renderAnnotationsList(data.annotations);
         self.renderWorkPackagesList(data.work_packages);
+
+        // Formats converted server-side (e.g. IFC -> GLB): wait for the job.
+        var conv = data.conversion;
+        if (conv && conv.status && conv.status !== 'completed') {
+          if (conv.status === 'error') {
+            self.showLoader('Conversione IFC non riuscita: ' + (conv.message || 'errore sconosciuto'));
+            return;
+          }
+          self.showLoader('Conversione IFC in corso sul server (puo richiedere alcuni minuti)...');
+          clearTimeout(self._conversionPoll);
+          self._conversionPoll = setTimeout(function() { self.loadProjectData(); }, 8000);
+          return;
+        }
+
         self.load3DModel(data.model_url, data.model_format);
       })
       .catch(function(err) {
@@ -279,6 +294,23 @@
     fetch(url, { credentials: 'same-origin' })
       .then(function(response) {
         if (!response.ok) throw new Error('HTTP error ' + response.status);
+
+        // model_file returns JSON (not binary) while a server-side conversion
+        // is still pending/processing/failed. Poll until the .glb is ready.
+        var ct = response.headers.get('content-type') || '';
+        if (ct.indexOf('application/json') !== -1) {
+          return response.json().then(function(j) {
+            if (j && j.status === 'error') {
+              self.showLoader('Conversione non riuscita: ' + (j.message || 'errore sconosciuto'));
+            } else {
+              self.showLoader('Conversione del modello in corso sul server...');
+              clearTimeout(self._conversionPoll);
+              self._conversionPoll = setTimeout(function() { self.load3DModel(url, format); }, 8000);
+            }
+            return null; // stop this load attempt
+          });
+        }
+
         var contentLength = response.headers.get('content-length');
         if (!response.body || !window.ReadableStream || !contentLength) {
           return response.arrayBuffer();
@@ -309,6 +341,7 @@
         return read();
       })
       .then(function(buffer) {
+        if (!buffer) return; // conversion still pending: a poll was scheduled
         self.showLoader('Parsing 3D geometry...');
 
         if (format === 'glb' || format === 'gltf') {

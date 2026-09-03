@@ -10,7 +10,7 @@ Formati supportati:
 | glTF / GLB | funzionante (`THREE.GLTFLoader`) |
 | OBJ / Wavefront | funzionante (`THREE.OBJLoader`) |
 | PLY / Gaussian Splatting (`.ply`, `.splat`, `.ksplat`) | funzionante come point cloud |
-| IFC (BIM) | **parziale** — vedi *Limitazioni IFC* |
+| IFC (BIM) | conversione server-side IFC → GLB con `IfcConvert` — vedi *IFC* |
 
 Testato su OpenProject 16.6.
 
@@ -75,15 +75,48 @@ sudo systemctl restart openproject-web-1 openproject-worker-1
   asincrono; `viewer_engine.js` attende che `THREE` sia disponibile prima di
   inizializzare, per compatibilità con le navigazioni Turbo Drive.
 
-## Limitazioni IFC
+## IFC
 
-Il bundle non contiene un loader IFC reale. `viewer_engine.js` estrae solo i
-punti `IFCCARTESIANPOINT` via regex e li mostra come point cloud grezzo (senza
-trasformazioni di local placement). Per un rendering BIM corretto:
+Gli IFC non sono renderizzati lato client: vengono **convertiti sul server in
+GLB** e il viewer carica il GLB (che già funziona).
 
-1. integrare `web-ifc` + `IFCLoader` (file già presenti in `vendor/`), oppure
-2. conversione server-side IFC → GLB (IfcOpenShell / `IfcConvert`) in un job di
-   background, servendo il GLB da `SpatialModelsController#model_file`.
+Pipeline:
+
+1. All'upload (`create`/`update`) o alla prima apertura, `SpatialModel#enqueue_conversion`
+   accoda `SpatialViewer::ConvertIfcJob`.
+2. Il job invoca `SpatialViewer::IfcConverter`, che esegue
+   `IfcConvert -q -y --no-progress --center-model <in.ifc> <out.glb>`.
+3. Il GLB viene messo in cache in
+   `<attachments_storage_path>/spatial_viewer/<model_id>/model.glb`.
+4. Lo stato (`pending` / `processing` / `completed` / `error` + messaggio) è
+   salvato in `spatial_models.settings["conversion"]` ed esposto da `api_data`
+   nel campo `conversion`. Finché non è `completed`, `model_file` risponde JSON
+   e il viewer fa polling mostrando "Conversione in corso".
+5. La cache viene invalidata automaticamente quando cambia l'allegato
+   (`conversion.attachment_id`) e rimossa alla cancellazione del modello.
+
+### Requisiti / configurazione
+
+- Binario `IfcConvert` (IfcOpenShell). Cercato in: `IFCCONVERT_BIN`,
+  `<Rails.root>/bin/IfcConvert`, `/opt/openproject/bin/IfcConvert`, `$PATH`.
+  Il modulo BIM di OpenProject lo installa già in `bin/IfcConvert`.
+- `attachment_max_size`: per il modulo spatial il limite è **bypassato**
+  (`AttachmentPatch#internal_container?`), quindi gli IFC grandi si allegano
+  comunque. Attenzione però allo spazio disco.
+- Variabili d'ambiente:
+  - `SPATIAL_VIEWER_MAX_IFC_MB` (default `300`) — sopra questa soglia la
+    conversione viene rifiutata con un messaggio che rimanda al modulo BIM.
+  - `SPATIAL_VIEWER_CONVERT_TIMEOUT` (default `1800` s).
+
+### Limiti noti
+
+- Modelli molto grandi (es. export Revit da centinaia di MB) producono GLB
+  troppo pesanti per il browser: usare il visualizzatore IFC nativo del
+  modulo BIM di OpenProject (basato su XKT/xeokit, pensato per quei volumi).
+- `IfcConvert` può loggare `Triangulation missing for face` su geometrie
+  problematiche: sono warning, la conversione prosegue.
+- I file client-side `vendor/web-ifc*.js`, `vendor/IFCLoader*.js` non sono più
+  usati (restano per un'eventuale futura resa lato client).
 
 ## Storico
 

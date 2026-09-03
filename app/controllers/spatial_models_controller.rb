@@ -15,6 +15,7 @@ class SpatialModelsController < ApplicationController
   def show
     @annotations = @spatial_model.spatial_annotations.includes(:work_package, :author).order(created_at: :desc)
     @work_packages = @project.work_packages.visible.order(updated_at: :desc).limit(50)
+    @spatial_model.enqueue_conversion
   end
 
   def new
@@ -39,6 +40,7 @@ class SpatialModelsController < ApplicationController
           redirect_to edit_project_spatial_model_path(@project, @spatial_model)
           return
         end
+        @spatial_model.reload.enqueue_conversion(force: true)
       end
       flash[:notice] = I18n.t('notice_successful_create')
       redirect_to project_spatial_model_path(@project, @spatial_model)
@@ -61,6 +63,7 @@ class SpatialModelsController < ApplicationController
         )
         if attachment.save
           @spatial_model.attachments.where.not(id: attachment.id).destroy_all
+          @spatial_model.reload.enqueue_conversion(force: true)
         else
           flash[:error] = "Model details saved, but file replacement failed: #{attachment.errors.full_messages.join(', ')}"
           redirect_to edit_project_spatial_model_path(@project, @spatial_model)
@@ -81,15 +84,9 @@ class SpatialModelsController < ApplicationController
   end
 
   def model_file
-    attachment = @spatial_model.model_attachment
-    if attachment.present? && File.exist?(attachment.file.path)
-      send_file attachment.file.path,
-                filename: attachment.filename,
-                type: attachment.content_type || 'application/octet-stream',
-                disposition: 'inline'
-    else
-      render_404
-    end
+    return serve_converted_model if @spatial_model.needs_conversion?
+
+    serve_raw_attachment
   end
 
   def api_data
@@ -109,12 +106,16 @@ class SpatialModelsController < ApplicationController
                  model_file_project_spatial_model_path(@project, @spatial_model)
                end
 
+    @spatial_model.enqueue_conversion if @spatial_model.needs_conversion?
+
     render json: {
       id: @spatial_model.id,
       title: @spatial_model.title,
       description: @spatial_model.description,
-      model_format: @spatial_model.model_format,
+      model_format: @spatial_model.viewer_format,
+      source_format: @spatial_model.model_format,
       model_url: file_url,
+      conversion: conversion_payload,
       settings: @spatial_model.settings,
       annotations: annotations_json,
       work_packages: work_packages_json,
@@ -123,6 +124,50 @@ class SpatialModelsController < ApplicationController
   end
 
   private
+
+  # nil for formats that render directly; otherwise the current server-side
+  # conversion status so the front-end can wait / show errors.
+  def conversion_payload
+    return nil unless @spatial_model.needs_conversion?
+
+    if @spatial_model.model_attachment.blank?
+      return { status: "error", message: "Nessun file IFC allegato a questo modello." }
+    end
+
+    state = @spatial_model.conversion_state
+    {
+      status: @spatial_model.converted_file_ready? ? "completed" : (state["status"].presence || "pending"),
+      message: state["message"]
+    }
+  end
+
+  def serve_raw_attachment
+    attachment = @spatial_model.model_attachment
+    if attachment.present? && File.exist?(attachment.diskfile.path)
+      send_file attachment.diskfile.path,
+                filename: attachment.filename,
+                type: attachment.content_type.presence || 'application/octet-stream',
+                disposition: 'inline'
+    else
+      render_404
+    end
+  end
+
+  def serve_converted_model
+    if @spatial_model.converted_file_ready?
+      send_file @spatial_model.converted_file_path.to_s,
+                filename: "#{@spatial_model.title.parameterize.presence || 'model'}.glb",
+                type: 'model/gltf-binary',
+                disposition: 'inline'
+    else
+      @spatial_model.enqueue_conversion
+      state = @spatial_model.conversion_state
+      render json: {
+        status: state["status"].presence || "pending",
+        message: state["message"]
+      }
+    end
+  end
 
   def find_model
     @spatial_model = SpatialModel.find_by!(id: params[:id], project: @project)
