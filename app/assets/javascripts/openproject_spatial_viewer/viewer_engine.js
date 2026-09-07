@@ -26,6 +26,8 @@
         var app = window.spatialViewerApp;
         if (app._animFrameId) cancelAnimationFrame(app._animFrameId);
         if (app._conversionPoll) clearTimeout(app._conversionPoll);
+        if (app._gltfWorker) { try { app._gltfWorker.terminate(); } catch (ignore3) {} }
+        app._modelBlob = null;
         if (app._xrSession) { try { app._xrSession.end(); } catch (ignore2) {} }
         if (app.renderer) {
           app.renderer.setAnimationLoop(null);
@@ -300,7 +302,6 @@
     }
 
     format = (format || 'glb').toLowerCase();
-    this.showLoader('Downloading 3D model (' + format.toUpperCase() + ')...');
 
     if (typeof THREE === 'undefined') {
       this.showLoader('Error: Three.js engine failed to initialize.');
@@ -308,93 +309,281 @@
     }
 
     var self = this;
-    fetch(url, { credentials: 'same-origin' })
-      .then(function(response) {
-        if (!response.ok) throw new Error('HTTP error ' + response.status);
+    var warnMb = parseInt(this.container.dataset.maxModelMb, 10) || 250;
+    var heavyMb = parseInt(this.container.dataset.heavyModelMb, 10) || 40;
 
-        // model_file returns JSON (not binary) while a server-side conversion
-        // is still pending/processing/failed. Poll until the .glb is ready.
-        var ct = response.headers.get('content-type') || '';
-        if (ct.indexOf('application/json') !== -1) {
-          return response.json().then(function(j) {
-            if (j && j.status === 'error') {
-              self.showLoader('Conversion failed: ' + (j.message || 'unknown error'));
-            } else {
-              self.showLoader('Converting the model on the server...');
-              clearTimeout(self._conversionPoll);
-              self._conversionPoll = setTimeout(function() { self.load3DModel(url, format); }, 8000);
+    this.showLoader('Checking 3D model...');
+
+    // (6) HEAD first: learn the size before pulling the whole file.
+    fetch(url, { method: 'HEAD', credentials: 'same-origin' })
+      .then(function(head) {
+        var ct = head.headers.get('content-type') || '';
+        var lenHdr = head.headers.get('content-length');
+        var bytes = lenHdr ? parseInt(lenHdr, 10) : 0;
+
+        if (ct.indexOf('application/json') === -1 && bytes > 0) {
+          self._modelBytes = bytes;
+          self.heavyMode = bytes >= heavyMb * 1048576;
+
+          if (bytes > warnMb * 1048576) {
+            var mb = (bytes / 1048576).toFixed(0);
+            var ok = window.confirm(
+              'This 3D model is about ' + mb + ' MB.\n\n' +
+              'Loading it may take a long time, use a lot of memory, or crash ' +
+              'this browser tab. Continue?');
+            if (!ok) {
+              self.showLoader('Loading cancelled — the model is ' + mb + ' MB. ' +
+                'Reload the page to try again.');
+              return { aborted: true };
             }
-            return null; // stop this load attempt
-          });
+          }
         }
-
-        var contentLength = response.headers.get('content-length');
-        if (!response.body || !window.ReadableStream || !contentLength) {
-          return response.arrayBuffer();
-        }
-        var total = parseInt(contentLength, 10);
-        var loaded = 0;
-        var reader = response.body.getReader();
-        var chunks = [];
-
-        function read() {
-          return reader.read().then(function(result) {
-            if (result.done) {
-              var buf = new Uint8Array(loaded);
-              var offset = 0;
-              for (var i = 0; i < chunks.length; i++) {
-                buf.set(chunks[i], offset);
-                offset += chunks[i].length;
-              }
-              return buf.buffer;
-            }
-            chunks.push(result.value);
-            loaded += result.value.length;
-            var pct = total > 0 ? Math.round((loaded / total) * 100) + '% ' : '';
-            self.showLoader('Downloading model: ' + pct + '(' + (loaded / 1048576).toFixed(1) + ' MB)');
-            return read();
-          });
-        }
-        return read();
+        return self._downloadModel(url, format);
       })
-      .then(function(buffer) {
-        if (!buffer) return; // conversion still pending: a poll was scheduled
-        self.showLoader('Parsing 3D geometry...');
-
-        if (format === 'glb' || format === 'gltf') {
-          var gltfLoader = new THREE.GLTFLoader();
-          gltfLoader.parse(buffer, '',
-            function(gltf) { self.onModelLoaded(gltf.scene); },
-            function(err) {
-              console.error('[SpatialViewer] GLTF parse error:', err);
-              self.showLoader('Error parsing GLTF/GLB: ' + (err.message || err));
-            }
-          );
-        } else if (format === 'obj') {
-          var text = new TextDecoder('utf-8').decode(buffer);
-          var objLoader = new THREE.OBJLoader();
-          self.onModelLoaded(objLoader.parse(text));
-        } else if (format === 'ply' || format === 'gaussian_splat' || format === 'splat' || format === 'ksplat') {
-          var plyLoader = new THREE.PLYLoader();
-          var geom = plyLoader.parse(buffer);
-          geom.computeVertexNormals();
-          var mat = geom.hasAttribute('color')
-            ? new THREE.PointsMaterial({ size: 0.05, vertexColors: true })
-            : new THREE.PointsMaterial({ size: 0.05, color: 0x38bdf8 });
-          self.onModelLoaded(new THREE.Points(geom, mat));
-        } else if (format === 'ifc') {
-          // IFC: attempt simple GLB-like parse; if the server converted it, it works.
-          // Otherwise, parse as text and build simple geometry.
-          self.parseIfcBuffer(buffer);
-        } else {
-          self.hideLoader();
-          self.createDemoModel();
-        }
+      .catch(function() {
+        // HEAD blocked/unsupported: just download, rely on GET headers.
+        return self._downloadModel(url, format);
+      })
+      .then(function(res) {
+        if (!res || res.aborted || res.pending) return;
+        self._parseModel(res.buffer, format);
       })
       .catch(function(err) {
         console.error('[SpatialViewer] Model loading failed:', err);
-        self.showLoader('Error downloading model: ' + err.message);
+        self.showLoader('Error loading model: ' + (err && err.message || err));
       });
+  };
+
+  // Download the model, streaming for progress. Returns { buffer } / { pending }.
+  SpatialViewerApp.prototype._downloadModel = function(url, format) {
+    var self = this;
+    self.showLoader('Downloading 3D model (' + format.toUpperCase() + ')...');
+
+    return fetch(url, { credentials: 'same-origin' }).then(function(response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+
+      // model_file replies JSON while a server-side conversion is pending.
+      var ct = response.headers.get('content-type') || '';
+      if (ct.indexOf('application/json') !== -1) {
+        return response.json().then(function(j) {
+          if (j && j.status === 'error') {
+            self.showLoader('Conversion failed: ' + (j.message || 'unknown error'));
+          } else {
+            self.showLoader('Converting the model on the server...');
+            clearTimeout(self._conversionPoll);
+            self._conversionPoll = setTimeout(function() { self.load3DModel(url, format); }, 8000);
+          }
+          return { pending: true };
+        });
+      }
+
+      var lenHdr = response.headers.get('content-length');
+      var total = lenHdr ? parseInt(lenHdr, 10) : 0;
+      if (total && !self._modelBytes) {
+        self._modelBytes = total;
+        self.heavyMode = total >= ((parseInt(self.container.dataset.heavyModelMb, 10) || 40) * 1048576);
+      }
+
+      if (!response.body || !window.ReadableStream) {
+        return response.arrayBuffer().then(function(b) {
+          try { self._modelBlob = new Blob([b]); } catch (e) {}
+          return { buffer: b };
+        });
+      }
+
+      var loaded = 0;
+      var chunks = [];
+      var reader = response.body.getReader();
+
+      function read() {
+        return reader.read().then(function(r) {
+          if (r.done) {
+            // (3) Hand the bytes to a browser-managed Blob and drop the chunks;
+            // the ArrayBuffer is then transferred to the worker so the main
+            // thread heap is freed during parsing.
+            var blob = new Blob(chunks);
+            chunks.length = 0;
+            self._modelBlob = blob;
+            return blob.arrayBuffer().then(function(b) { return { buffer: b }; });
+          }
+          chunks.push(r.value);
+          loaded += r.value.length;
+          var pct = total ? Math.round(loaded / total * 100) + '% ' : '';
+          self.showLoader('Downloading model: ' + pct + '(' + (loaded / 1048576).toFixed(1) + ' MB)');
+          return read();
+        });
+      }
+      return read();
+    });
+  };
+
+  SpatialViewerApp.prototype._parseModel = function(buffer, format) {
+    var self = this;
+    self.showLoader('Parsing 3D geometry...');
+
+    if (format === 'glb' || format === 'gltf') {
+      self._parseGltf(buffer);
+    } else if (format === 'obj') {
+      self.onModelLoaded(new THREE.OBJLoader().parse(new TextDecoder('utf-8').decode(buffer)));
+    } else if (format === 'ply' || format === 'gaussian_splat' || format === 'splat' || format === 'ksplat') {
+      var geom = new THREE.PLYLoader().parse(buffer);
+      geom.computeVertexNormals();
+      var mat = geom.hasAttribute('color')
+        ? new THREE.PointsMaterial({ size: 0.05, vertexColors: true })
+        : new THREE.PointsMaterial({ size: 0.05, color: 0x38bdf8 });
+      self.onModelLoaded(new THREE.Points(geom, mat));
+    } else if (format === 'ifc') {
+      self.parseIfcBuffer(buffer);
+    } else {
+      self.hideLoader();
+      self.createDemoModel();
+    }
+  };
+
+  // (7) Parse GLB/GLTF in a Web Worker so the main thread does not freeze.
+  // Falls back to a main-thread GLTFLoader.parse() on any failure (e.g. the GLB
+  // has textures / KHR extensions the worker path can't handle).
+  SpatialViewerApp.prototype._parseGltf = function(buffer) {
+    var self = this;
+
+    function mainThreadParse(buf) {
+      self.showLoader('Parsing 3D geometry (the page may briefly freeze)...');
+      try {
+        new THREE.GLTFLoader().parse(buf, '',
+          function(gltf) { self.onModelLoaded(gltf.scene); },
+          function(err) {
+            console.error('[SpatialViewer] GLTF parse error:', err);
+            self.showLoader('Error parsing GLTF/GLB: ' + (err && err.message || err));
+          });
+      } catch (err) {
+        self.showLoader('Error parsing GLTF/GLB: ' + (err && err.message || err));
+      }
+    }
+
+    function recoverAndFallback() {
+      if (self._modelBlob) {
+        self._modelBlob.arrayBuffer()
+          .then(mainThreadParse)
+          .catch(function(err) { self.showLoader('Error loading model: ' + (err && err.message || err)); });
+      } else {
+        self.showLoader('Could not load the 3D model (background parse failed).');
+      }
+    }
+
+    if (!window.Worker) { mainThreadParse(buffer); return; }
+
+    var worker;
+    try {
+      worker = new Worker('/assets/openproject_spatial_viewer/gltf_worker.js');
+    } catch (err) {
+      console.warn('[SpatialViewer] GLTF worker unavailable, parsing on main thread:', err);
+      mainThreadParse(buffer);
+      return;
+    }
+
+    self._gltfWorker = worker;
+    var settled = false;
+    var timer = setTimeout(function() {
+      if (settled) return;
+      settled = true;
+      console.warn('[SpatialViewer] GLTF worker timed out; falling back to main thread');
+      try { worker.terminate(); } catch (e) {}
+      recoverAndFallback();
+    }, 120000);
+
+    function finish(fn) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { worker.terminate(); } catch (e) {}
+      fn();
+    }
+
+    worker.onmessage = function(ev) {
+      var d = ev.data || {};
+      if (d.type === 'done') {
+        finish(function() {
+          try {
+            self.onModelLoaded(self._rebuildFromWorker(d.meshes));
+          } catch (err) {
+            console.error('[SpatialViewer] Rebuilding worker meshes failed:', err);
+            recoverAndFallback();
+          }
+        });
+      } else if (d.type === 'error') {
+        console.warn('[SpatialViewer] Worker parse failed (' + d.error + '); falling back to main thread');
+        finish(recoverAndFallback);
+      }
+    };
+    worker.onerror = function(err) {
+      console.warn('[SpatialViewer] Worker error; falling back to main thread:', err && err.message);
+      finish(recoverAndFallback);
+    };
+
+    self.showLoader('Parsing 3D geometry in the background...');
+    worker.postMessage(
+      { type: 'parse', buffer: buffer, bundleUrl: '/assets/openproject_spatial_viewer/vendor.bundle.js' },
+      [buffer]
+    );
+  };
+
+  SpatialViewerApp.prototype._rebuildFromWorker = function(meshesData) {
+    var group = new THREE.Group();
+    (meshesData || []).forEach(function(md) {
+      var geom = new THREE.BufferGeometry();
+      Object.keys(md.attributes || {}).forEach(function(name) {
+        var d = md.attributes[name];
+        geom.setAttribute(name, new THREE.BufferAttribute(new Float32Array(d.buffer), d.itemSize));
+      });
+      if (md.index) {
+        var Ctor = (md.index.ctor === 'Uint16Array') ? Uint16Array : Uint32Array;
+        geom.setIndex(new THREE.BufferAttribute(new Ctor(md.index.buffer), 1));
+      }
+      if (!(md.attributes && md.attributes.normal) && !md.isPoints) geom.computeVertexNormals();
+
+      var mp = md.material || {};
+      var obj;
+      if (md.isPoints) {
+        obj = new THREE.Points(geom, new THREE.PointsMaterial({
+          size: 0.05,
+          color: mp.color != null ? mp.color : 0x38bdf8,
+          vertexColors: !!mp.vertexColors
+        }));
+      } else {
+        obj = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
+          color: mp.color != null ? mp.color : 0xb8c0cc,
+          metalness: mp.metalness != null ? mp.metalness : 0.1,
+          roughness: mp.roughness != null ? mp.roughness : 0.85,
+          transparent: !!mp.transparent,
+          opacity: mp.opacity != null ? mp.opacity : 1,
+          vertexColors: !!mp.vertexColors,
+          side: mp.doubleSided ? THREE.DoubleSide : THREE.FrontSide
+        }));
+      }
+      obj.name = md.name || '';
+      obj.matrixAutoUpdate = false;
+      if (md.matrixWorld && md.matrixWorld.length === 16) obj.matrix.fromArray(md.matrixWorld);
+      group.add(obj);
+    });
+    return group;
+  };
+
+  // (1) Drop shadows / high-DPI rendering for heavy models.
+  SpatialViewerApp.prototype._applyPerformanceMode = function() {
+    if (!this.renderer) return;
+    var heavy = !!this.heavyMode;
+    this.renderer.shadowMap.enabled = !heavy;
+    this.renderer.shadowMap.needsUpdate = true;
+    this.renderer.setPixelRatio(heavy ? 1 : Math.min(window.devicePixelRatio, 2));
+
+    if (heavy) {
+      this.showTooltip('Large model — shadows and high-DPI rendering are off for performance.');
+      var self = this;
+      setTimeout(function() {
+        var t = document.getElementById('drawingTooltip');
+        if (t && self.currentTool === 'orbit') t.style.display = 'none';
+      }, 5000);
+    }
   };
 
   /**
@@ -479,6 +668,9 @@
 
     this.modelMeshObjects = [];
     var self = this;
+    var heavy = !!this.heavyMode;
+    var triangles = 0;
+
     object.traverse(function(child) {
       if (child.isMesh || child.isPoints) {
         if (child.material) {
@@ -488,11 +680,23 @@
             child.material.clippingPlanes = self.clipPlanes;
           }
         }
-        child.castShadow = true;
-        child.receiveShadow = true;
+        child.castShadow = !heavy;
+        child.receiveShadow = !heavy;
         self.modelMeshObjects.push(child);
+
+        var g = child.geometry;
+        if (g && g.index) triangles += g.index.count / 3;
+        else if (g && g.attributes && g.attributes.position) triangles += g.attributes.position.count / 3;
       }
     });
+
+    // (1) Escalate to heavy mode if the mesh is dense even when the file is small.
+    if (!heavy && triangles > 4000000) {
+      heavy = this.heavyMode = true;
+      this.modelMeshObjects.forEach(function(m) { m.castShadow = false; m.receiveShadow = false; });
+    }
+    this._applyPerformanceMode();
+    this._modelBlob = null; // release the downloaded bytes
 
     var box = new THREE.Box3().setFromObject(object);
     var center = box.getCenter(new THREE.Vector3());

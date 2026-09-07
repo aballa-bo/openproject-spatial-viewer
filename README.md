@@ -161,11 +161,20 @@ Pipeline:
     rejected with a message pointing to the BIM module.
   - `SPATIAL_VIEWER_CONVERT_TIMEOUT` (default `1800` seconds).
 
-### Known limits
+### Large models
 
-- Very large models (e.g. multi-hundred-MB Revit exports) produce GLB files too
-  heavy for the browser: use the native IFC viewer in the OpenProject BIM module
-  (XKT/xeokit, designed for that scale).
+- `gltf_worker.js` parses GLB/GLTF in a **Web Worker** (no main-thread freeze),
+  transferring de-interleaved geometry back to the viewer. Textured / Draco /
+  meshopt models fall back to a main-thread `GLTFLoader.parse()`.
+- The download is buffered through a `Blob` and the `ArrayBuffer` is transferred
+  to the worker, so it is not held on the main-thread heap during parsing.
+- A `HEAD` request checks the size first: above `data-max-model-mb` (default
+  250) the viewer asks for confirmation before downloading.
+- Above `data-heavy-model-mb` (default 40), or >4M triangles, "heavy mode"
+  turns off shadows and caps `pixelRatio` at 1.
+- Still not solved: no Draco/meshopt/KTX2 decoders (compressed GLB fails with a
+  clear error), no BVH raycast, no LOD. Very large models (multi-hundred-MB
+  Revit exports) are still better served by the BIM module's XKT/xeokit viewer.
 - `IfcConvert` may log `Triangulation missing for face` on problematic geometry:
   these are warnings, conversion continues.
 - `vendor/web-ifc*.js` and `vendor/IFCLoader*.js` are currently unused (kept for

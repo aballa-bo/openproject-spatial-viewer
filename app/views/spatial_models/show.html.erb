@@ -1,6 +1,10 @@
 <% html_title "#{@spatial_model.title} - 3D Viewer" %>
 
-<div class="spatial-viewer-app" id="spatialViewerApp" data-api-url="<%= api_data_project_spatial_model_path(@project, @spatial_model) %>" data-csrf-token="<%= form_authenticity_token %>">
+<div class="spatial-viewer-app" id="spatialViewerApp"
+     data-api-url="<%= api_data_project_spatial_model_path(@project, @spatial_model) %>"
+     data-csrf-token="<%= form_authenticity_token %>"
+     data-max-model-mb="250"
+     data-heavy-model-mb="40">
 
   <div class="spatial-toolbar">
     <div class="toolbar-section toolbar-title-group">
