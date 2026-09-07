@@ -1476,10 +1476,13 @@
     this._panelOpen = !sp.classList.contains('collapsed');
     this._applyPanelState();
 
+    // Bind once, even if initUI is somehow re-entered for this DOM.
     var btn = document.getElementById('btnSidePanelToggle');
-    if (btn) {
+    if (btn && btn.dataset.spatialToggleBound !== '1') {
+      btn.dataset.spatialToggleBound = '1';
       btn.addEventListener('click', function(e) {
         e.preventDefault();
+        e.stopPropagation();
         self.toggleSidePanel();
       });
     }
@@ -1522,18 +1525,33 @@
   SpatialViewerApp.prototype._applyPanelState = function() {
     var sp = this.sidePanel;
     if (!sp) return;
+
     if (this._panelOpen) {
       sp.classList.remove('collapsed');
+      // Inline styles so no stylesheet rule can keep it hidden.
+      sp.style.display = 'flex';
       sp.style.width = this._panelWidth + 'px';
+      sp.style.minWidth = '';
+      // If no form is open, make sure a stale "creating" state cannot leave the
+      // panel showing an empty New Work Package form instead of the tabs.
+      if (!this.pendingGeometry) sp.classList.remove('creating');
     } else {
       sp.classList.add('collapsed');
+      sp.style.display = 'none';
+      sp.style.width = '0px';
     }
+
     var btn = document.getElementById('btnSidePanelToggle');
     if (btn) {
       if (this._panelOpen) btn.classList.add('active');
       else btn.classList.remove('active');
     }
     if (this._resizeHandler) this._resizeHandler(); // keep the canvas in step
+
+    console.log('[SpatialViewer] side panel ' +
+      (this._panelOpen ? 'OPEN ' + this._panelWidth + 'px' : 'CLOSED') +
+      ' (computed display=' + window.getComputedStyle(sp).display +
+      ', width=' + window.getComputedStyle(sp).width + ')');
   };
 
   SpatialViewerApp.prototype.toggleSidePanel = function() {
