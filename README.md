@@ -30,8 +30,9 @@ Tested on OpenProject 16.6.
   against `gl_FragCoord`); `depthTest` keeps only the front-most surface. The
   tint is pixel-exact on the visible surface — no offset, no speckle, correct
   occlusion — and identical for glb / ifc / gaussian-splat. It updates live
-  while drawing (uniform refresh only) and is rebuilt from the stored viewpoint
-  when an annotation is opened.
+  while drawing (uniform refresh only), stays on the annotation that was just
+  created, and is rebuilt by `showAnnotationSurface()` whenever a saved
+  annotation is opened from the list (projected through the current camera).
 - Only at pointer-up is the screen ring down-sampled to ≤64 points and
   projected to 3D for storage (rays that miss the mesh fall back to the focal
   plane, so the stored ring always has the drawn shape).

@@ -1439,6 +1439,10 @@
         self.projectData.annotations.unshift(result.annotation);
         self.renderAnnotationsList(self.projectData.annotations);
         self.renderExisting3DAnnotations();
+        // Keep the filled surface highlight on the annotation that was just
+        // created, rebuilt from its stored ring (the camera has not moved, so
+        // it matches exactly what was drawn).
+        self.showAnnotationSurface(result.annotation);
         var c = document.getElementById('annotationCountHeader');
         if (c) c.innerText = self.projectData.annotations.length;
         var annTab = document.querySelector('.tab-btn[data-tab="annotationsTab"]');
@@ -1494,17 +1498,21 @@
     });
   };
 
+  // Re-project a saved lasso annotation's 3D ring through the current camera
+  // and tint the model surface inside it (the same filled highlight shown while
+  // drawing). Rebuilt each time so it matches the current viewpoint.
+  SpatialViewerApp.prototype.showAnnotationSurface = function(a) {
+    this._setLassoHighlight(null);
+    if (!a || a.annotation_type !== 'lasso_selection') return;
+    var gd = a.geometry_data;
+    if (!gd || !gd.points || gd.points.length < 3) return;
+    var ring = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
+    this._selectSurfaceInLasso(ring, this.camera, a.color || '#3b82f6');
+  };
+
   SpatialViewerApp.prototype.flyToAnnotation = function(a) {
     var self = this;
-
-    var showSelection = function() {
-      self._setLassoHighlight(null); // rebuild for this viewpoint
-      if (a.annotation_type === 'lasso_selection' && a.geometry_data && a.geometry_data.points &&
-          a.geometry_data.points.length >= 3) {
-        var ring = a.geometry_data.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
-        self._selectSurfaceInLasso(ring, self.camera, a.color || '#3b82f6');
-      }
-    };
+    var showSelection = function() { self.showAnnotationSurface(a); };
 
     if (!a.camera_viewpoint || !a.camera_viewpoint.eye) { showSelection(); return; }
 
