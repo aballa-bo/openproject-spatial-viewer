@@ -106,6 +106,18 @@ class SpatialAnnotation < ApplicationRecord
     "/work_packages/#{work_package_id}"
   end
 
+  # The snapshot route is nested under project + spatial model, so it must be
+  # built with the route helper rather than hand-assembled.
+  def snapshot_url
+    return nil if snapshot.blank? || spatial_model.blank?
+
+    Rails.application.routes.url_helpers
+         .snapshot_project_spatial_model_spatial_annotation_path(spatial_model.project, spatial_model, self)
+  rescue StandardError => e
+    Rails.logger.warn("[SpatialViewer] Could not build snapshot URL for annotation ##{id}: #{e.message}")
+    nil
+  end
+
   def as_json_payload
     {
       id:,
@@ -117,7 +129,7 @@ class SpatialAnnotation < ApplicationRecord
       camera_viewpoint:,
       geometry_data:,
       json_viewpoint:,
-      snapshot_url: (snapshot ? "/spatial_annotations/#{id}/snapshot" : nil),
+      snapshot_url:,
       work_package_id:,
       work_package_url:,
       work_package_subject: work_package&.subject,

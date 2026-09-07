@@ -10,7 +10,7 @@ class SpatialAnnotationsController < ApplicationController
 
   def index
     @annotations = @spatial_model.spatial_annotations
-                                 .includes(:work_package, :author, :attachments)
+                                 .includes(:work_package, :author, :attachments, spatial_model: :project)
                                  .order(created_at: :desc)
     render json: @annotations.map(&:as_json_payload)
   end
