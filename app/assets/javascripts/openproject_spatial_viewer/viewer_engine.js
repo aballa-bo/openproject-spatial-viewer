@@ -28,6 +28,11 @@
         if (app._conversionPoll) clearTimeout(app._conversionPoll);
         if (app._gltfWorker) { try { app._gltfWorker.terminate(); } catch (ignore3) {} }
         app._modelBlob = null;
+        if (app.modelMeshObjects) {
+          app.modelMeshObjects.forEach(function(m) {
+            try { if (m.geometry && m.geometry.disposeBoundsTree) m.geometry.disposeBoundsTree(); } catch (e) {}
+          });
+        }
         if (app._xrSession) { try { app._xrSession.end(); } catch (ignore2) {} }
         if (app.renderer) {
           app.renderer.setAnimationLoop(null);
@@ -179,7 +184,23 @@
     this.loadProjectData();
   }
 
+  // Wire three-mesh-bvh onto THREE (once) so surface raycasts stay fast on big
+  // meshes. No-op if the library did not load.
+  function installBVH() {
+    if (typeof THREE === 'undefined' || THREE.__bvhInstalled || !window.MeshBVHLib) return;
+    try {
+      THREE.BufferGeometry.prototype.computeBoundsTree = window.MeshBVHLib.computeBoundsTree;
+      THREE.BufferGeometry.prototype.disposeBoundsTree = window.MeshBVHLib.disposeBoundsTree;
+      THREE.Mesh.prototype.raycast = window.MeshBVHLib.acceleratedRaycast;
+      THREE.__bvhInstalled = true;
+      console.log('[SpatialViewer] three-mesh-bvh installed');
+    } catch (e) {
+      console.warn('[SpatialViewer] BVH install failed:', e);
+    }
+  }
+
   SpatialViewerApp.prototype.initThree = function() {
+    installBVH();
     var width = this.viewport.clientWidth || window.innerWidth;
     var height = this.viewport.clientHeight || (window.innerHeight - 150);
 
@@ -237,6 +258,7 @@
     this.scene.add(this.lassoHighlightGroup);
 
     this.raycaster = new THREE.Raycaster();
+    this.raycaster.firstHitOnly = true; // honoured by three-mesh-bvh
     this.mouse = new THREE.Vector2();
 
     this.clipPlanes = [
@@ -251,6 +273,11 @@
     this.renderer.setAnimationLoop(function() {
       var presenting = self.renderer.xr && self.renderer.xr.isPresenting;
       if (self.controls && !presenting) self.controls.update();
+      // Frame-rate-driven sampling of the drawing stroke: guarantees a dense
+      // outline regardless of how the browser batches pointermove events.
+      if (self.isDrawing && self._pointerClient) {
+        self._sampleDrawPoint(self._pointerClient.x, self._pointerClient.y);
+      }
       if (self.renderer && self.scene && self.camera) {
         self.renderer.render(self.scene, self.camera);
       }
@@ -669,6 +696,7 @@
     this.modelObject = object;
     this.scene.add(object);
 
+    this._bvhReady = false; // rebuild BVH for the new model on next tool use
     this.modelMeshObjects = [];
     var self = this;
     var heavy = !!this.heavyMode;
@@ -700,6 +728,10 @@
     }
     this._applyPerformanceMode();
     this._modelBlob = null; // release the downloaded bytes
+
+    // Build the BVH now for light models (cheap); defer it for heavy ones to
+    // the first time a drawing tool is used.
+    if (!heavy) this._ensureBVH();
 
     var box = new THREE.Box3().setFromObject(object);
     var center = box.getCenter(new THREE.Vector3());
@@ -765,6 +797,33 @@
     this.viewport.addEventListener('pointerdown', function(e) { self.onPointerDown(e); });
     this.viewport.addEventListener('pointermove', function(e) { self.onPointerMove(e); });
     this.viewport.addEventListener('pointerup', function(e) { self.onPointerUp(e); });
+    this.viewport.addEventListener('pointerleave', function(e) { self.onPointerUp(e); });
+    this.viewport.addEventListener('pointercancel', function(e) { self.onPointerUp(e); });
+  };
+
+  // Build BVH bounds trees for the model meshes (once). Synchronous: a one-time
+  // freeze of up to ~1-2 s on very large models, triggered when a tool that
+  // needs surface raycasts is first used.
+  SpatialViewerApp.prototype._ensureBVH = function() {
+    if (this._bvhReady) return;
+    this._bvhReady = true;
+    if (!THREE.__bvhInstalled || !this.modelMeshObjects) return;
+
+    var todo = this.modelMeshObjects.filter(function(m) {
+      if (!m.isMesh || !m.geometry || m.geometry.boundsTree) return false;
+      var pos = m.geometry.attributes && m.geometry.attributes.position;
+      return pos && pos.count > 30 && pos.count <= 9000000;
+    });
+    if (!todo.length) return;
+
+    var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+    todo.forEach(function(m) {
+      try { m.geometry.computeBoundsTree({ maxLeafTris: 12 }); } catch (e) {
+        console.warn('[SpatialViewer] computeBoundsTree failed:', e);
+      }
+    });
+    var t1 = (window.performance && performance.now) ? performance.now() : Date.now();
+    console.log('[SpatialViewer] BVH: ' + todo.length + ' tree(s) in ' + Math.round(t1 - t0) + ' ms');
   };
 
   SpatialViewerApp.prototype._raycastAt = function(clientX, clientY) {
@@ -811,6 +870,7 @@
       this._setLassoHighlight(null);
       this.currentDrawingPoints = [this._surfacePoint(hit)];
       this._lastSampleClient = { x: e.clientX, y: e.clientY };
+      this._pointerClient = { x: e.clientX, y: e.clientY };
       this._updateOutline(this.currentDrawingPoints, this.currentTool === 'lasso');
     } else if (this.currentTool === 'measure') {
       if (!this.measureStartPoint) {
@@ -824,24 +884,24 @@
   };
 
   SpatialViewerApp.prototype.onPointerMove = function(e) {
+    this._pointerClient = { x: e.clientX, y: e.clientY };
     if (!this.isDrawing) return;
-    // Use coalesced sub-frame positions so fast strokes still sample densely,
-    // but cap the number of raycasts per event.
+    // Coalesced sub-frame positions catch fast strokes; the rAF loop covers the
+    // rest. Cap raycasts per event.
     var list = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
-    var n = list.length, maxRays = 16, stride = n > maxRays ? Math.ceil(n / maxRays) : 1;
+    var n = list.length, maxRays = 20, stride = n > maxRays ? Math.ceil(n / maxRays) : 1;
     for (var i = 0; i < n; i += stride) {
       this._sampleDrawPoint(list[i].clientX, list[i].clientY);
     }
-    if (stride > 1) this._sampleDrawPoint(list[n - 1].clientX, list[n - 1].clientY);
   };
 
   SpatialViewerApp.prototype._sampleDrawPoint = function(clientX, clientY) {
     var isLasso = this.currentTool === 'lasso';
-    var minPx = isLasso ? 3 : 6;
+    var minPx = isLasso ? 2 : 5;
     var last = this._lastSampleClient || { x: clientX, y: clientY };
     var dx = clientX - last.x, dy = clientY - last.y;
     if (dx * dx + dy * dy < minPx * minPx) return;
-    if (this.currentDrawingPoints.length >= 6000) return;
+    if (this.currentDrawingPoints.length >= 8000) return;
 
     var hit = this._raycastAt(clientX, clientY);
     if (!hit) return;
@@ -872,18 +932,20 @@
     });
   };
 
-  // Outline preview: LineLoop when closed (lasso), Line when open (draw).
+  // Outline preview. When closed (lasso) the ring is explicitly closed by
+  // repeating the first point (more reliable than LineLoop across drivers).
   SpatialViewerApp.prototype._updateOutline = function(points, closed) {
     if (this.currentDrawingLine) {
       this.tempMarkupGroup.remove(this.currentDrawingLine);
       this.currentDrawingLine.geometry.dispose();
       this.currentDrawingLine = null;
     }
-    var geom = new THREE.BufferGeometry().setFromPoints(points);
+    var pts = (closed && points.length > 2) ? points.concat([points[0]]) : points;
+    var geom = new THREE.BufferGeometry().setFromPoints(pts);
     var mat = new THREE.LineBasicMaterial({
       color: new THREE.Color(this.activeColor), depthTest: false, transparent: true
     });
-    this.currentDrawingLine = closed ? new THREE.LineLoop(geom, mat) : new THREE.Line(geom, mat);
+    this.currentDrawingLine = new THREE.Line(geom, mat);
     this.currentDrawingLine.renderOrder = 999;
     this.tempMarkupGroup.add(this.currentDrawingLine);
   };
@@ -902,19 +964,16 @@
     if (objOrNull) g.add(objOrNull);
   };
 
-  // Select the portion of the MODEL SURFACE (glb / ifc / gaussian splat) that
-  // falls inside the lasso polygon, seen from `camera`. Returns a Group with a
-  // translucent overlay mesh (+ points for splat clouds), or null.
-  //
-  // Method: project every model vertex to screen space once, test against the
-  // 2D lasso polygon (even-odd), keep faces with a majority of vertices inside
-  // that also face the camera. No raycasting -> cost is O(verts + faces), one
-  // pass; meshes above ~4M verts are skipped.
+  // Select the VISIBLE model surface (glb / ifc / gaussian splat) inside the
+  // lasso polygon, seen from `camera`. Casts a screen-space grid of rays and
+  // keeps the first hit of each — so only the front-most surface is picked,
+  // never geometry behind it. Fast because the meshes carry a BVH.
   SpatialViewerApp.prototype._selectSurfaceInLasso = function(ring3d, camera, color) {
     if (!ring3d || ring3d.length < 3 || !this.modelMeshObjects || !this.modelMeshObjects.length) return null;
     camera = camera || this.camera;
     camera.updateMatrixWorld();
     this.scene.updateMatrixWorld(true);
+    this._ensureBVH();
 
     var vp = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     var rect = this.canvas.getBoundingClientRect();
@@ -926,6 +985,15 @@
       return [(_p.x * 0.5 + 0.5) * W, (-_p.y * 0.5 + 0.5) * H];
     });
 
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    poly.forEach(function(q) {
+      if (q[0] < minX) minX = q[0]; if (q[0] > maxX) maxX = q[0];
+      if (q[1] < minY) minY = q[1]; if (q[1] > maxY) maxY = q[1];
+    });
+    minX = Math.max(0, minX); minY = Math.max(0, minY);
+    maxX = Math.min(W, maxX); maxY = Math.min(H, maxY);
+    if (maxX <= minX || maxY <= minY) return null;
+
     function inPoly(x, y) {
       var inside = false;
       for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -936,74 +1004,62 @@
       return inside;
     }
 
-    var MAX_VERTS = 6000000;
-    var camPos = camera.position;
-    var meshPos = [];
-    var pointPos = [];
+    var TARGET = 12000;
+    var step = Math.max(3, Math.sqrt(((maxX - minX) * (maxY - minY)) / TARGET));
+
+    var ray = new THREE.Raycaster();
+    ray.firstHitOnly = true;
+    ray.params.Points.threshold = this.raycaster.params.Points.threshold;
+    var m = new THREE.Vector2();
+    var seen = Object.create(null);
+    var meshPos = [], pointPos = [];
     var va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3();
-    var e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3(), toCam = new THREE.Vector3();
-    var cen = new THREE.Vector3(), tmp = new THREE.Vector3();
 
-    function screenInside(worldVec) {
-      tmp.copy(worldVec).applyMatrix4(vp);
-      if (tmp.z < -1 || tmp.z > 1) return false;
-      return inPoly((tmp.x * 0.5 + 0.5) * W, (-tmp.y * 0.5 + 0.5) * H);
-    }
+    for (var py = minY + step * 0.5; py < maxY; py += step) {
+      for (var px = minX + step * 0.5; px < maxX; px += step) {
+        if (!inPoly(px, py)) continue;
+        m.x = (px / W) * 2 - 1;
+        m.y = -(py / H) * 2 + 1;
+        ray.setFromCamera(m, camera);
+        var hits = ray.intersectObjects(this.modelMeshObjects, true);
+        if (!hits.length) continue;
+        var h = hits[0];
 
-    this.modelMeshObjects.forEach(function(obj) {
-      var g = obj.geometry;
-      if (!g || !g.attributes || !g.attributes.position) return;
-      var pos = g.attributes.position;
-      var count = pos.count;
-      if (count > MAX_VERTS) return;
-      var mw = obj.matrixWorld;
-
-      if (obj.isPoints) {
-        for (var k = 0; k < count; k++) {
-          va.fromBufferAttribute(pos, k).applyMatrix4(mw);
-          if (screenInside(va)) pointPos.push(va.x, va.y, va.z);
+        if (h.object.isPoints || h.face == null || h.faceIndex == null) {
+          pointPos.push(h.point.x, h.point.y, h.point.z);
+          continue;
         }
-        return;
-      }
+        var key = h.object.id + ':' + h.faceIndex;
+        if (seen[key]) continue;
+        seen[key] = true;
 
-      var idx = g.index;
-      var faces = idx ? idx.count / 3 : count / 3;
-      for (var f = 0; f < faces; f++) {
+        var g = h.object.geometry, pos = g.attributes.position, idx = g.index, mw = h.object.matrixWorld;
         var a, b, c;
-        if (idx) { a = idx.getX(f * 3); b = idx.getX(f * 3 + 1); c = idx.getX(f * 3 + 2); }
-        else { a = f * 3; b = f * 3 + 1; c = f * 3 + 2; }
-
+        if (idx) { a = idx.getX(h.faceIndex * 3); b = idx.getX(h.faceIndex * 3 + 1); c = idx.getX(h.faceIndex * 3 + 2); }
+        else { a = h.faceIndex * 3; b = a + 1; c = a + 2; }
         va.fromBufferAttribute(pos, a).applyMatrix4(mw);
         vb.fromBufferAttribute(pos, b).applyMatrix4(mw);
         vc.fromBufferAttribute(pos, c).applyMatrix4(mw);
-
-        // Face is selected when its centroid projects inside the lasso polygon.
-        cen.copy(va).add(vb).add(vc).multiplyScalar(1 / 3);
-        if (!screenInside(cen)) continue;
-
-        e1.subVectors(vb, va); e2.subVectors(vc, va); fn.crossVectors(e1, e2);
-        toCam.subVectors(camPos, cen);
-        if (fn.dot(toCam) <= 0) continue; // keep only camera-facing surface
-
         meshPos.push(va.x, va.y, va.z, vb.x, vb.y, vb.z, vc.x, vc.y, vc.z);
       }
-    });
+    }
 
     var group = new THREE.Group();
     if (meshPos.length) {
       var mg = new THREE.BufferGeometry();
       mg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(meshPos), 3));
       group.add(new THREE.Mesh(mg, new THREE.MeshBasicMaterial({
-        color: color, transparent: true, opacity: 0.4, side: THREE.DoubleSide,
-        depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4
+        color: color, transparent: true, opacity: 0.45, side: THREE.DoubleSide,
+        depthTest: true, depthWrite: false,
+        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1
       })));
     }
     if (pointPos.length) {
       var pg = new THREE.BufferGeometry();
       pg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pointPos), 3));
       group.add(new THREE.Points(pg, new THREE.PointsMaterial({
-        color: color, size: (this.modelRadius || 10) * 0.006,
-        transparent: true, opacity: 0.85, depthWrite: false
+        color: color, size: Math.max((this.modelRadius || 10) * 0.004, step * 0.01),
+        transparent: true, opacity: 0.9, depthTest: true, depthWrite: false
       })));
     }
     if (!group.children.length) return null;
@@ -1173,8 +1229,8 @@
         self.annotationsGroup.add(cone);
       } else if (a.annotation_type === 'lasso_selection' && gd.points && gd.points.length >= 3) {
         var ring = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
-        var loop = new THREE.LineLoop(
-          new THREE.BufferGeometry().setFromPoints(ring),
+        var loop = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(ring.concat([ring[0]])),
           new THREE.LineBasicMaterial({ color: col, depthTest: false, transparent: true })
         );
         loop.renderOrder = 998;
@@ -1312,6 +1368,7 @@
         self.currentTool = btn.dataset.tool;
         self.controls.enabled = (self.currentTool === 'orbit');
         self.updateTooltip();
+        if (self.currentTool !== 'orbit') self._ensureBVH();
       });
     });
     var orbitBtn = document.getElementById('toolOrbit');

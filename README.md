@@ -21,11 +21,15 @@ Tested on OpenProject 16.6.
 - 3D markup tools: surface pin, polyline (points land exactly on the model
   surface), lasso, distance measurement. Sampling is screen-space and uses
   coalesced pointer events, so density is dense and scale-independent.
-- The lasso is always a closed loop and highlights the **actual model surface**
-  (glb / ifc / gaussian splat) inside the polygon — the camera-facing faces
-  whose centroid projects into the lasso — as a translucent overlay, not a flat
-  fill. It is recomputed from the stored viewpoint when the annotation is
-  opened (skipped for meshes above ~6M vertices).
+- The lasso is always a closed loop (the ring is explicitly closed) and
+  highlights the **visible model surface** inside the polygon: a screen-space
+  grid of rays is cast and only the first hit of each is kept, so geometry
+  behind the front surface is never selected. The translucent overlay is built
+  from the exact model faces and recomputed from the stored viewpoint when the
+  annotation is opened.
+- `vendor/mesh-bvh.js` (three-mesh-bvh 0.5.23) accelerates surface raycasting.
+  Bounds trees are built once — at load for light models, on first tool use for
+  heavy ones (`_ensureBVH`).
 - Annotations follow the **BCF** data model and are always tied to a Work
   Package — see *Annotations & BCF*.
 - Section planes (X/Y/Z clipping), preset views (top/front/right/iso).

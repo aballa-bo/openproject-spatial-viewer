@@ -10,11 +10,13 @@ module OpenProject
         return '' unless controller.is_a?(::SpatialModelsController) ||
                          controller.is_a?(::SpatialAnnotationsController)
 
-        stylesheet = controller.view_context.stylesheet_link_tag('/assets/openproject_spatial_viewer/viewer.css')
-        vendor_js = controller.view_context.nonced_javascript_include_tag('/assets/openproject_spatial_viewer/vendor.bundle.js', skip_pipeline: true)
-        engine_js = controller.view_context.nonced_javascript_include_tag('/assets/openproject_spatial_viewer/viewer_engine.js', skip_pipeline: true)
+        vc = controller.view_context
+        stylesheet = vc.stylesheet_link_tag('/assets/openproject_spatial_viewer/viewer.css')
+        vendor_js = vc.nonced_javascript_include_tag('/assets/openproject_spatial_viewer/vendor.bundle.js', skip_pipeline: true)
+        bvh_js = vc.nonced_javascript_include_tag('/assets/openproject_spatial_viewer/vendor/mesh-bvh.js', skip_pipeline: true)
+        engine_js = vc.nonced_javascript_include_tag('/assets/openproject_spatial_viewer/viewer_engine.js', skip_pipeline: true)
 
-        "#{stylesheet}\n#{vendor_js}\n#{engine_js}".html_safe
+        "#{stylesheet}\n#{vendor_js}\n#{bvh_js}\n#{engine_js}".html_safe
       end
     end
   end
