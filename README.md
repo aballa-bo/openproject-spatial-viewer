@@ -18,8 +18,10 @@ Tested on OpenProject 16.6.
 
 - WebGL viewer built on Three.js r128 (bundled in
   `app/assets/javascripts/openproject_spatial_viewer/vendor.bundle.js`).
-- 3D markup tools: surface pin, polyline on mesh, lasso/region selection,
-  distance measurement.
+- 3D markup tools: surface pin, polyline (points snapped to the model surface),
+  lasso region selection (auto-closed, semi-transparent fill), distance
+  measurement. Sampling is screen-space so density is scale-independent;
+  point clouds / gaussian splats are picked via a scale-relative ray threshold.
 - Annotations follow the **BCF** data model and are always tied to a Work
   Package — see *Annotations & BCF*.
 - Section planes (X/Y/Z clipping), preset views (top/front/right/iso).

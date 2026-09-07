@@ -703,6 +703,11 @@
     var size = box.getSize(new THREE.Vector3());
     var maxDim = Math.max(size.x, size.y, size.z) || 10;
 
+    // Scale-dependent tuning for the drawing tools.
+    this.modelRadius = maxDim;
+    this.surfaceOffset = Math.max(maxDim * 0.0006, 0.0015); // tiny lift, stays "on" the surface
+    if (this.raycaster) this.raycaster.params.Points.threshold = maxDim * 0.01; // hit splat/point clouds
+
     this.controls.target.copy(center);
     this.camera.position.set(center.x + maxDim * 1.5, center.y + maxDim * 1.2, center.z + maxDim * 1.5);
     this.camera.lookAt(center);
@@ -766,19 +771,40 @@
     return intersects.length > 0 ? intersects[0] : null;
   };
 
+  // A ray hit projected onto the surface, with a minuscule scale-relative lift
+  // along the (world-space) surface normal to avoid z-fighting with the model.
+  SpatialViewerApp.prototype._surfacePoint = function(hit) {
+    var off = this.surfaceOffset || 0.002;
+    var dir;
+    if (hit.face && hit.face.normal && hit.object) {
+      dir = hit.face.normal.clone()
+        .applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld))
+        .normalize();
+    } else {
+      // Point clouds / gaussian splats have no faces: lift toward the camera.
+      dir = new THREE.Vector3().subVectors(this.camera.position, hit.point).normalize();
+    }
+    return hit.point.clone().addScaledVector(dir, off);
+  };
+
   SpatialViewerApp.prototype.onPointerDown = function(e) {
     if (this.currentTool === 'orbit' || e.button !== 0) return;
     var hit = this.getIntersection(e);
     if (!hit) return;
 
     if (this.currentTool === 'pin') {
-      this.place3DPin(hit.point, hit.face ? hit.face.normal : new THREE.Vector3(0,1,0));
+      var n = new THREE.Vector3(0, 1, 0);
+      if (hit.face && hit.object) {
+        n = hit.face.normal.clone()
+          .applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld)).normalize();
+      }
+      this.place3DPin(hit.point, n);
     } else if (this.currentTool === 'draw' || this.currentTool === 'lasso') {
       this.isDrawing = true;
       this.controls.enabled = false;
-      var norm = hit.face ? hit.face.normal : new THREE.Vector3(0,1,0);
-      this.currentDrawingPoints = [hit.point.clone().add(norm.clone().multiplyScalar(0.02))];
-      this.startPolyline(this.currentDrawingPoints);
+      this.currentDrawingPoints = [this._surfacePoint(hit)];
+      this._lastSampleClient = { x: e.clientX, y: e.clientY };
+      this._updateOutline(this.currentDrawingPoints, this.currentTool === 'lasso');
     } else if (this.currentTool === 'measure') {
       if (!this.measureStartPoint) {
         this.measureStartPoint = hit.point.clone();
@@ -792,43 +818,138 @@
 
   SpatialViewerApp.prototype.onPointerMove = function(e) {
     if (!this.isDrawing) return;
+
+    // Screen-space sampling: consistent visual density regardless of model scale.
+    var isLasso = this.currentTool === 'lasso';
+    var minPx = isLasso ? 4 : 7;
+    var last = this._lastSampleClient || { x: e.clientX, y: e.clientY };
+    var dx = e.clientX - last.x, dy = e.clientY - last.y;
+    if (Math.sqrt(dx * dx + dy * dy) < minPx) return;
+    if (this.currentDrawingPoints.length >= 3000) return;
+
     var hit = this.getIntersection(e);
-    if (hit) {
-      var norm = hit.face ? hit.face.normal : new THREE.Vector3(0,1,0);
-      var pt = hit.point.clone().add(norm.clone().multiplyScalar(0.02));
-      var last = this.currentDrawingPoints[this.currentDrawingPoints.length - 1];
-      if (!last || last.distanceTo(pt) > 0.05) {
-        this.currentDrawingPoints.push(pt);
-        this.updatePolyline(this.currentDrawingPoints);
-      }
+    if (!hit) return;
+
+    this._lastSampleClient = { x: e.clientX, y: e.clientY };
+    this.currentDrawingPoints.push(this._surfacePoint(hit));
+    this._updateOutline(this.currentDrawingPoints, isLasso);
+
+    if (isLasso) {
+      var n = this.currentDrawingPoints.length;
+      var step = Math.max(4, Math.floor(n / 25)); // bound total triangulation work
+      if (n % step === 0) this._updateFillPreview(this.currentDrawingPoints);
     }
   };
 
   SpatialViewerApp.prototype.onPointerUp = function() {
-    if (this.isDrawing) {
-      this.isDrawing = false;
-      this.controls.enabled = true;
-      if (this.currentDrawingPoints.length > 2) {
-        this.openAnnotationModal({
-          type: this.currentTool === 'lasso' ? 'lasso_selection' : 'draw_polyline',
-          points: this.currentDrawingPoints.map(function(p) { return {x:p.x,y:p.y,z:p.z}; })
-        });
-      }
+    if (!this.isDrawing) return;
+    this.isDrawing = false;
+    this.controls.enabled = true;
+
+    var isLasso = this.currentTool === 'lasso';
+    var pts = this.currentDrawingPoints || [];
+    if (pts.length < (isLasso ? 3 : 2)) { this.clearTempMarkup(); return; }
+
+    if (isLasso) {
+      this._updateOutline(pts, true);      // always a closed loop
+      this._updateFillPreview(pts);
     }
+
+    this.openAnnotationModal({
+      type: isLasso ? 'lasso_selection' : 'draw_polyline',
+      closed: isLasso,
+      points: pts.map(function(p) { return { x: p.x, y: p.y, z: p.z }; })
+    });
   };
 
-  SpatialViewerApp.prototype.startPolyline = function(points) {
+  // Outline preview: LineLoop when closed (lasso), Line when open (draw).
+  SpatialViewerApp.prototype._updateOutline = function(points, closed) {
+    if (this.currentDrawingLine) {
+      this.tempMarkupGroup.remove(this.currentDrawingLine);
+      this.currentDrawingLine.geometry.dispose();
+      this.currentDrawingLine = null;
+    }
     var geom = new THREE.BufferGeometry().setFromPoints(points);
-    var mat = new THREE.LineBasicMaterial({ color: new THREE.Color(this.activeColor), linewidth: 4, depthTest: false });
-    this.currentDrawingLine = new THREE.Line(geom, mat);
+    var mat = new THREE.LineBasicMaterial({
+      color: new THREE.Color(this.activeColor), depthTest: false, transparent: true
+    });
+    this.currentDrawingLine = closed ? new THREE.LineLoop(geom, mat) : new THREE.Line(geom, mat);
+    this.currentDrawingLine.renderOrder = 999;
     this.tempMarkupGroup.add(this.currentDrawingLine);
   };
 
-  SpatialViewerApp.prototype.updatePolyline = function(points) {
-    if (this.currentDrawingLine) {
-      this.currentDrawingLine.geometry.dispose();
-      this.currentDrawingLine.geometry = new THREE.BufferGeometry().setFromPoints(points);
+  SpatialViewerApp.prototype._updateFillPreview = function(points) {
+    if (this.currentFillMesh) {
+      this.tempMarkupGroup.remove(this.currentFillMesh);
+      this.currentFillMesh.geometry.dispose();
+      this.currentFillMesh.material.dispose();
+      this.currentFillMesh = null;
     }
+    var m = this._buildPolygonFill(points, new THREE.Color(this.activeColor));
+    if (m) { this.currentFillMesh = m; this.tempMarkupGroup.add(m); }
+  };
+
+  // Semi-transparent filled polygon from a 3D ring of points. The ring is
+  // projected onto its best-fit plane, triangulated, then lifted back to 3D.
+  SpatialViewerApp.prototype._buildPolygonFill = function(points, color) {
+    if (!points || points.length < 3) return null;
+
+    var normal = new THREE.Vector3();
+    for (var i = 0; i < points.length; i++) {
+      var cur = points[i], nxt = points[(i + 1) % points.length];
+      normal.x += (cur.y - nxt.y) * (cur.z + nxt.z);
+      normal.y += (cur.z - nxt.z) * (cur.x + nxt.x);
+      normal.z += (cur.x - nxt.x) * (cur.y + nxt.y);
+    }
+    if (normal.lengthSq() < 1e-12) return null;
+    normal.normalize();
+
+    var centroid = new THREE.Vector3();
+    points.forEach(function(p) { centroid.add(p); });
+    centroid.multiplyScalar(1 / points.length);
+
+    var u = new THREE.Vector3(1, 0, 0);
+    if (Math.abs(normal.dot(u)) > 0.9) u.set(0, 1, 0);
+    u.crossVectors(normal, u).normalize();
+    var v = new THREE.Vector3().crossVectors(normal, u).normalize();
+
+    var flat2d = points.map(function(p) {
+      var d = new THREE.Vector3().subVectors(p, centroid);
+      return new THREE.Vector2(d.dot(u), d.dot(v));
+    });
+
+    var tris;
+    try {
+      tris = THREE.ShapeUtils.triangulateShape(flat2d, []);
+    } catch (err) {
+      return null;
+    }
+    if (!tris || !tris.length) return null;
+
+    var positions = new Float32Array(points.length * 3);
+    points.forEach(function(p, k) {
+      positions[k * 3] = p.x; positions[k * 3 + 1] = p.y; positions[k * 3 + 2] = p.z;
+    });
+    var index = [];
+    tris.forEach(function(t) { index.push(t[0], t[1], t[2]); });
+
+    var geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geom.setIndex(index);
+    geom.computeVertexNormals();
+
+    var mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({
+      color: color,
+      transparent: true,
+      opacity: 0.28,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1
+    }));
+    mesh.renderOrder = 998;
+    return mesh;
   };
 
   SpatialViewerApp.prototype.place3DPin = function(point, normal) {
@@ -990,10 +1111,25 @@
         cone.position.set(pt.x, pt.y, pt.z);
         cone.userData = { annotation: a };
         self.annotationsGroup.add(cone);
-      } else if ((a.annotation_type === 'draw_polyline' || a.annotation_type === 'lasso_selection') && gd.points) {
+      } else if (a.annotation_type === 'lasso_selection' && gd.points && gd.points.length >= 3) {
+        var ring = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
+        var loop = new THREE.LineLoop(
+          new THREE.BufferGeometry().setFromPoints(ring),
+          new THREE.LineBasicMaterial({ color: col, depthTest: false, transparent: true })
+        );
+        loop.renderOrder = 998;
+        loop.userData = { annotation: a };
+        self.annotationsGroup.add(loop);
+
+        var fill = self._buildPolygonFill(ring, col);
+        if (fill) { fill.userData = { annotation: a }; self.annotationsGroup.add(fill); }
+      } else if (a.annotation_type === 'draw_polyline' && gd.points) {
         var pts = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
-        var geom = new THREE.BufferGeometry().setFromPoints(pts);
-        var line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: col, linewidth: 3, depthTest: false }));
+        var line = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(pts),
+          new THREE.LineBasicMaterial({ color: col, depthTest: false, transparent: true })
+        );
+        line.renderOrder = 999;
         line.userData = { annotation: a };
         self.annotationsGroup.add(line);
       }
@@ -1251,7 +1387,7 @@
   SpatialViewerApp.prototype.updateTooltip = function() {
     var tip = document.getElementById('drawingTooltip');
     if (!tip) return;
-    var msgs = { pin: 'Click on the mesh surface to place a 3D Pin.', draw: 'Click and drag on the mesh to draw a 3D polyline.', lasso: 'Drag to select a mesh region with the lasso.', measure: 'Click first point then second point to measure.' };
+    var msgs = { pin: 'Click on the surface to place a 3D pin.', draw: 'Click and drag along the surface to draw a polyline.', lasso: 'Drag around a region — the selection closes and fills automatically.', measure: 'Click first point then second point to measure.' };
     if (msgs[this.currentTool]) { tip.innerText = msgs[this.currentTool]; tip.style.display = 'block'; }
     else { tip.style.display = 'none'; }
   };
@@ -1262,7 +1398,15 @@
   };
 
   SpatialViewerApp.prototype.clearTempMarkup = function() {
-    while (this.tempMarkupGroup.children.length > 0) this.tempMarkupGroup.remove(this.tempMarkupGroup.children[0]);
+    while (this.tempMarkupGroup.children.length > 0) {
+      var c = this.tempMarkupGroup.children[0];
+      if (c.geometry) c.geometry.dispose();
+      if (c.material && c.material.dispose) c.material.dispose();
+      this.tempMarkupGroup.remove(c);
+    }
+    this.currentDrawingLine = null;
+    this.currentFillMesh = null;
+    this.currentDrawingPoints = [];
   };
 
   // Back-compat alias

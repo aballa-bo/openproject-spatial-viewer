@@ -177,11 +177,17 @@ class SpatialAnnotation < ApplicationRecord
     Array(pts).filter_map { |p| xyz([p[:x], p[:y], p[:z]]) }
   end
 
+  def closed_geometry?
+    annotation_type == "lasso_selection" ||
+      (geometry_data || {}).with_indifferent_access[:closed].present?
+  end
+
   def bcf_lines
     pts = geometry_points
     return [] if pts.length < 2
 
-    pts.each_cons(2).map do |a, b|
+    ring = closed_geometry? && pts.length >= 3 ? pts + [pts.first] : pts
+    ring.each_cons(2).map do |a, b|
       { "start_point" => hash_point(to_zup(a)), "end_point" => hash_point(to_zup(b)) }
     end
   end
