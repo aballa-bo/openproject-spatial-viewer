@@ -21,20 +21,27 @@ Tested on OpenProject 16.6.
 - 3D markup tools: surface pin, polyline (points land exactly on the model
   surface), lasso, distance measurement. Sampling is screen-space and uses
   coalesced pointer events, so density is dense and scale-independent.
-- The lasso is always a closed loop (the ring is explicitly closed, drawn as a
-  plain Line; the pointer is captured so a stroke that leaves the viewport does
-  not end early).
-- The lasso highlight re-renders the model's **own geometry** with a tint
-  shader (`LASSO_FS`) that discards fragments outside the polygon; `depthTest`
-  keeps only the front-most surface. The tint is therefore pixel-exact on the
-  visible surface — no offset, no speckle, correct occlusion — and identical
-  for glb / ifc / gaussian-splat. Recomputed from the stored viewpoint when an
-  annotation is opened.
-- `vendor/mesh-bvh.js` (three-mesh-bvh 0.5.23) accelerates the per-sample
-  surface raycasts of the outline; trees are built once (`_ensureBVH`), and the
-  library self-loads if the hook did not emit its `<script>`.
-- Outline sampling walks the pointer path in ~3 px steps (not per pointer
-  event), so density is path-length based, not event-frequency based.
+- **The lasso is a screen-space gesture — it casts no rays while drawing.** The
+  path is collected in canvas pixels (interpolated to ~2 px) and stroked on a 2D
+  overlay canvas with `closePath()`, so it is dense, visibly closed *during* the
+  drag, and identical on a 10-triangle box or a 2-million-triangle scan.
+- The highlight re-renders the model's **own geometry** with a tint shader
+  (`LASSO_FS`) that discards fragments outside the polygon (tested in NDC
+  against `gl_FragCoord`); `depthTest` keeps only the front-most surface. The
+  tint is pixel-exact on the visible surface — no offset, no speckle, correct
+  occlusion — and identical for glb / ifc / gaussian-splat. It updates live
+  while drawing (uniform refresh only) and is rebuilt from the stored viewpoint
+  when an annotation is opened.
+- Only at pointer-up is the screen ring down-sampled to ≤64 points and
+  projected to 3D for storage (rays that miss the mesh fall back to the focal
+  plane, so the stored ring always has the drawn shape).
+- The free-hand polyline tool still raycasts per point, but with a hard budget
+  of 8 rays per pointer event so a heavy mesh cannot stall the UI.
+- `vendor/mesh-bvh.js` (three-mesh-bvh 0.5.23) accelerates those raycasts;
+  trees are built once (`_ensureBVH`), and the library self-loads if the hook
+  did not emit its `<script>`.
+- The pointer is captured on stroke start, so a stroke that leaves the viewport
+  does not end early.
 - Annotations follow the **BCF** data model and are always tied to a Work
   Package — see *Annotations & BCF*.
 - Section planes (X/Y/Z clipping), preset views (top/front/right/iso).

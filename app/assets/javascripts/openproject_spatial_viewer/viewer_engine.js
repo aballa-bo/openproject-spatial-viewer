@@ -752,6 +752,7 @@
     this.scene.add(object);
 
     this._bvhReady = false; // rebuild BVH for the new model on next tool use
+    this._setLassoHighlight(null); // any old highlight references the old geometry
     this.modelMeshObjects = [];
     var self = this;
     var heavy = !!this.heavyMode;
@@ -914,26 +915,78 @@
     return hit.point.clone().addScaledVector(this._hitNormal(hit), off);
   };
 
+  // ---- 2D overlay used to draw the lasso outline -------------------------
+  // The lasso is a screen-space gesture: drawing it on a 2D canvas keeps it
+  // dense, always closed and exactly under the cursor, with zero raycasting.
+  SpatialViewerApp.prototype._ensureLassoOverlay = function() {
+    if (this.lassoOverlay && this.lassoOverlay.parentNode) return this.lassoOverlay;
+    var c = document.createElement('canvas');
+    c.className = 'lasso-overlay';
+    c.style.position = 'absolute';
+    c.style.left = '0';
+    c.style.top = '0';
+    c.style.width = '100%';
+    c.style.height = '100%';
+    c.style.pointerEvents = 'none';
+    c.style.zIndex = '40';
+    this.viewport.appendChild(c);
+    this.lassoOverlay = c;
+    return c;
+  };
+
+  SpatialViewerApp.prototype._drawLassoOverlay = function(path, closed) {
+    var c = this._ensureLassoOverlay();
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var w = this.viewport.clientWidth, h = this.viewport.clientHeight;
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+      c.width = Math.round(w * dpr);
+      c.height = Math.round(h * dpr);
+    }
+    var ctx = c.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (!path || path.length < 2) return;
+
+    ctx.beginPath();
+    ctx.moveTo(path[0].x, path[0].y);
+    for (var i = 1; i < path.length; i++) ctx.lineTo(path[i].x, path[i].y);
+    if (closed) ctx.closePath();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+    ctx.stroke();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = this.activeColor;
+    ctx.stroke();
+  };
+
+  SpatialViewerApp.prototype._clearLassoOverlay = function() {
+    if (!this.lassoOverlay) return;
+    var ctx = this.lassoOverlay.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, this.lassoOverlay.width, this.lassoOverlay.height);
+  };
+
+  SpatialViewerApp.prototype._viewportPoint = function(clientX, clientY) {
+    var rect = this.canvas.getBoundingClientRect();
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  };
+
   SpatialViewerApp.prototype.onPointerDown = function(e) {
     if (this.currentTool === 'orbit' || e.button !== 0) return;
-    var hit = this.getIntersection(e);
-    if (!hit) return;
+
+    var isLasso = this.currentTool === 'lasso';
+
+    // The lasso needs no surface hit to start — it is a screen gesture.
+    var hit = isLasso ? null : this.getIntersection(e);
+    if (!isLasso && !hit) return;
 
     if (this.currentTool === 'pin') {
       this.place3DPin(hit.point, this._hitNormal(hit));
-    } else if (this.currentTool === 'draw' || this.currentTool === 'lasso') {
-      this.isDrawing = true;
-      this.controls.enabled = false;
-      this._setLassoHighlight(null);
-      // Capture the pointer so the stroke keeps sampling (and pointerup still
-      // fires) even if the cursor leaves the viewport near the model edge.
-      try { if (e.pointerId != null) this.viewport.setPointerCapture(e.pointerId); } catch (ignore) {}
-      this._activePointerId = (e.pointerId != null) ? e.pointerId : null;
-      this.currentDrawingPoints = [this._surfacePoint(hit)];
-      this._lastSampleClient = { x: e.clientX, y: e.clientY };
-      this._pointerClient = { x: e.clientX, y: e.clientY };
-      this._updateOutline(this.currentDrawingPoints, this.currentTool === 'lasso');
-    } else if (this.currentTool === 'measure') {
+      return;
+    }
+    if (this.currentTool === 'measure') {
       if (!this.measureStartPoint) {
         this.measureStartPoint = hit.point.clone();
         this.showTooltip('Point 1 selected. Click second point to measure.');
@@ -941,43 +994,94 @@
         this.finishMeasurement(this.measureStartPoint, hit.point);
         this.measureStartPoint = null;
       }
+      return;
+    }
+    if (this.currentTool !== 'draw' && !isLasso) return;
+
+    this.isDrawing = true;
+    this.controls.enabled = false;
+    this._setLassoHighlight(null);
+    // Capture the pointer so the stroke keeps going (and pointerup still fires)
+    // even if the cursor leaves the viewport.
+    try { if (e.pointerId != null) this.viewport.setPointerCapture(e.pointerId); } catch (ignore) {}
+    this._activePointerId = (e.pointerId != null) ? e.pointerId : null;
+    this._pointerClient = { x: e.clientX, y: e.clientY };
+    this._lastSampleClient = { x: e.clientX, y: e.clientY };
+
+    if (isLasso) {
+      this.lassoScreenPath = [this._viewportPoint(e.clientX, e.clientY)];
+      this._lassoHlFrame = 0;
+      this._drawLassoOverlay(this.lassoScreenPath, true);
+    } else {
+      this.currentDrawingPoints = [this._surfacePoint(hit)];
+      this._updateOutline(this.currentDrawingPoints, false);
     }
   };
 
   SpatialViewerApp.prototype.onPointerMove = function(e) {
     this._pointerClient = { x: e.clientX, y: e.clientY };
     if (!this.isDrawing) return;
-    // Coalesced sub-frame positions catch fast strokes; the rAF loop covers the
-    // rest. Cap raycasts per event.
     var list = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
-    var n = list.length, maxRays = 20, stride = n > maxRays ? Math.ceil(n / maxRays) : 1;
+    var n = list.length, cap = 24, stride = n > cap ? Math.ceil(n / cap) : 1;
     for (var i = 0; i < n; i += stride) {
       this._sampleDrawPoint(list[i].clientX, list[i].clientY);
     }
   };
 
   SpatialViewerApp.prototype._sampleDrawPoint = function(clientX, clientY) {
-    if (this.currentDrawingPoints.length >= 8000) return;
-    var isLasso = this.currentTool === 'lasso';
-    var minPx = isLasso ? 3 : 5;
+    if (this.currentTool === 'lasso') return this._sampleLassoScreen(clientX, clientY);
+    return this._sampleDrawSurface(clientX, clientY);
+  };
+
+  // Lasso: pure screen-space path, interpolated to ~2 px. No raycasting, so it
+  // stays dense on any model regardless of triangle count.
+  SpatialViewerApp.prototype._sampleLassoScreen = function(clientX, clientY) {
+    var path = this.lassoScreenPath;
+    if (!path) return;
+    if (path.length >= 4000) return;
+
+    var p = this._viewportPoint(clientX, clientY);
+    var last = path[path.length - 1];
+    var dx = p.x - last.x, dy = p.y - last.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var minPx = 2;
+    if (dist < minPx) return;
+
+    var steps = Math.min(Math.floor(dist / minPx), 600);
+    for (var s = 1; s <= steps; s++) {
+      var t = (s * minPx) / dist;
+      path.push({ x: last.x + dx * t, y: last.y + dy * t });
+    }
+    path.push(p);
+    this._lastSampleClient = { x: clientX, y: clientY };
+
+    this._drawLassoOverlay(path, true);
+    // Live surface highlight, refreshed every few samples.
+    if ((++this._lassoHlFrame % 4) === 0) {
+      this._showLassoPolygon(this._screenPathToNdc(path), this.activeColor);
+    }
+  };
+
+  // Free-hand polyline on the surface: still needs a ray per point, but the
+  // number of rays per event is capped so a heavy mesh cannot stall the UI.
+  SpatialViewerApp.prototype._sampleDrawSurface = function(clientX, clientY) {
+    if (this.currentDrawingPoints.length >= 4000) return;
+    var minPx = 5;
     var last = this._lastSampleClient;
-    if (!last) { this._addSampleRay(clientX, clientY, isLasso); return; }
+    if (!last) { this._addSampleRay(clientX, clientY); return; }
 
     var dx = clientX - last.x, dy = clientY - last.y;
     var dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < minPx) return;
 
-    // Walk the segment from the last sample to here in minPx steps, so the
-    // outline density depends on path length, not on how often the browser
-    // fires pointer events.
-    var steps = Math.min(Math.floor(dist / minPx), 400);
+    var steps = Math.min(Math.floor(dist / minPx), 8); // hard ray budget
     var added = false;
     for (var s = 1; s <= steps; s++) {
       var t = (s * minPx) / dist;
-      if (this._addSampleRay(last.x + dx * t, last.y + dy * t, isLasso)) added = true;
+      if (this._addSampleRay(last.x + dx * t, last.y + dy * t)) added = true;
     }
-    if (this._addSampleRay(clientX, clientY, isLasso)) added = true;
-    if (added) this._updateOutline(this.currentDrawingPoints, isLasso);
+    if (this._addSampleRay(clientX, clientY)) added = true;
+    if (added) this._updateOutline(this.currentDrawingPoints, false);
   };
 
   SpatialViewerApp.prototype._addSampleRay = function(clientX, clientY) {
@@ -997,20 +1101,67 @@
     } catch (ignore) {}
     this._activePointerId = null;
 
-    var isLasso = this.currentTool === 'lasso';
+    if (this.currentTool === 'lasso') return this._finishLasso();
+
     var pts = this.currentDrawingPoints || [];
-    if (pts.length < (isLasso ? 3 : 2)) { this.clearTempMarkup(); return; }
-
-    if (isLasso) {
-      this._updateOutline(pts, true); // always a closed loop
-      this._setLassoHighlight(this._selectSurfaceInLasso(pts, this.camera, new THREE.Color(this.activeColor)));
-    }
-
+    if (pts.length < 2) { this.clearTempMarkup(); return; }
+    this._updateOutline(pts, false);
     this.openAnnotationModal({
-      type: isLasso ? 'lasso_selection' : 'draw_polyline',
-      closed: isLasso,
+      type: 'draw_polyline',
+      closed: false,
       points: pts.map(function(p) { return { x: p.x, y: p.y, z: p.z }; })
     });
+  };
+
+  SpatialViewerApp.prototype._finishLasso = function() {
+    var path = this.lassoScreenPath || [];
+    if (path.length < 3) { this._clearLassoOverlay(); this.clearTempMarkup(); return; }
+
+    this._drawLassoOverlay(path, true);
+    this._showLassoPolygon(this._screenPathToNdc(path), this.activeColor);
+
+    // Now (once) turn a down-sampled screen ring into 3D points for storage.
+    // The 2D overlay stays on screen as the outline until the form is closed.
+    var ring = this._screenPathToWorldRing(path, 64);
+    if (ring.length < 3) { this._clearLassoOverlay(); this.clearTempMarkup(); return; }
+
+    this.currentDrawingPoints = ring;
+
+    this.openAnnotationModal({
+      type: 'lasso_selection',
+      closed: true,
+      points: ring.map(function(p) { return { x: p.x, y: p.y, z: p.z }; })
+    });
+  };
+
+  SpatialViewerApp.prototype._screenPathToNdc = function(path) {
+    var w = this.viewport.clientWidth || 1, h = this.viewport.clientHeight || 1;
+    return path.map(function(p) { return [(p.x / w) * 2 - 1, -(p.y / h) * 2 + 1]; });
+  };
+
+  // Down-sample the screen ring and project it onto the model; points that miss
+  // the mesh fall back to the focal plane so the stored ring always has the
+  // shape that was drawn.
+  SpatialViewerApp.prototype._screenPathToWorldRing = function(path, maxPoints) {
+    this._ensureBVH();
+    var rect = this.canvas.getBoundingClientRect();
+    var n = path.length;
+    var stride = Math.max(1, Math.floor(n / maxPoints));
+
+    var planeNormal = this.camera.getWorldDirection(new THREE.Vector3()).negate();
+    var plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+      planeNormal, (this.controls ? this.controls.target : new THREE.Vector3()).clone()
+    );
+
+    var out = [];
+    for (var i = 0; i < n && out.length < maxPoints; i += stride) {
+      var p = path[i];
+      var hit = this._raycastAt(rect.left + p.x, rect.top + p.y);
+      if (hit) { out.push(this._surfacePoint(hit)); continue; }
+      var fallback = this.raycaster.ray.intersectPlane(plane, new THREE.Vector3());
+      if (fallback) out.push(fallback);
+    }
+    return out;
   };
 
   // Outline preview. When closed (lasso) the ring is explicitly closed by
@@ -1043,25 +1194,13 @@
       });
       g.remove(c);
     }
+    this._lassoHl = objOrNull || null;
     if (objOrNull) g.add(objOrNull);
   };
 
-  // Highlight the VISIBLE model surface inside the lasso polygon. Re-renders the
-  // model's own geometry with a tint shader that discards fragments outside the
-  // polygon; depthTest keeps only the front-most surface. Exact, dense, no
-  // offset — works the same for glb / ifc / gaussian-splat.
-  SpatialViewerApp.prototype._selectSurfaceInLasso = function(ring3d, camera, color) {
-    if (!ring3d || ring3d.length < 3 || !this.modelMeshObjects || !this.modelMeshObjects.length) return null;
-    camera = camera || this.camera;
-    camera.updateMatrixWorld();
-    this.scene.updateMatrixWorld(true);
-
-    var vp = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    var _p = new THREE.Vector3();
-    var ndc = ring3d.map(function(v) { _p.copy(v).applyMatrix4(vp); return [_p.x, _p.y]; });
-
-    // Down-sample the ring to <= LASSO_MAX_PTS-1 points, then close it (append
-    // the first point) so shader edges are just i -> i+1, no wrap.
+  // Pack an NDC polygon into the shader uniform: down-sample to LASSO_MAX_PTS-1
+  // points, close it, pad the tail with the last point (degenerate edges).
+  function packLassoPoly(ndc) {
     var maxRing = LASSO_MAX_PTS - 1;
     var poly;
     if (ndc.length <= maxRing) {
@@ -1079,9 +1218,35 @@
       var pt = k < poly.length ? poly[k] : lastPt;
       flat[k * 2] = pt[0]; flat[k * 2 + 1] = pt[1];
     }
+    return { flat: flat, len: poly.length };
+  }
+
+  // Highlight the VISIBLE model surface inside the (NDC) lasso polygon by
+  // re-rendering the model's OWN geometry with a tint shader that discards
+  // fragments outside the polygon. depthTest keeps only the front-most surface,
+  // so the tint is pixel-exact on the visible surface — same for glb/ifc/gs.
+  SpatialViewerApp.prototype._showLassoPolygon = function(ndcPoly, color) {
+    if (!ndcPoly || ndcPoly.length < 3 || !this.modelMeshObjects || !this.modelMeshObjects.length) {
+      this._setLassoHighlight(null);
+      return;
+    }
+    var packed = packLassoPoly(ndcPoly);
+    var col = new THREE.Color(color);
+
+    // Fast path: just refresh the uniforms of the existing overlay.
+    if (this._lassoHl) {
+      this._lassoHl.traverse(function(n) {
+        if (n.material && n.material.uniforms) {
+          n.material.uniforms.uPoly.value = packed.flat;
+          n.material.uniforms.uPolyLen.value = packed.len;
+          n.material.uniforms.uColor.value.set(col.r, col.g, col.b);
+          n.material.uniformsNeedUpdate = true;
+        }
+      });
+      return;
+    }
 
     var res = this.renderer.getDrawingBufferSize(new THREE.Vector2());
-    var col = new THREE.Color(color);
     var radius = this.modelRadius || 10;
     var group = new THREE.Group();
 
@@ -1093,8 +1258,8 @@
           uColor: { value: new THREE.Vector3(col.r, col.g, col.b) },
           uOpacity: { value: isPoints ? 0.9 : 0.45 },
           uRes: { value: res.clone() },
-          uPoly: { value: flat },
-          uPolyLen: { value: poly.length },
+          uPoly: { value: packed.flat },
+          uPolyLen: { value: packed.len },
           uSize: { value: radius * 0.004 }
         },
         vertexShader: isPoints ? LASSO_POINTS_VS : LASSO_VS,
@@ -1115,9 +1280,22 @@
       group.add(node);
     });
 
-    if (!group.children.length) return null;
+    if (!group.children.length) return;
     group.renderOrder = 997;
-    return group;
+    this._setLassoHighlight(group);
+  };
+
+  // Same highlight, driven by a stored 3D ring projected through `camera`.
+  SpatialViewerApp.prototype._selectSurfaceInLasso = function(ring3d, camera, color) {
+    if (!ring3d || ring3d.length < 3) return;
+    camera = camera || this.camera;
+    camera.updateMatrixWorld();
+    this.scene.updateMatrixWorld(true);
+
+    var vp = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    var _p = new THREE.Vector3();
+    var ndc = ring3d.map(function(v) { _p.copy(v).applyMatrix4(vp); return [_p.x, _p.y]; });
+    this._showLassoPolygon(ndc, color);
   };
 
   SpatialViewerApp.prototype.place3DPin = function(point, normal) {
@@ -1191,7 +1369,9 @@
     var panel = document.getElementById('spatialSidePanel');
     if (panel) panel.classList.remove('creating');
     this.clearTempMarkup();
+    this._clearLassoOverlay();
     this._setLassoHighlight(null);
+    this.lassoScreenPath = null;
     this.pendingGeometry = null;
   };
 
@@ -1309,14 +1489,11 @@
     var self = this;
 
     var showSelection = function() {
+      self._setLassoHighlight(null); // rebuild for this viewpoint
       if (a.annotation_type === 'lasso_selection' && a.geometry_data && a.geometry_data.points &&
           a.geometry_data.points.length >= 3) {
         var ring = a.geometry_data.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
-        self._setLassoHighlight(
-          self._selectSurfaceInLasso(ring, self.camera, new THREE.Color(a.color || '#3b82f6'))
-        );
-      } else {
-        self._setLassoHighlight(null);
+        self._selectSurfaceInLasso(ring, self.camera, a.color || '#3b82f6');
       }
     };
 
@@ -1449,7 +1626,9 @@
     var clearBtn = document.getElementById('toolClear');
     if (clearBtn) clearBtn.addEventListener('click', function() {
       self.clearTempMarkup();
+      self._clearLassoOverlay();
       self._setLassoHighlight(null);
+      self.lassoScreenPath = null;
     });
 
     var sliceBtn = document.getElementById('btnSliceToggle');
@@ -1576,7 +1755,7 @@
   SpatialViewerApp.prototype.updateTooltip = function() {
     var tip = document.getElementById('drawingTooltip');
     if (!tip) return;
-    var msgs = { pin: 'Click on the surface to place a 3D pin.', draw: 'Click and drag along the surface to draw a polyline.', lasso: 'Drag around a region — the selection closes and fills automatically.', measure: 'Click first point then second point to measure.' };
+    var msgs = { pin: 'Click on the surface to place a 3D pin.', draw: 'Click and drag along the surface to draw a polyline.', lasso: 'Drag around a region — the outline closes as you draw and the model surface inside it is highlighted.', measure: 'Click first point then second point to measure.' };
     if (msgs[this.currentTool]) { tip.innerText = msgs[this.currentTool]; tip.style.display = 'block'; }
     else { tip.style.display = 'none'; }
   };
