@@ -218,17 +218,36 @@
 
 .spatial-side-panel {
   width: 380px;
+  flex: 0 0 auto;      /* never squeezed by the viewport */
+  position: relative;  /* anchor for the resize grip */
   background: #0f172a;
   border-left: 1px solid #334155;
   display: flex;
   flex-direction: column;
   z-index: 10;
-  transition: width 0.3s ease;
 }
 
 .spatial-side-panel.collapsed {
-  width: 0;
+  width: 0 !important;
+  min-width: 0 !important;
   display: none;
+}
+
+/* Drag handle on the panel's left edge */
+.side-panel-resizer {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 7px;
+  cursor: col-resize;
+  background: transparent;
+  z-index: 20;
+}
+
+.side-panel-resizer:hover,
+.side-panel-resizer.dragging {
+  background: rgba(56, 189, 248, 0.35);
 }
 
 .side-panel-tabs {
@@ -367,8 +386,10 @@
   min-height: 0;
 }
 
+/* While creating, keep the panel wide enough for the form but let a wider
+   user-chosen width win. */
 .spatial-side-panel.creating {
-  width: 440px;
+  min-width: 380px;
 }
 
 .spatial-side-panel.creating .side-panel-tabs,

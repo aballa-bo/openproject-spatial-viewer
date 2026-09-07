@@ -53,6 +53,9 @@ Tested on OpenProject 16.6.
 - Annotations follow the **BCF** data model and are always tied to a Work
   Package — see *Annotations & BCF*.
 - Section planes (X/Y/Z clipping), preset views (top/front/right/iso).
+- The "Tickets & Annotations" button toggles the right panel open/closed
+  (`toggleSidePanel`), and the panel is resizable by dragging its left edge —
+  the width is clamped to 280–900 px and remembered in `localStorage`.
 - Dedicated permissions: `view_spatial_models`, `manage_spatial_models`,
   `create_spatial_annotations`.
 

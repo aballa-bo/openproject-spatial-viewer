@@ -1458,11 +1458,93 @@
     var newRadio = document.querySelector('input[name="caMode"][value="new"]');
     if (newRadio) { newRadio.checked = true; this.updateCreateMode('new'); }
 
-    if (panel) {
-      panel.classList.remove('collapsed');
-      panel.classList.add('creating');
-    }
+    this.openSidePanel();
+    if (panel) panel.classList.add('creating');
     if (subject) subject.focus();
+  };
+
+  // ---- Side panel: explicit open/closed state + drag-to-resize -------------
+  SpatialViewerApp.prototype._initSidePanel = function() {
+    var self = this;
+    var sp = document.getElementById('spatialSidePanel');
+    if (!sp) return;
+    this.sidePanel = sp;
+
+    var stored = null;
+    try { stored = window.localStorage.getItem('spatialViewer.panelWidth'); } catch (e) {}
+    this._panelWidth = Math.min(900, Math.max(280, parseInt(stored, 10) || 380));
+    this._panelOpen = !sp.classList.contains('collapsed');
+    this._applyPanelState();
+
+    var btn = document.getElementById('btnSidePanelToggle');
+    if (btn) {
+      btn.addEventListener('click', function(e) {
+        e.preventDefault();
+        self.toggleSidePanel();
+      });
+    }
+
+    if (!sp.querySelector('.side-panel-resizer')) {
+      var grip = document.createElement('div');
+      grip.className = 'side-panel-resizer';
+      grip.title = 'Drag to resize';
+      sp.insertBefore(grip, sp.firstChild);
+
+      var dragging = false, pid = null;
+      grip.addEventListener('pointerdown', function(e) {
+        dragging = true;
+        pid = (e.pointerId != null) ? e.pointerId : null;
+        grip.classList.add('dragging');
+        try { if (pid != null) grip.setPointerCapture(pid); } catch (ignore) {}
+        e.preventDefault();
+        e.stopPropagation();
+      });
+      grip.addEventListener('pointermove', function(e) {
+        if (!dragging) return;
+        var right = sp.getBoundingClientRect().right;
+        self._panelWidth = Math.min(900, Math.max(280, Math.round(right - e.clientX)));
+        self._applyPanelState();
+        e.preventDefault();
+      });
+      var endDrag = function() {
+        if (!dragging) return;
+        dragging = false;
+        grip.classList.remove('dragging');
+        try { if (pid != null) grip.releasePointerCapture(pid); } catch (ignore) {}
+        pid = null;
+        try { window.localStorage.setItem('spatialViewer.panelWidth', String(self._panelWidth)); } catch (e) {}
+      };
+      grip.addEventListener('pointerup', endDrag);
+      grip.addEventListener('pointercancel', endDrag);
+    }
+  };
+
+  SpatialViewerApp.prototype._applyPanelState = function() {
+    var sp = this.sidePanel;
+    if (!sp) return;
+    if (this._panelOpen) {
+      sp.classList.remove('collapsed');
+      sp.style.width = this._panelWidth + 'px';
+    } else {
+      sp.classList.add('collapsed');
+    }
+    var btn = document.getElementById('btnSidePanelToggle');
+    if (btn) {
+      if (this._panelOpen) btn.classList.add('active');
+      else btn.classList.remove('active');
+    }
+    if (this._resizeHandler) this._resizeHandler(); // keep the canvas in step
+  };
+
+  SpatialViewerApp.prototype.toggleSidePanel = function() {
+    this._panelOpen = !this._panelOpen;
+    this._applyPanelState();
+  };
+
+  SpatialViewerApp.prototype.openSidePanel = function() {
+    if (this._panelOpen) return;
+    this._panelOpen = true;
+    this._applyPanelState();
   };
 
   SpatialViewerApp.prototype.updateCreateMode = function(mode) {
@@ -1772,8 +1854,7 @@
       });
     });
 
-    var spBtn = document.getElementById('btnSidePanelToggle'), sp = document.getElementById('spatialSidePanel');
-    if (spBtn && sp) spBtn.addEventListener('click', function() { sp.classList.toggle('collapsed'); });
+    this._initSidePanel();
 
     // Inline "New Work Package" create panel
     var caCancel = document.getElementById('caCancelBtn');
