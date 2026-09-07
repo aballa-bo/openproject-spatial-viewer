@@ -110,8 +110,23 @@ class SpatialAnnotationsController < ApplicationController
       subject: subject.to_s.truncate(255),
       description: params[:wp_description].presence
     }
-    attributes[:assigned_to_id] = params[:wp_assigned_to_id] if params[:wp_assigned_to_id].present?
-    attributes[:priority_id] = params[:wp_priority_id] if params[:wp_priority_id].present?
+    # The inline panel offers the full standard work package field set, just
+    # like the BCF module. Every attribute is optional — pass through only the
+    # ones the user actually filled in and let the create contract validate.
+    {
+      assigned_to_id: :wp_assigned_to_id,
+      responsible_id: :wp_responsible_id,
+      status_id:      :wp_status_id,
+      priority_id:    :wp_priority_id,
+      category_id:    :wp_category_id,
+      version_id:     :wp_version_id,
+      parent_id:      :wp_parent_id,
+      start_date:     :wp_start_date,
+      due_date:       :wp_due_date,
+      estimated_hours: :wp_estimated_hours
+    }.each do |attr, param|
+      attributes[attr] = params[param] if params[param].present?
+    end
 
     call = ::WorkPackages::CreateService.new(user: User.current).call(**attributes)
 

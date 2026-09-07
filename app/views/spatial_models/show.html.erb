@@ -63,6 +63,9 @@
       <button type="button" class="toolbar-btn" id="btnWireframe" title="Toggle Wireframe">
         <i class="icon-grid"></i>
       </button>
+      <button type="button" class="toolbar-btn" id="btnRender" title="Render quality: lighting, shadows, environment">
+        <i class="icon-settings2"></i> Render
+      </button>
       <button type="button" class="toolbar-btn" id="btnVR" title="Enter VR" style="display: none;">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true" focusable="false">
           <path d="M21 6H3a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h5.2a2 2 0 0 0 1.7-.9l1.3-2c.3-.45.95-.45 1.25 0l1.3 2a2 2 0 0 0 1.7.9H21a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zM7.5 14A2.5 2.5 0 1 1 10 11.5 2.5 2.5 0 0 1 7.5 14zm9 0a2.5 2.5 0 1 1 2.5-2.5 2.5 2.5 0 0 1-2.5 2.5z"/>
@@ -92,6 +95,53 @@
           <label>Y Plane: <input type="range" id="clipY" min="-50" max="50" value="50" step="0.5"></label>
           <label>Z Plane: <input type="range" id="clipZ" min="-50" max="50" value="50" step="0.5"></label>
           <button type="button" class="button -small" id="resetClipBtn">Reset Sections</button>
+        </div>
+      </div>
+
+      <div class="render-panel" id="renderPanel" style="display: none;">
+        <div class="slicing-header">
+          <span>Render quality</span>
+          <button type="button" class="close-btn" id="closeRenderBtn">&times;</button>
+        </div>
+        <div class="slicing-body">
+          <label class="render-row">
+            <span>Shadows</span>
+            <select id="rqShadows" class="form-select">
+              <option value="off">Off</option>
+              <option value="hard">Hard</option>
+              <option value="soft">Soft</option>
+            </select>
+          </label>
+          <label class="render-row">
+            <span>Tone mapping</span>
+            <select id="rqTone" class="form-select">
+              <option value="aces">Filmic (ACES)</option>
+              <option value="reinhard">Reinhard</option>
+              <option value="linear">Linear</option>
+              <option value="none">None</option>
+            </select>
+          </label>
+          <label class="render-row">
+            <span>Background</span>
+            <select id="rqBackground" class="form-select">
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+              <option value="studio">Studio</option>
+            </select>
+          </label>
+          <label class="render-row -range">
+            <span>Exposure <b id="rqExposureVal">1.0</b></span>
+            <input type="range" id="rqExposure" min="0.2" max="2.5" step="0.05" value="1">
+          </label>
+          <label class="render-row -range">
+            <span>Light intensity <b id="rqLightVal">1.0</b></span>
+            <input type="range" id="rqLight" min="0.1" max="3" step="0.1" value="1">
+          </label>
+          <label class="render-row -check"><input type="checkbox" id="rqEnv"> Environment light &amp; reflections</label>
+          <label class="render-row -check"><input type="checkbox" id="rqHiDpi"> High-resolution (HiDPI)</label>
+          <label class="render-row -check"><input type="checkbox" id="rqWireframe"> Wireframe</label>
+          <label class="render-row -check"><input type="checkbox" id="rqGrid"> Ground grid</label>
+          <button type="button" class="button -small" id="rqReset">Reset to defaults</button>
         </div>
       </div>
 
@@ -133,6 +183,7 @@
           </div>
 
           <div id="caNewGroup">
+            <p class="create-panel-section">Details</p>
             <div class="form-group">
               <label>Subject *</label>
               <input type="text" id="caSubject" class="form-input" placeholder="Work Package subject">
@@ -147,27 +198,98 @@
                 </select>
               </div>
               <div class="form-group">
-                <label>Priority</label>
-                <select id="caPriority" class="form-select">
+                <label>Status</label>
+                <select id="caStatus" class="form-select">
                   <option value="">Default</option>
-                  <% @wp_priorities.each do |p| %>
-                    <option value="<%= p.id %>"><%= p.name %></option>
+                  <% @wp_statuses.each do |s| %>
+                    <option value="<%= s.id %>" <%= 'selected' if s.is_default %>><%= s.name %></option>
                   <% end %>
                 </select>
               </div>
             </div>
             <div class="form-group">
-              <label>Assignee</label>
-              <select id="caAssignee" class="form-select">
-                <option value="">Unassigned</option>
-                <% @wp_assignees.each do |u| %>
-                  <option value="<%= u.id %>"><%= u.name %></option>
-                <% end %>
-              </select>
-            </div>
-            <div class="form-group">
               <label>Description</label>
               <textarea id="caDesc" class="form-textarea" rows="4" placeholder="Description / notes"></textarea>
+            </div>
+
+            <p class="create-panel-section">People</p>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Assignee</label>
+                <select id="caAssignee" class="form-select">
+                  <option value="">Unassigned</option>
+                  <% @wp_assignees.each do |u| %>
+                    <option value="<%= u.id %>"><%= u.name %></option>
+                  <% end %>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Accountable</label>
+                <select id="caAccountable" class="form-select">
+                  <option value="">Nobody</option>
+                  <% @wp_assignees.each do |u| %>
+                    <option value="<%= u.id %>"><%= u.name %></option>
+                  <% end %>
+                </select>
+              </div>
+            </div>
+
+            <p class="create-panel-section">Classification</p>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Priority</label>
+                <select id="caPriority" class="form-select">
+                  <option value="">Default</option>
+                  <% @wp_priorities.each do |p| %>
+                    <option value="<%= p.id %>" <%= 'selected' if p.is_default %>><%= p.name %></option>
+                  <% end %>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Category</label>
+                <select id="caCategory" class="form-select">
+                  <option value="">None</option>
+                  <% @wp_categories.each do |c| %>
+                    <option value="<%= c.id %>"><%= c.name %></option>
+                  <% end %>
+                </select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Version</label>
+                <select id="caVersion" class="form-select">
+                  <option value="">None</option>
+                  <% @wp_versions.each do |v| %>
+                    <option value="<%= v.id %>"><%= v.name %></option>
+                  <% end %>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Parent</label>
+                <select id="caParent" class="form-select">
+                  <option value="">None</option>
+                  <% @work_packages.each do |wp| %>
+                    <option value="<%= wp.id %>">#<%= wp.id %> - <%= wp.subject %></option>
+                  <% end %>
+                </select>
+              </div>
+            </div>
+
+            <p class="create-panel-section">Scheduling</p>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Start date</label>
+                <input type="date" id="caStartDate" class="form-input">
+              </div>
+              <div class="form-group">
+                <label>Finish date</label>
+                <input type="date" id="caDueDate" class="form-input">
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Estimated time (h)</label>
+              <input type="number" id="caEstimatedHours" class="form-input" min="0" step="0.25" placeholder="e.g. 4">
             </div>
           </div>
 

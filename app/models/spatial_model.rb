@@ -22,8 +22,12 @@ class SpatialModel < ApplicationRecord
 
   after_destroy :cleanup_converted_files
 
+  # The most recently uploaded file. `attachments` is ordered by created_at
+  # ascending, so `.first` would return a stale file that is still hanging
+  # around after a re-upload (e.g. a broken multi-file .gltf replaced by a
+  # self-contained .glb).
   def model_attachment
-    attachments.first
+    attachments.to_a.max_by { |a| [a.created_at, a.id] }
   end
 
   def model_attachment_url

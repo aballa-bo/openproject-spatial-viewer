@@ -4,6 +4,7 @@ class SpatialModelsController < ApplicationController
   before_action :find_project_by_project_id
   before_action :authorize
   before_action :find_model, only: %i[show edit update destroy api_data model_file]
+  before_action :relax_csp_for_3d_viewer, only: :show
 
   menu_item :spatial_models
   layout 'base'
@@ -17,9 +18,14 @@ class SpatialModelsController < ApplicationController
     @work_packages = @project.work_packages.visible.order(updated_at: :desc).limit(100)
 
     # Data for the inline "New Work Package" panel shown beside the viewer.
+    # Mirrors the standard OpenProject work package form (as used by the BCF
+    # module) so the same set of attributes can be filled in place.
     @wp_types = @project.types.order(:position)
+    @wp_statuses = Status.order(:position)
     @wp_priorities = IssuePriority.active.order(:position)
     @wp_assignees = Principal.possible_assignee(@project).ordered_by_name.limit(200)
+    @wp_categories = @project.categories
+    @wp_versions = @project.assignable_versions
 
     @spatial_model.enqueue_conversion
   end
@@ -115,6 +121,15 @@ class SpatialModelsController < ApplicationController
                  model_file_project_spatial_model_path(@project, @spatial_model)
                end
 
+    # Real uncompressed byte size. The front-end can't rely on the Content-Length
+    # of model_file: it is served with gzip, so the header reports the compressed
+    # size and a large model gets misclassified as "light".
+    file_size = if @spatial_model.needs_conversion? && @spatial_model.converted_file_ready?
+                  @spatial_model.converted_file_path.size
+                else
+                  @spatial_model.model_attachment&.filesize
+                end
+
     @spatial_model.enqueue_conversion if @spatial_model.needs_conversion?
 
     render json: {
@@ -124,6 +139,7 @@ class SpatialModelsController < ApplicationController
       model_format: @spatial_model.viewer_format,
       source_format: @spatial_model.model_format,
       model_url: file_url,
+      file_size:,
       conversion: conversion_payload,
       settings: @spatial_model.settings,
       annotations: annotations_json,
@@ -133,6 +149,15 @@ class SpatialModelsController < ApplicationController
   end
 
   private
+
+  # three.js' GLTFLoader turns the textures embedded in a GLB into `blob:` URLs
+  # and any data-URI resources into `data:` URLs, then loads them with `fetch()`
+  # (via ImageBitmapLoader). OpenProject's default connect-src is `'self'` only,
+  # so every textured model fails with "Refused to connect ... Content Security
+  # Policy". Allow those two schemes for the viewer page.
+  def relax_csp_for_3d_viewer
+    append_content_security_policy_directives(connect_src: %w[blob: data:])
+  end
 
   # nil for formats that render directly; otherwise the current server-side
   # conversion status so the front-end can wait / show errors.
@@ -150,12 +175,27 @@ class SpatialModelsController < ApplicationController
     }
   end
 
+  # Content types by model format. Deliberately NOT taken from
+  # attachment.content_type: a .gltf file is JSON and gets stored as
+  # "application/json", which the front-end viewer would mistake for the
+  # "conversion pending" envelope and poll this endpoint forever.
+  MODEL_CONTENT_TYPES = {
+    "glb" => "model/gltf-binary",
+    "gltf" => "model/gltf+json",
+    "obj" => "text/plain",
+    "ply" => "application/octet-stream",
+    "splat" => "application/octet-stream",
+    "ksplat" => "application/octet-stream",
+    "gaussian_splat" => "application/octet-stream",
+    "ifc" => "application/octet-stream"
+  }.freeze
+
   def serve_raw_attachment
     attachment = @spatial_model.model_attachment
     if attachment.present? && File.exist?(attachment.diskfile.path)
       send_file attachment.diskfile.path,
                 filename: attachment.filename,
-                type: attachment.content_type.presence || 'application/octet-stream',
+                type: MODEL_CONTENT_TYPES[@spatial_model.model_format] || 'application/octet-stream',
                 disposition: 'inline'
     else
       render_404

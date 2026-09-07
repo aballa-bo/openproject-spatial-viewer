@@ -247,6 +247,23 @@
     this.loadProjectData();
   }
 
+  // ---- Render-quality settings ------------------------------------------
+  // User-tweakable via the "Render" panel; persisted per browser.
+  var RENDER_DEFAULTS = {
+    shadows: 'soft',      // 'off' | 'hard' | 'soft'
+    tone: 'aces',         // 'aces' | 'reinhard' | 'linear' | 'none'
+    background: 'light',  // 'light' | 'dark' | 'studio'
+    exposure: 1.0,        // tone-mapping exposure
+    light: 1.0,           // multiplier on the scene lights
+    env: true,            // image-based environment light + reflections
+    hiDpi: true,          // render at devicePixelRatio (vs 1)
+    wireframe: false,
+    grid: true
+  };
+  var RENDER_STORE_KEY = 'spatialViewer.render';
+
+  var BG_COLORS = { light: 0xeef1f4, dark: 0x0f172a, studio: 0x15181e };
+
   // Wire three-mesh-bvh onto THREE (once) so surface raycasts stay fast on big
   // meshes. No-op if the library did not load.
   function installBVH() {
@@ -280,8 +297,10 @@
     var width = this.viewport.clientWidth || window.innerWidth;
     var height = this.viewport.clientHeight || (window.innerHeight - 150);
 
+    this.renderSettings = this._loadRenderSettings();
+
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x0f172a);
+    this.scene.background = new THREE.Color(BG_COLORS[this.renderSettings.background] || BG_COLORS.light);
 
     this.camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 2000);
     this.camera.position.set(10, 10, 10);
@@ -297,6 +316,10 @@
     this.renderer.shadowMap.enabled = true;
     this.renderer.localClippingEnabled = true;
     this.renderer.xr.enabled = true; // WebXR / VR headset support
+    // Correct colour pipeline for glTF PBR materials (r128 defaults to linear
+    // output, which makes textured models look dark / washed out).
+    if (THREE.sRGBEncoding != null) this.renderer.outputEncoding = THREE.sRGBEncoding;
+    this.renderer.physicallyCorrectLights = false;
 
     // Dolly rig: the camera is parented to a group so we can place the VR
     // "player" near the model when entering immersive mode. Outside VR the
@@ -310,19 +333,40 @@
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.05;
 
-    this.scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    // Base intensities are kept modest: the image-based environment map and
+    // tone mapping carry most of the look. The "Light intensity" slider scales
+    // all three (see _applyRenderSettings).
+    this.ambientLight = new THREE.AmbientLight(0xffffff, 0.45);
+    this.scene.add(this.ambientLight);
 
-    var dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
-    dirLight1.position.set(20, 40, 20);
-    this.scene.add(dirLight1);
+    this.keyLight = new THREE.DirectionalLight(0xffffff, 0.85);
+    this.keyLight.position.set(20, 40, 20);
+    this.keyLight.castShadow = true;
+    this.keyLight.shadow.mapSize.set(2048, 2048);
+    this.keyLight.shadow.bias = -0.0004;
+    this.keyLight.shadow.normalBias = 0.02;
+    this.scene.add(this.keyLight);
+    this.scene.add(this.keyLight.target);
 
-    var dirLight2 = new THREE.DirectionalLight(0x90b0ff, 0.5);
-    dirLight2.position.set(-20, -20, -20);
-    this.scene.add(dirLight2);
+    this.fillLight = new THREE.DirectionalLight(0x90b0ff, 0.35);
+    this.fillLight.position.set(-20, -20, -20);
+    this.scene.add(this.fillLight);
 
-    this.gridHelper = new THREE.GridHelper(50, 50, 0x334155, 0x1e293b);
+    // Invisible plane under the model that only catches shadows.
+    this.shadowCatcher = new THREE.Mesh(
+      new THREE.PlaneGeometry(1, 1),
+      new THREE.ShadowMaterial({ opacity: 0.22 })
+    );
+    this.shadowCatcher.rotation.x = -Math.PI / 2;
+    this.shadowCatcher.receiveShadow = true;
+    this.shadowCatcher.visible = false;
+    this.scene.add(this.shadowCatcher);
+
+    this.gridHelper = new THREE.GridHelper(50, 50, 0xb8c0cc, 0xdbe0e6);
     this.gridHelper.position.y = -0.01;
     this.scene.add(this.gridHelper);
+
+    this._buildEnvironment();
 
     this.annotationsGroup = new THREE.Group();
     this.scene.add(this.annotationsGroup);
@@ -343,6 +387,8 @@
       new THREE.Plane(new THREE.Vector3(0, 0, -1), 1000)
     ];
 
+    this._applyRenderSettings();
+
     var self = this;
     // setAnimationLoop (not requestAnimationFrame) is required for WebXR:
     // during an immersive session the browser drives the frame timing.
@@ -358,6 +404,243 @@
         self.renderer.render(self.scene, self.camera);
       }
     });
+  };
+
+  // ---- Render quality ----------------------------------------------------
+
+  SpatialViewerApp.prototype._loadRenderSettings = function() {
+    var s = {};
+    try {
+      var raw = window.localStorage.getItem(RENDER_STORE_KEY);
+      if (raw) s = JSON.parse(raw) || {};
+    } catch (e) {}
+    var out = {};
+    Object.keys(RENDER_DEFAULTS).forEach(function(k) {
+      out[k] = (s[k] === undefined || s[k] === null) ? RENDER_DEFAULTS[k] : s[k];
+    });
+    return out;
+  };
+
+  SpatialViewerApp.prototype._saveRenderSettings = function() {
+    try { window.localStorage.setItem(RENDER_STORE_KEY, JSON.stringify(this.renderSettings)); } catch (e) {}
+  };
+
+  // A cheap, asset-free image-based light: a vertical sky/horizon/ground
+  // gradient turned into a pre-filtered environment map. Gives glTF PBR
+  // materials soft ambient light and subtle reflections.
+  SpatialViewerApp.prototype._buildEnvironment = function() {
+    if (!THREE.PMREMGenerator || !THREE.DataTexture) return;
+    try {
+      var w = 16, h = 64, data = new Uint8Array(w * h * 4);
+      var sky = [232, 238, 247], horizon = [206, 210, 216], ground = [120, 120, 126];
+      var lerp = function(a, b, t) { return a + (b - a) * t; };
+      for (var y = 0; y < h; y++) {
+        var t = y / (h - 1);            // 0 = bottom row, 1 = top row
+        var up = 1 - t;                 // 1 = top of the sphere
+        var c = (up > 0.5)
+          ? [lerp(horizon[0], sky[0], (up - 0.5) * 2), lerp(horizon[1], sky[1], (up - 0.5) * 2), lerp(horizon[2], sky[2], (up - 0.5) * 2)]
+          : [lerp(ground[0], horizon[0], up * 2), lerp(ground[1], horizon[1], up * 2), lerp(ground[2], horizon[2], up * 2)];
+        for (var x = 0; x < w; x++) {
+          var i = (y * w + x) * 4;
+          data[i] = c[0]; data[i + 1] = c[1]; data[i + 2] = c[2]; data[i + 3] = 255;
+        }
+      }
+      var tex = new THREE.DataTexture(data, w, h, THREE.RGBAFormat);
+      tex.mapping = THREE.EquirectangularReflectionMapping;
+      tex.needsUpdate = true;
+
+      var pmrem = new THREE.PMREMGenerator(this.renderer);
+      pmrem.compileEquirectangularShader();
+      this._envMap = pmrem.fromEquirectangular(tex).texture;
+      tex.dispose();
+      pmrem.dispose();
+    } catch (e) {
+      console.warn('[SpatialViewer] environment map build failed:', e);
+      this._envMap = null;
+    }
+  };
+
+  var TONE_MAP = {
+    aces: 'ACESFilmicToneMapping',
+    reinhard: 'ReinhardToneMapping',
+    linear: 'LinearToneMapping',
+    none: 'NoToneMapping'
+  };
+
+  // Push the current renderSettings onto the renderer / scene / lights / model.
+  SpatialViewerApp.prototype._applyRenderSettings = function() {
+    var r = this.renderer, s = this.renderSettings;
+    if (!r || !s) return;
+
+    // Tone mapping + exposure
+    var tmName = TONE_MAP[s.tone] || TONE_MAP.aces;
+    r.toneMapping = (THREE[tmName] != null) ? THREE[tmName] : THREE.NoToneMapping;
+    r.toneMappingExposure = s.exposure;
+
+    // Pixel ratio
+    var ratio = s.hiDpi ? Math.min(window.devicePixelRatio, 2) : 1;
+    if (ratio !== this._appliedRatio) {
+      this._appliedRatio = ratio;
+      r.setPixelRatio(ratio);
+      var w = this.viewport ? this.viewport.clientWidth : 0;
+      var h = this.viewport ? this.viewport.clientHeight : 0;
+      if (w > 0 && h > 0) r.setSize(w, h, false);
+    }
+
+    // Shadows
+    var shadowsOn = s.shadows !== 'off';
+    r.shadowMap.enabled = shadowsOn;
+    r.shadowMap.type = (s.shadows === 'soft') ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
+    r.shadowMap.needsUpdate = true;
+    if (this.keyLight) this.keyLight.castShadow = shadowsOn;
+    if (this.shadowCatcher) this.shadowCatcher.visible = shadowsOn && !!this.modelObject;
+    (this.modelMeshObjects || []).forEach(function(m) {
+      m.castShadow = shadowsOn;
+      m.receiveShadow = shadowsOn;
+    });
+
+    // Environment light + reflections
+    this.scene.environment = (s.env && this._envMap) ? this._envMap : null;
+
+    // Light intensity multiplier
+    var k = s.light;
+    if (this.ambientLight) this.ambientLight.intensity = 0.45 * k;
+    if (this.keyLight) this.keyLight.intensity = 0.85 * k;
+    if (this.fillLight) this.fillLight.intensity = 0.35 * k;
+
+    // Wireframe
+    var wf = !!s.wireframe;
+    (this.modelMeshObjects || []).forEach(function(m) {
+      var mats = Array.isArray(m.material) ? m.material : [m.material];
+      mats.forEach(function(mm) { if (mm && 'wireframe' in mm) mm.wireframe = wf; });
+    });
+
+    // Ground grid + background
+    if (this.gridHelper) this.gridHelper.visible = !!s.grid;
+    if (this.scene) {
+      this.scene.background = new THREE.Color(BG_COLORS[s.background] != null ? BG_COLORS[s.background] : BG_COLORS.light);
+    }
+
+    this._syncRenderPanel();
+    this._saveRenderSettings();
+  };
+
+  // Size the shadow frustum + shadow-catcher plane to the freshly loaded model.
+  SpatialViewerApp.prototype._fitShadowsToModel = function(box, center, maxDim) {
+    if (this.keyLight) {
+      var d = maxDim * 1.2;
+      var cam = this.keyLight.shadow.camera;
+      cam.left = -d; cam.right = d; cam.top = d; cam.bottom = -d;
+      cam.near = maxDim * 0.01; cam.far = maxDim * 12;
+      cam.updateProjectionMatrix();
+      this.keyLight.position.set(center.x + maxDim * 0.9, center.y + maxDim * 1.8, center.z + maxDim * 0.7);
+      this.keyLight.target.position.copy(center);
+      this.keyLight.target.updateMatrixWorld();
+    }
+    if (this.shadowCatcher) {
+      this.shadowCatcher.position.set(center.x, box.min.y - maxDim * 0.002, center.z);
+      this.shadowCatcher.scale.set(maxDim * 8, maxDim * 8, 1);
+    }
+  };
+
+  // Frame the model in view (same maths as the initial load).
+  SpatialViewerApp.prototype.fitToView = function() {
+    if (!this.modelObject) return;
+    var box = new THREE.Box3().setFromObject(this.modelObject);
+    if (box.isEmpty()) return;
+    var center = box.getCenter(new THREE.Vector3());
+    var size = box.getSize(new THREE.Vector3());
+    var maxDim = Math.max(size.x, size.y, size.z) || 10;
+    this.controls.target.copy(center);
+    this.camera.position.set(center.x + maxDim * 1.5, center.y + maxDim * 1.2, center.z + maxDim * 1.5);
+    this.camera.lookAt(center);
+    this.controls.update();
+  };
+
+  SpatialViewerApp.prototype.goHome = function() {
+    if (!this._homeView) { this.fitToView(); return; }
+    this.camera.position.copy(this._homeView.position);
+    this.controls.target.copy(this._homeView.target);
+    this.controls.update();
+  };
+
+  // Reflect renderSettings into the Render panel's inputs.
+  SpatialViewerApp.prototype._syncRenderPanel = function() {
+    var s = this.renderSettings;
+    var set = function(id, val) { var el = document.getElementById(id); if (el) el.value = val; };
+    var check = function(id, val) { var el = document.getElementById(id); if (el) el.checked = !!val; };
+    set('rqShadows', s.shadows);
+    set('rqTone', s.tone);
+    set('rqBackground', s.background);
+    set('rqExposure', s.exposure);
+    set('rqLight', s.light);
+    check('rqEnv', s.env);
+    check('rqHiDpi', s.hiDpi);
+    check('rqWireframe', s.wireframe);
+    check('rqGrid', s.grid);
+    var ev = document.getElementById('rqExposureVal'); if (ev) ev.textContent = Number(s.exposure).toFixed(2);
+    var lv = document.getElementById('rqLightVal'); if (lv) lv.textContent = Number(s.light).toFixed(1);
+    var btn = document.getElementById('btnWireframe');
+    if (btn) btn.classList.toggle('active', !!s.wireframe);
+  };
+
+  SpatialViewerApp.prototype._initRenderPanel = function() {
+    var self = this;
+    var panel = document.getElementById('renderPanel');
+    var btn = document.getElementById('btnRender');
+    if (btn && panel) {
+      btn.addEventListener('click', function() {
+        var open = panel.style.display === 'none' || !panel.style.display;
+        panel.style.display = open ? 'block' : 'none';
+        btn.classList.toggle('active', open);
+      });
+    }
+    var closeBtn = document.getElementById('closeRenderBtn');
+    if (closeBtn && panel) closeBtn.addEventListener('click', function() {
+      panel.style.display = 'none';
+      if (btn) btn.classList.remove('active');
+    });
+
+    var bind = function(id, key, kind) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var evt = (kind === 'range') ? 'input' : 'change';
+      el.addEventListener(evt, function() {
+        if (kind === 'check') self.renderSettings[key] = el.checked;
+        else if (kind === 'range') self.renderSettings[key] = parseFloat(el.value);
+        else self.renderSettings[key] = el.value;
+        self._applyRenderSettings();
+      });
+    };
+    bind('rqShadows', 'shadows', 'select');
+    bind('rqTone', 'tone', 'select');
+    bind('rqBackground', 'background', 'select');
+    bind('rqExposure', 'exposure', 'range');
+    bind('rqLight', 'light', 'range');
+    bind('rqEnv', 'env', 'check');
+    bind('rqHiDpi', 'hiDpi', 'check');
+    bind('rqWireframe', 'wireframe', 'check');
+    bind('rqGrid', 'grid', 'check');
+
+    var reset = document.getElementById('rqReset');
+    if (reset) reset.addEventListener('click', function() {
+      self.renderSettings = JSON.parse(JSON.stringify(RENDER_DEFAULTS));
+      self._applyRenderSettings();
+    });
+
+    // Toolbar wireframe button mirrors the panel checkbox.
+    var wfBtn = document.getElementById('btnWireframe');
+    if (wfBtn) wfBtn.addEventListener('click', function() {
+      self.renderSettings.wireframe = !self.renderSettings.wireframe;
+      self._applyRenderSettings();
+    });
+
+    var homeBtn = document.getElementById('btnHome');
+    if (homeBtn) homeBtn.addEventListener('click', function() { self.goHome(); });
+    var fitBtn = document.getElementById('btnFit');
+    if (fitBtn) fitBtn.addEventListener('click', function() { self.fitToView(); });
+
+    this._syncRenderPanel();
   };
 
   SpatialViewerApp.prototype.loadProjectData = function() {
@@ -384,6 +667,14 @@
           clearTimeout(self._conversionPoll);
           self._conversionPoll = setTimeout(function() { self.loadProjectData(); }, 8000);
           return;
+        }
+
+        // Authoritative uncompressed size from the server — model_file is gzip'd
+        // so its Content-Length can't be trusted for the heavy-model decision.
+        var heavyMb = parseInt(self.container.dataset.heavyModelMb, 10) || 40;
+        if (data.file_size) {
+          self._modelBytes = data.file_size;
+          self.heavyMode = data.file_size >= heavyMb * 1048576;
         }
 
         self.load3DModel(data.model_url, data.model_format);
@@ -427,6 +718,10 @@
         var lenHdr = head.headers.get('content-length');
         var bytes = lenHdr ? parseInt(lenHdr, 10) : 0;
 
+        // Prefer the authoritative size from api_data; the HEAD Content-Length
+        // may be gzip-compressed and understate a large model.
+        if (self._modelBytes) bytes = Math.max(bytes, self._modelBytes);
+
         if (ct.indexOf('application/json') === -1 && bytes > 0) {
           self._modelBytes = bytes;
           self.heavyMode = bytes >= heavyMb * 1048576;
@@ -468,10 +763,28 @@
     return fetch(url, { credentials: 'same-origin' }).then(function(response) {
       if (!response.ok) throw new Error('HTTP ' + response.status);
 
-      // model_file replies JSON while a server-side conversion is pending.
-      var ct = response.headers.get('content-type') || '';
-      if (ct.indexOf('application/json') !== -1) {
-        return response.json().then(function(j) {
+      // model_file replies with a small JSON envelope ({status, message}) while
+      // a server-side conversion (IFC -> GLB) is pending. But a .gltf file *is*
+      // JSON too, and some servers label it application/json — so a JSON
+      // content-type alone must NOT be treated as "conversion pending", or the
+      // viewer polls model_file forever and never renders the model.
+      var ct = (response.headers.get('content-type') || '').toLowerCase();
+      if (ct.indexOf('/json') !== -1) {
+        return response.arrayBuffer().then(function(b) {
+          var head = '';
+          try { head = new TextDecoder('utf-8').decode(b.slice(0, 4096)); } catch (e) {}
+          var isEnvelope = b.byteLength < 4096 &&
+                           head.indexOf('"status"') !== -1 &&
+                           head.indexOf('"asset"') === -1;
+
+          if (!isEnvelope && (format === 'glb' || format === 'gltf')) {
+            // It's the glTF document itself. Parse it as the model.
+            try { self._modelBlob = new Blob([b]); } catch (e) {}
+            return { buffer: b };
+          }
+
+          var j = {};
+          try { j = JSON.parse(head); } catch (e) {}
           if (j && j.status === 'error') {
             self.showLoader('Conversion failed: ' + (j.message || 'unknown error'));
           } else {
@@ -546,22 +859,75 @@
     }
   };
 
+  // A text .gltf document can point at companion files (scene.bin, textures/*)
+  // via relative `uri`s. The viewer only ever receives the single uploaded
+  // file, so those references cannot be resolved. Returns the list of external
+  // resources, or [] for a self-contained file / binary .glb.
+  SpatialViewerApp.prototype._gltfExternalRefs = function(buffer) {
+    // Binary .glb starts with the magic number 0x46546C67 ("glTF") — no text
+    // to inspect, and its resources are always embedded.
+    var dv = new DataView(buffer);
+    if (buffer.byteLength >= 4 && dv.getUint32(0, true) === 0x46546C67) return [];
+
+    var gltf;
+    try { gltf = JSON.parse(new TextDecoder('utf-8').decode(buffer)); }
+    catch (e) { return []; }
+
+    var refs = [];
+    ['buffers', 'images'].forEach(function(key) {
+      (gltf[key] || []).forEach(function(entry) {
+        var uri = entry && entry.uri;
+        if (typeof uri === 'string' && uri.slice(0, 5) !== 'data:') refs.push(uri);
+      });
+    });
+    return refs;
+  };
+
   // (7) Parse GLB/GLTF in a Web Worker so the main thread does not freeze.
   // Falls back to a main-thread GLTFLoader.parse() on any failure (e.g. the GLB
   // has textures / KHR extensions the worker path can't handle).
   SpatialViewerApp.prototype._parseGltf = function(buffer) {
     var self = this;
 
+    var refs = this._gltfExternalRefs(buffer);
+    if (refs.length) {
+      var shown = refs.slice(0, 3).join(', ') + (refs.length > 3 ? ', …' : '');
+      this.showLoader(
+        'This .gltf file references ' + refs.length + ' external file(s) that were ' +
+        'not uploaded (' + shown + '). Upload a single self-contained .glb instead, ' +
+        'or a .gltf with embedded (data-URI) buffers and textures.');
+      console.warn('[SpatialViewer] glTF references external resources:', refs);
+      return;
+    }
+
     function mainThreadParse(buf) {
       self.showLoader('Parsing 3D geometry (the page may briefly freeze)...');
+      var parsed = false;
       try {
         new THREE.GLTFLoader().parse(buf, '',
-          function(gltf) { self.onModelLoaded(gltf.scene); },
+          function(gltf) {
+            // GLTFLoader wraps its onLoad callback in a .catch(onError), so an
+            // exception thrown *here* (while adding the model to the scene, BVH,
+            // …) would otherwise be reported as a bogus "parse error". Handle it
+            // separately and let the real stack surface.
+            parsed = true;
+            try {
+              self.onModelLoaded(gltf.scene);
+            } catch (err) {
+              console.error('[SpatialViewer] Post-load processing failed:', err);
+              self.showLoader('The model loaded but could not be displayed: ' +
+                (err && err.message || err));
+            }
+          },
           function(err) {
+            if (parsed) return; // already past parsing — error came from onLoad
             console.error('[SpatialViewer] GLTF parse error:', err);
-            self.showLoader('Error parsing GLTF/GLB: ' + (err && err.message || err));
+            self.showLoader('Error parsing GLTF/GLB: ' + (err && err.message || err) +
+              '. If this is a large or highly detailed model, the browser tab may ' +
+              'have run out of memory — try a decimated / Draco-compressed export.');
           });
       } catch (err) {
+        console.error('[SpatialViewer] GLTFLoader.parse threw:', err);
         self.showLoader('Error parsing GLTF/GLB: ' + (err && err.message || err));
       }
     }
@@ -677,19 +1043,23 @@
   // (1) Drop shadows / high-DPI rendering for heavy models.
   SpatialViewerApp.prototype._applyPerformanceMode = function() {
     if (!this.renderer) return;
-    var heavy = !!this.heavyMode;
-    this.renderer.shadowMap.enabled = !heavy;
-    this.renderer.shadowMap.needsUpdate = true;
-    this.renderer.setPixelRatio(heavy ? 1 : Math.min(window.devicePixelRatio, 2));
 
-    if (heavy) {
-      this.showTooltip('Large model — shadows and high-DPI rendering are off for performance.');
+    // On the first heavy model of the session, drop shadows and HiDPI to keep
+    // the frame-rate usable. This is a one-time nudge to the stored settings —
+    // the user can turn them back on in the Render panel and it sticks.
+    if (this.heavyMode && !this._heavyDefaultsApplied) {
+      this._heavyDefaultsApplied = true;
+      this.renderSettings.shadows = 'off';
+      this.renderSettings.hiDpi = false;
+      this.showTooltip('Large model — shadows and high-DPI turned off for performance. Re-enable them in the Render panel.');
       var self = this;
       setTimeout(function() {
         var t = document.getElementById('drawingTooltip');
         if (t && self.currentTool === 'orbit') t.style.display = 'none';
-      }, 5000);
+      }, 6000);
     }
+
+    this._applyRenderSettings();
   };
 
   /**
@@ -788,8 +1158,6 @@
             child.material.clippingPlanes = self.clipPlanes;
           }
         }
-        child.castShadow = !heavy;
-        child.receiveShadow = !heavy;
         self.modelMeshObjects.push(child);
 
         var g = child.geometry;
@@ -801,7 +1169,6 @@
     // (1) Escalate to heavy mode if the mesh is dense even when the file is small.
     if (!heavy && triangles > 4000000) {
       heavy = this.heavyMode = true;
-      this.modelMeshObjects.forEach(function(m) { m.castShadow = false; m.receiveShadow = false; });
     }
     this._applyPerformanceMode();
     this._modelBlob = null; // release the downloaded bytes
@@ -832,6 +1199,14 @@
     this.camera.position.set(center.x + maxDim * 1.5, center.y + maxDim * 1.2, center.z + maxDim * 1.5);
     this.camera.lookAt(center);
     this.controls.update();
+
+    // Size shadows to the model and remember this framing for the Home button.
+    this._fitShadowsToModel(box, center, maxDim);
+    this._homeView = { position: this.camera.position.clone(), target: this.controls.target.clone() };
+
+    // Re-apply render settings now that the model (and its materials) exist, so
+    // shadows / wireframe / env map land on the new meshes.
+    this._applyRenderSettings();
 
     this.hideLoader();
     this.renderExisting3DAnnotations();
@@ -1454,6 +1829,15 @@
     if (descInput) descInput.value = '';
     if (titleEl) titleEl.innerText = 'New Work Package';
 
+    // Reset the optional standard fields to their neutral default so a value
+    // left over from a previous annotation is not silently reused.
+    ['caStatus', 'caPriority', 'caAssignee', 'caAccountable', 'caCategory',
+     'caVersion', 'caParent', 'caStartDate', 'caDueDate', 'caEstimatedHours']
+      .forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.value = '';
+      });
+
     // Reset mode to "new"
     var newRadio = document.querySelector('input[name="caMode"][value="new"]');
     if (newRadio) { newRadio.checked = true; this.updateCreateMode('new'); }
@@ -1611,10 +1995,11 @@
     var mode = (document.querySelector('input[name="caMode"]:checked') || {}).value || 'new';
     var subject = (document.getElementById('caSubject').value || '').trim();
     var desc = document.getElementById('caDesc').value;
-    var typeId = document.getElementById('caType') ? document.getElementById('caType').value : '';
-    var priorityId = document.getElementById('caPriority') ? document.getElementById('caPriority').value : '';
-    var assigneeId = document.getElementById('caAssignee') ? document.getElementById('caAssignee').value : '';
-    var existingWpId = document.getElementById('caExistingWp') ? document.getElementById('caExistingWp').value : '';
+    var val = function(id) {
+      var el = document.getElementById(id);
+      return el && el.value ? el.value : '';
+    };
+    var existingWpId = val('caExistingWp');
 
     if (mode === 'existing' && !existingWpId) { alert('Select a Work Package to link.'); return; }
     if (mode === 'new' && !subject) { alert('Enter a subject for the Work Package.'); return; }
@@ -1637,9 +2022,17 @@
       create_work_package: (mode === 'new') ? 'true' : 'false',
       wp_subject: subject,
       wp_description: desc,
-      wp_type_id: typeId,
-      wp_priority_id: priorityId,
-      wp_assigned_to_id: assigneeId
+      wp_type_id: val('caType'),
+      wp_status_id: val('caStatus'),
+      wp_priority_id: val('caPriority'),
+      wp_assigned_to_id: val('caAssignee'),
+      wp_responsible_id: val('caAccountable'),
+      wp_category_id: val('caCategory'),
+      wp_version_id: val('caVersion'),
+      wp_parent_id: val('caParent'),
+      wp_start_date: val('caStartDate'),
+      wp_due_date: val('caDueDate'),
+      wp_estimated_hours: val('caEstimatedHours')
     };
 
     var saveBtn = document.getElementById('caSaveBtn');
@@ -1872,6 +2265,8 @@
     var closeSliceBtn = document.getElementById('closeSliceBtn');
     if (sliceBtn && slicePanel) sliceBtn.addEventListener('click', function() { slicePanel.style.display = slicePanel.style.display === 'none' ? 'block' : 'none'; });
     if (closeSliceBtn && slicePanel) closeSliceBtn.addEventListener('click', function() { slicePanel.style.display = 'none'; });
+
+    this._initRenderPanel();
 
     var clipX = document.getElementById('clipX'), clipY = document.getElementById('clipY'), clipZ = document.getElementById('clipZ');
     var resetClip = document.getElementById('resetClipBtn');

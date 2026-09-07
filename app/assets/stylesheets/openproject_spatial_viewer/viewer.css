@@ -1,24 +1,34 @@
+/* =========================================================================
+   Spatial viewer (3D & Splatting) — aligned with the OpenProject UI.
+   Colours, spacing and typography come from the global design tokens
+   (Primer + OpenProject variables) so the module reads as part of the app,
+   the same way the BCF / IFC viewer does.
+   ========================================================================= */
 
 .spatial-viewer-app {
   display: flex;
   flex-direction: column;
   height: calc(100vh - 120px);
-  min-height: 600px;
-  background: #1e293b;
-  color: #f8fafc;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  min-height: 560px;
+  background: var(--bgColor-default);
+  color: var(--body-font-color);
+  font-family: var(--body-font-family);
+  font-size: var(--body-font-size);
   overflow: hidden;
-  border-radius: 8px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--borderColor-default);
+  border-radius: 6px;
+  box-shadow: var(--shadow-resting-small, 0 1px 3px rgba(27, 31, 36, 0.12));
 }
+
+/* ---- Toolbar ---------------------------------------------------------- */
 
 .spatial-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 16px;
-  background: #0f172a;
-  border-bottom: 1px solid #334155;
+  padding: 8px 12px;
+  background: var(--bgColor-muted);
+  border-bottom: 1px solid var(--borderColor-default);
   gap: 12px;
   flex-wrap: wrap;
   z-index: 20;
@@ -35,36 +45,35 @@
 }
 
 .toolbar-model-title {
-  font-weight: 600;
-  font-size: 1.05rem;
-  color: #f1f5f9;
+  font-weight: var(--base-text-weight-bold);
+  font-size: 1rem;
+  color: var(--fgColor-default, var(--body-font-color));
 }
 
 .toolbar-btn {
-  background: #1e293b;
-  color: #cbd5e1;
-  border: 1px solid #334155;
-  border-radius: 6px;
-  padding: 6px 12px;
-  font-size: 0.85rem;
+  background: var(--button--background-color);
+  color: var(--button--font-color);
+  border: 1px solid var(--borderColor-default);
+  border-radius: 4px;
+  padding: 5px 10px;
+  font-size: 0.8125rem;
+  line-height: 1.4;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  transition: all 0.2s ease;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
 }
 
 .toolbar-btn:hover {
-  background: #334155;
-  color: #ffffff;
-  border-color: #475569;
+  background: var(--button--background-hover-color);
+  border-color: var(--borderColor-emphasis);
 }
 
 .toolbar-btn.active {
-  background: #2563eb;
-  color: #ffffff;
-  border-color: #3b82f6;
-  box-shadow: 0 0 10px rgba(37, 99, 235, 0.4);
+  background: var(--accent-color);
+  color: var(--font-color-on-primary);
+  border-color: var(--accent-color);
 }
 
 .toolbar-btn:disabled {
@@ -85,12 +94,13 @@
   position: absolute;
   top: 100%;
   left: 0;
-  background: #1e293b;
-  border: 1px solid #334155;
-  border-radius: 6px;
-  padding: 6px 0;
+  margin-top: 4px;
+  background: var(--overlay-bgColor, var(--bgColor-default));
+  border: 1px solid var(--borderColor-default);
+  border-radius: var(--overlay-borderRadius, 6px);
+  padding: 4px 0;
   min-width: 180px;
-  box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+  box-shadow: var(--shadow-floating-small, 0 6px 18px rgba(27, 31, 36, 0.18));
   z-index: 100;
 }
 
@@ -100,16 +110,18 @@
 
 .toolbar-dropdown-menu a {
   display: block;
-  padding: 8px 14px;
-  color: #cbd5e1;
+  padding: 7px 14px;
+  color: var(--body-font-color);
   text-decoration: none;
-  font-size: 0.85rem;
+  font-size: 0.8125rem;
 }
 
 .toolbar-dropdown-menu a:hover {
-  background: #334155;
-  color: #ffffff;
+  background: var(--drop-down-hover-bg-color);
+  color: var(--body-font-color);
 }
+
+/* ---- Main layout ---------------------------------------------------------- */
 
 .spatial-main-container {
   display: flex;
@@ -129,7 +141,7 @@
   min-height: 0;
   overflow: hidden;
   position: relative;
-  background: radial-gradient(circle at center, #1e293b 0%, #0f172a 100%);
+  background: radial-gradient(circle at 50% 32%, #ffffff 0%, #eef1f4 55%, #e4e8ec 100%);
   cursor: default;
 }
 
@@ -141,24 +153,21 @@
 
 .viewer-loader {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(15, 23, 42, 0.85);
+  inset: 0;
+  background: rgba(255, 255, 255, 0.82);
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   z-index: 50;
-  backdrop-filter: blur(4px);
+  backdrop-filter: blur(3px);
 }
 
 .spinner {
-  width: 48px;
-  height: 48px;
-  border: 4px solid #334155;
-  border-top-color: #3b82f6;
+  width: 44px;
+  height: 44px;
+  border: 4px solid var(--borderColor-muted);
+  border-top-color: var(--accent-color);
   border-radius: 50%;
   animation: spin 1s linear infinite;
 }
@@ -168,9 +177,9 @@
 }
 
 .loader-text {
-  margin-top: 16px;
-  font-size: 0.95rem;
-  color: #94a3b8;
+  margin-top: 14px;
+  font-size: 0.9rem;
+  color: var(--fgColor-muted);
 }
 
 .drawing-tooltip {
@@ -178,37 +187,38 @@
   top: 16px;
   left: 50%;
   transform: translateX(-50%);
-  background: rgba(15, 23, 42, 0.9);
-  color: #38bdf8;
-  padding: 8px 16px;
-  border-radius: 20px;
-  font-size: 0.85rem;
-  border: 1px solid #0284c7;
+  background: var(--bgColor-default);
+  color: var(--fgColor-accent, var(--accent-color));
+  padding: 7px 16px;
+  border-radius: 16px;
+  font-size: 0.8125rem;
+  border: 1px solid var(--borderColor-accent-muted, var(--accent-color--minor1));
   pointer-events: none;
   z-index: 30;
-  box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+  box-shadow: var(--shadow-floating-small, 0 4px 15px rgba(27, 31, 36, 0.15));
 }
 
+/* Floating panel over the viewport (section planes) */
 .slicing-panel {
   position: absolute;
   top: 16px;
   left: 16px;
-  background: rgba(15, 23, 42, 0.95);
-  border: 1px solid #334155;
-  border-radius: 8px;
+  background: var(--bgColor-default);
+  border: 1px solid var(--borderColor-default);
+  border-radius: 6px;
   padding: 14px;
   width: 240px;
   z-index: 30;
-  box-shadow: 0 8px 25px rgba(0,0,0,0.4);
+  box-shadow: var(--shadow-floating-small, 0 8px 25px rgba(27, 31, 36, 0.18));
 }
 
 .slicing-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-weight: 600;
+  font-weight: var(--base-text-weight-bold);
   margin-bottom: 12px;
-  border-bottom: 1px solid #334155;
+  border-bottom: 1px solid var(--borderColor-default);
   padding-bottom: 6px;
 }
 
@@ -217,19 +227,80 @@
   flex-direction: column;
   font-size: 0.8rem;
   margin-bottom: 10px;
-  color: #94a3b8;
+  color: var(--fgColor-muted);
 }
 
 .slicing-body input[type=range] {
   margin-top: 4px;
 }
 
+/* Render-quality panel — floats top-right of the viewport */
+.render-panel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: var(--bgColor-default);
+  border: 1px solid var(--borderColor-default);
+  border-radius: 6px;
+  padding: 12px 14px;
+  width: 264px;
+  max-height: calc(100% - 32px);
+  overflow-y: auto;
+  z-index: 30;
+  box-shadow: var(--shadow-floating-small, 0 8px 25px rgba(27, 31, 36, 0.18));
+}
+
+.render-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.8125rem;
+  color: var(--body-font-color);
+  margin-bottom: 10px;
+}
+
+.render-row .form-select {
+  width: 130px;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  font-size: 0.8125rem;
+}
+
+.render-row.-range {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.render-row.-range input[type=range] {
+  width: 100%;
+}
+
+.render-row.-range b {
+  font-weight: var(--base-text-weight-bold);
+  color: var(--fgColor-muted);
+}
+
+.render-row.-check {
+  justify-content: flex-start;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.render-panel .button {
+  width: 100%;
+  margin-top: 2px;
+}
+
+/* ---- Side panel --------------------------------------------------------- */
+
 .spatial-side-panel {
   width: 380px;
   flex: 0 0 auto;      /* never squeezed by the viewport */
   position: relative;  /* anchor for the resize grip */
-  background: #0f172a;
-  border-left: 1px solid #334155;
+  background: var(--bgColor-default);
+  border-left: 1px solid var(--borderColor-default);
   display: flex;
   flex-direction: column;
   z-index: 10;
@@ -255,30 +326,36 @@
 
 .side-panel-resizer:hover,
 .side-panel-resizer.dragging {
-  background: rgba(56, 189, 248, 0.35);
+  background: var(--accent-color--minor1);
 }
 
 .side-panel-tabs {
   display: flex;
-  border-bottom: 1px solid #334155;
+  border-bottom: 1px solid var(--borderColor-default);
+  background: var(--bgColor-muted);
 }
 
 .tab-btn {
   flex: 1;
   background: transparent;
   border: none;
-  padding: 12px;
-  color: #94a3b8;
+  padding: 11px 12px;
+  color: var(--fgColor-muted);
   font-weight: 500;
+  font-size: 0.8125rem;
   cursor: pointer;
   border-bottom: 2px solid transparent;
-  transition: all 0.2s;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.tab-btn:hover {
+  color: var(--body-font-color);
 }
 
 .tab-btn.active {
-  color: #38bdf8;
-  border-bottom-color: #38bdf8;
-  background: rgba(56, 189, 248, 0.05);
+  color: var(--accent-color);
+  border-bottom-color: var(--accent-color);
+  background: var(--bgColor-default);
 }
 
 .tab-content {
@@ -292,20 +369,21 @@
   display: block;
 }
 
+/* ---- Annotation / work package cards ---------------------------------- */
+
 .annotation-card {
-  background: #1e293b;
-  border: 1px solid #334155;
-  border-radius: 8px;
+  background: var(--bgColor-default);
+  border: 1px solid var(--borderColor-default);
+  border-radius: 6px;
   overflow: hidden;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 
 .annotation-card:hover {
-  border-color: #38bdf8;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  border-color: var(--accent-color);
+  box-shadow: var(--shadow-resting-small, 0 2px 8px rgba(27, 31, 36, 0.12));
 }
 
 .annotation-thumb {
@@ -313,8 +391,8 @@
   width: 100%;
   height: 130px;
   object-fit: cover;
-  background: #0f172a;
-  border-bottom: 1px solid #334155;
+  background: var(--bgColor-muted);
+  border-bottom: 1px solid var(--borderColor-default);
 }
 
 .annotation-card-body {
@@ -328,41 +406,43 @@
   margin: 2px 0 4px;
   padding: 2px 8px;
   border-radius: 12px;
-  font-size: 0.78rem;
-  background: #14532d;
-  color: #bbf7d0;
+  font-size: 0.75rem;
+  background: var(--bgColor-success-muted, #dafbe1);
+  color: var(--fgColor-success, #1a7f37);
   text-decoration: none;
 }
 
 .annotation-wp-link:hover {
-  background: #166534;
-  color: #ffffff;
+  background: var(--bgColor-success-muted, #cdf3d6);
+  color: var(--fgColor-success, #116329);
 }
 
 .annotation-card-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   margin-bottom: 6px;
 }
 
 .annotation-title {
-  font-weight: 600;
-  font-size: 0.95rem;
-  color: #f1f5f9;
+  font-weight: var(--base-text-weight-bold);
+  font-size: 0.9rem;
+  color: var(--body-font-color);
 }
 
 .annotation-type-badge {
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   padding: 2px 8px;
   border-radius: 12px;
-  background: #334155;
-  color: #cbd5e1;
+  background: var(--bgColor-neutral-muted, #eaeef2);
+  color: var(--fgColor-muted);
+  white-space: nowrap;
 }
 
 .annotation-desc {
-  font-size: 0.85rem;
-  color: #94a3b8;
+  font-size: 0.8125rem;
+  color: var(--fgColor-muted);
   margin-bottom: 8px;
 }
 
@@ -370,9 +450,9 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 0.75rem;
-  color: #64748b;
-  border-top: 1px solid #334155;
+  font-size: 0.72rem;
+  color: var(--fgColor-muted);
+  border-top: 1px solid var(--borderColor-default);
   padding-top: 6px;
   margin-top: 6px;
 }
@@ -380,12 +460,17 @@
 .close-btn {
   background: transparent;
   border: none;
-  color: #94a3b8;
-  font-size: 1.4rem;
+  color: var(--fgColor-muted);
+  font-size: 1.35rem;
+  line-height: 1;
   cursor: pointer;
 }
 
-/* ---- Inline "New Work Package" panel (beside the viewer) ---------------- */
+.close-btn:hover {
+  color: var(--body-font-color);
+}
+
+/* ---- Inline "New Work Package" panel (beside the viewer, BCF style) --- */
 
 .annotation-create-panel {
   display: none;
@@ -397,7 +482,7 @@
 /* While creating, keep the panel wide enough for the form but let a wider
    user-chosen width win. */
 .spatial-side-panel.creating {
-  min-width: 380px;
+  min-width: 400px;
 }
 
 .spatial-side-panel.creating .side-panel-tabs,
@@ -413,14 +498,16 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 14px 16px;
-  border-bottom: 1px solid #334155;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--borderColor-default);
+  background: var(--bgColor-muted);
 }
 
 .create-panel-header h3 {
   margin: 0;
-  font-size: 1rem;
-  color: #f1f5f9;
+  font-size: 0.95rem;
+  font-weight: var(--base-text-weight-bold);
+  color: var(--body-font-color);
 }
 
 .create-panel-body {
@@ -429,12 +516,29 @@
   flex: 1;
 }
 
+.create-panel-section {
+  margin: 0 0 6px;
+  padding-top: 6px;
+  font-size: 0.72rem;
+  font-weight: var(--base-text-weight-bold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fgColor-muted);
+  border-top: 1px solid var(--borderColor-muted);
+}
+
+.create-panel-section:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
 .create-panel-footer {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 8px;
   padding: 12px 16px;
-  border-top: 1px solid #334155;
+  border-top: 1px solid var(--borderColor-default);
+  background: var(--bgColor-muted);
 }
 
 .ca-snapshot {
@@ -442,17 +546,17 @@
   height: 150px;
   object-fit: cover;
   border-radius: 6px;
-  border: 1px solid #334155;
-  background: #0f172a;
+  border: 1px solid var(--borderColor-default);
+  background: var(--bgColor-muted);
   margin-bottom: 14px;
 }
 
 .ca-mode-switch {
   display: flex;
-  gap: 14px;
+  gap: 16px;
   margin-bottom: 14px;
-  font-size: 0.85rem;
-  color: #cbd5e1;
+  font-size: 0.8125rem;
+  color: var(--body-font-color);
 }
 
 .ca-mode-switch label {
@@ -461,6 +565,8 @@
   gap: 5px;
   cursor: pointer;
 }
+
+/* ---- Forms (mirrors OpenProject text inputs) ------------------------- */
 
 .form-row {
   display: flex;
@@ -472,30 +578,48 @@
 }
 
 .form-group {
-  margin-bottom: 14px;
+  margin-bottom: 12px;
 }
 
 .form-group label {
   display: block;
-  font-size: 0.85rem;
-  color: #cbd5e1;
-  margin-bottom: 5px;
+  font-size: 0.8125rem;
+  font-weight: var(--base-text-weight-bold);
+  color: var(--body-font-color);
+  margin-bottom: 4px;
 }
 
-.form-input, .form-textarea, .form-select {
+.form-input,
+.form-textarea,
+.form-select {
   width: 100%;
-  background: #0f172a;
-  border: 1px solid #334155;
-  color: #f8fafc;
-  padding: 8px 12px;
-  border-radius: 6px;
-  font-size: 0.9rem;
+  background: var(--bgColor-default);
+  border: 1px solid var(--borderColor-default);
+  color: var(--body-font-color);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 0.875rem;
+  font-family: inherit;
+  line-height: 1.5;
 }
 
-.form-input:focus, .form-textarea:focus, .form-select:focus {
+.form-input:hover,
+.form-textarea:hover,
+.form-select:hover {
+  border-color: var(--borderColor-emphasis);
+}
+
+.form-input:focus,
+.form-textarea:focus,
+.form-select:focus {
   outline: none;
-  border-color: #38bdf8;
-  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-color--minor1);
+}
+
+.form-textarea {
+  resize: vertical;
+  min-height: 68px;
 }
 
 .color-picker-group {
@@ -509,18 +633,10 @@
   border-radius: 50%;
   border: 2px solid transparent;
   cursor: pointer;
-  transition: transform 0.2s;
+  transition: transform 0.15s;
 }
 
 .color-dot.active {
-  transform: scale(1.25);
-  border-color: #ffffff;
-}
-
-.spatial-modal-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 12px;
-  padding: 14px 20px;
-  border-top: 1px solid #334155;
+  transform: scale(1.2);
+  border-color: var(--body-font-color);
 }
