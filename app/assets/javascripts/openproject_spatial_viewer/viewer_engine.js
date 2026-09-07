@@ -854,7 +854,9 @@
     this.viewport.addEventListener('pointermove', function(e) { self.onPointerMove(e); });
     this.viewport.addEventListener('pointerup', function(e) { self.onPointerUp(e); });
     this.viewport.addEventListener('pointercancel', function(e) { self.onPointerUp(e); });
-    this.viewport.addEventListener('lostpointercapture', function(e) { self.onPointerUp(e); });
+    // NOTE: deliberately no 'lostpointercapture' listener. It bubbles, and
+    // OrbitControls captures the pointer on the canvas first; re-capturing
+    // would fire it and abort the stroke after a couple of points.
   };
 
   // Build BVH bounds trees for the model meshes (once). Synchronous: a one-time
@@ -1003,7 +1005,10 @@
     this._setLassoHighlight(null);
     // Capture the pointer so the stroke keeps going (and pointerup still fires)
     // even if the cursor leaves the viewport.
-    try { if (e.pointerId != null) this.viewport.setPointerCapture(e.pointerId); } catch (ignore) {}
+    // Capture on the CANVAS — the same element OrbitControls uses — so there is
+    // no capture transfer (which would fire lostpointercapture and kill the
+    // stroke). Events still bubble to our listeners on the viewport.
+    try { if (e.pointerId != null) this.canvas.setPointerCapture(e.pointerId); } catch (ignore) {}
     this._activePointerId = (e.pointerId != null) ? e.pointerId : null;
     this._pointerClient = { x: e.clientX, y: e.clientY };
     this._lastSampleClient = { x: e.clientX, y: e.clientY };
@@ -1095,9 +1100,12 @@
   SpatialViewerApp.prototype.onPointerUp = function() {
     if (!this.isDrawing) return;
     this.isDrawing = false;
-    this.controls.enabled = true;
+    // Restore orbiting only if the orbit tool is active — leaving it enabled
+    // while a drawing tool is selected let OrbitControls grab the pointer on
+    // the next stroke.
+    this.controls.enabled = (this.currentTool === 'orbit');
     try {
-      if (this._activePointerId != null) this.viewport.releasePointerCapture(this._activePointerId);
+      if (this._activePointerId != null) this.canvas.releasePointerCapture(this._activePointerId);
     } catch (ignore) {}
     this._activePointerId = null;
 
@@ -1126,6 +1134,7 @@
     if (ring.length < 3) { this._clearLassoOverlay(); this.clearTempMarkup(); return; }
 
     this.currentDrawingPoints = ring;
+    console.log('[SpatialViewer] lasso: ' + path.length + ' screen points -> ' + ring.length + ' 3D points');
 
     this.openAnnotationModal({
       type: 'lasso_selection',
