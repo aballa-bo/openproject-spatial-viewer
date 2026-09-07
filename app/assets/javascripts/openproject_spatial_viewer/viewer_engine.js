@@ -20,18 +20,26 @@
   }
 
   // ---- Lasso surface-highlight shader --------------------------------------
-  // Renders the model's own geometry, tinted, discarding fragments outside the
-  // lasso polygon (tested in NDC against gl_FragCoord). Because it shares the
-  // model geometry and uses depthTest, the tint lands exactly on the visible
-  // surface — no offset, no speckle, correctly occluded.
+  // A projective decal. The lasso polygon lives in the NDC of the camera that
+  // made the selection; every fragment of the model is re-projected through
+  // that camera (uSelViewProj) and tested against it, so the tint is glued to
+  // the SURFACE and rotates with the model. Visibility is frozen at selection
+  // time with a depth map rendered from the same camera (uSelDepth), so only
+  // the surface that was actually in front stays highlighted.
   var LASSO_MAX_PTS = 48;
   var LASSO_VS =
+    'uniform mat4 uSelViewProj;\n' +
+    'varying vec4 vSelClip;\n' +
     'void main() {\n' +
+    '  vSelClip = uSelViewProj * modelMatrix * vec4(position, 1.0);\n' +
     '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);\n' +
     '}';
   var LASSO_POINTS_VS =
+    'uniform mat4 uSelViewProj;\n' +
     'uniform float uSize;\n' +
+    'varying vec4 vSelClip;\n' +
     'void main() {\n' +
+    '  vSelClip = uSelViewProj * modelMatrix * vec4(position, 1.0);\n' +
     '  vec4 mv = modelViewMatrix * vec4(position, 1.0);\n' +
     '  gl_PointSize = clamp(uSize * 350.0 / max(-mv.z, 0.001), 2.0, 24.0);\n' +
     '  gl_Position = projectionMatrix * mv;\n' +
@@ -40,13 +48,19 @@
   // slots repeat the last point (degenerate edges contribute nothing). All
   // array indexing is loop-index based for maximum driver compatibility.
   var LASSO_FS =
+    '#include <packing>\n' +
     'uniform vec3 uColor;\n' +
     'uniform float uOpacity;\n' +
-    'uniform vec2 uRes;\n' +
     'uniform vec2 uPoly[' + LASSO_MAX_PTS + '];\n' +
     'uniform int uPolyLen;\n' +
+    'uniform sampler2D uSelDepth;\n' +
+    'uniform bool uUseDepth;\n' +
+    'uniform float uDepthBias;\n' +
+    'varying vec4 vSelClip;\n' +
     'void main() {\n' +
-    '  vec2 ndc = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;\n' +
+    '  if (vSelClip.w <= 0.0) discard;\n' +
+    '  vec2 ndc = vSelClip.xy / vSelClip.w;\n' +
+    '  if (abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0) discard;\n' +
     '  bool inside = false;\n' +
     '  for (int i = 0; i < ' + (LASSO_MAX_PTS - 1) + '; i++) {\n' +
     '    if (i + 1 >= uPolyLen) break;\n' +
@@ -58,6 +72,11 @@
     '    }\n' +
     '  }\n' +
     '  if (!inside) discard;\n' +
+    '  if (uUseDepth) {\n' +
+    '    float myDepth = 0.5 * (vSelClip.z / vSelClip.w) + 0.5;\n' +
+    '    float mapDepth = unpackRGBAToDepth(texture2D(uSelDepth, ndc * 0.5 + 0.5));\n' +
+    '    if (myDepth > mapDepth + uDepthBias) discard;\n' +
+    '  }\n' +
     '  gl_FragColor = vec4(uColor, uOpacity);\n' +
     '}';
 
@@ -70,6 +89,8 @@
         if (app._conversionPoll) clearTimeout(app._conversionPoll);
         if (app._gltfWorker) { try { app._gltfWorker.terminate(); } catch (ignore3) {} }
         app._modelBlob = null;
+        if (app._selDepthRT) { try { app._selDepthRT.dispose(); } catch (e) {} app._selDepthRT = null; }
+        if (app._depthMat) { try { app._depthMat.dispose(); } catch (e) {} app._depthMat = null; }
         if (app.modelMeshObjects) {
           app.modelMeshObjects.forEach(function(m) {
             try { if (m.geometry && m.geometry.disposeBoundsTree) m.geometry.disposeBoundsTree(); } catch (e) {}
@@ -801,6 +822,12 @@
     this.surfaceOffset = 0;
     if (this.raycaster) this.raycaster.params.Points.threshold = maxDim * 0.01;
 
+    // Fit the depth range to the model: the default 0.1..2000 wastes almost all
+    // depth precision up close, which the selection depth map depends on.
+    this.camera.near = Math.max(maxDim / 2000, 1e-4);
+    this.camera.far = Math.max(maxDim * 200, 100);
+    this.camera.updateProjectionMatrix();
+
     this.controls.target.copy(center);
     this.camera.position.set(center.x + maxDim * 1.5, center.y + maxDim * 1.2, center.z + maxDim * 1.5);
     this.camera.lookAt(center);
@@ -1230,11 +1257,70 @@
     return { flat: flat, len: poly.length };
   }
 
-  // Highlight the VISIBLE model surface inside the (NDC) lasso polygon by
-  // re-rendering the model's OWN geometry with a tint shader that discards
-  // fragments outside the polygon. depthTest keeps only the front-most surface,
-  // so the tint is pixel-exact on the visible surface — same for glb/ifc/gs.
-  SpatialViewerApp.prototype._showLassoPolygon = function(ndcPoly, color) {
+  // Render the model's depth from `camera` into a reusable target, packed as
+  // RGBA (same encoding three uses for shadow maps). This freezes "what was
+  // visible at selection time" so the highlight stays correct after orbiting.
+  SpatialViewerApp.prototype._renderSelectionDepth = function(camera) {
+    if (!this.renderer || !this.scene) return null;
+    try {
+      var size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+      var w = Math.max(512, Math.min(2048, Math.round(size.x) || 1024));
+      var h = Math.max(512, Math.min(2048, Math.round(size.y) || 1024));
+
+      if (!this._selDepthRT || this._selDepthRT.width !== w || this._selDepthRT.height !== h) {
+        if (this._selDepthRT) this._selDepthRT.dispose();
+        this._selDepthRT = new THREE.WebGLRenderTarget(w, h, {
+          minFilter: THREE.NearestFilter,
+          magFilter: THREE.NearestFilter,
+          format: THREE.RGBAFormat,
+          type: THREE.UnsignedByteType,
+          depthBuffer: true,
+          stencilBuffer: false
+        });
+      }
+      if (!this._depthMat) {
+        this._depthMat = new THREE.MeshDepthMaterial({
+          depthPacking: THREE.RGBADepthPacking,
+          side: THREE.DoubleSide
+        });
+      }
+
+      // Only the model belongs in the depth map.
+      var hidden = [];
+      [this.annotationsGroup, this.tempMarkupGroup, this.lassoHighlightGroup, this.gridHelper]
+        .forEach(function(o) { if (o && o.visible) { o.visible = false; hidden.push(o); } });
+
+      var prevOverride = this.scene.overrideMaterial;
+      var prevTarget = this.renderer.getRenderTarget();
+      var prevClear = this.renderer.getClearColor(new THREE.Color());
+      var prevAlpha = this.renderer.getClearAlpha();
+
+      this.scene.overrideMaterial = this._depthMat;
+      this.renderer.setRenderTarget(this._selDepthRT);
+      this.renderer.setClearColor(0xffffff, 1); // unwritten = far
+      this.renderer.clear(true, true, false);
+      this.renderer.render(this.scene, camera);
+
+      this.renderer.setRenderTarget(prevTarget);
+      this.renderer.setClearColor(prevClear, prevAlpha);
+      this.scene.overrideMaterial = prevOverride;
+      hidden.forEach(function(o) { o.visible = true; });
+
+      return {
+        texture: this._selDepthRT.texture,
+        viewProj: new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+      };
+    } catch (e) {
+      console.warn('[SpatialViewer] selection depth pass failed:', e);
+      return null;
+    }
+  };
+
+  // Highlight the model surface inside the (NDC) lasso polygon by re-rendering
+  // the model's OWN geometry with the projective tint shader. `camera` is the
+  // camera the polygon was measured in; the tint then stays glued to the
+  // surface when the view is orbited.
+  SpatialViewerApp.prototype._showLassoPolygon = function(ndcPoly, color, camera) {
     if (!ndcPoly || ndcPoly.length < 3 || !this.modelMeshObjects || !this.modelMeshObjects.length) {
       this._setLassoHighlight(null);
       return;
@@ -1242,7 +1328,7 @@
     var packed = packLassoPoly(ndcPoly);
     var col = new THREE.Color(color);
 
-    // Fast path: just refresh the uniforms of the existing overlay.
+    // Fast path: same selection viewpoint, only the polygon changed (live drag).
     if (this._lassoHl) {
       this._lassoHl.traverse(function(n) {
         if (n.material && n.material.uniforms) {
@@ -1255,7 +1341,14 @@
       return;
     }
 
-    var res = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    camera = camera || this.camera;
+    camera.updateMatrixWorld();
+    this.scene.updateMatrixWorld(true);
+
+    var sel = this._renderSelectionDepth(camera);
+    var selViewProj = sel ? sel.viewProj
+      : new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+
     var radius = this.modelRadius || 10;
     var group = new THREE.Group();
 
@@ -1266,10 +1359,15 @@
         uniforms: {
           uColor: { value: new THREE.Vector3(col.r, col.g, col.b) },
           uOpacity: { value: isPoints ? 0.9 : 0.45 },
-          uRes: { value: res.clone() },
           uPoly: { value: packed.flat },
           uPolyLen: { value: packed.len },
-          uSize: { value: radius * 0.004 }
+          uSize: { value: radius * 0.004 },
+          uSelViewProj: { value: selViewProj },
+          uSelDepth: { value: sel ? sel.texture : null },
+          // MeshDepthMaterial cannot rasterise Points, so skip the occlusion
+          // test for point clouds / gaussian splats.
+          uUseDepth: { value: !!sel && !isPoints },
+          uDepthBias: { value: 0.0006 }
         },
         vertexShader: isPoints ? LASSO_POINTS_VS : LASSO_VS,
         fragmentShader: LASSO_FS,
@@ -1304,7 +1402,7 @@
     var vp = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     var _p = new THREE.Vector3();
     var ndc = ring3d.map(function(v) { _p.copy(v).applyMatrix4(vp); return [_p.x, _p.y]; });
-    this._showLassoPolygon(ndc, color);
+    this._showLassoPolygon(ndc, color, camera);
   };
 
   SpatialViewerApp.prototype.place3DPin = function(point, normal) {

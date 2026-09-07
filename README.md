@@ -25,14 +25,21 @@ Tested on OpenProject 16.6.
   path is collected in canvas pixels (interpolated to ~2 px) and stroked on a 2D
   overlay canvas with `closePath()`, so it is dense, visibly closed *during* the
   drag, and identical on a 10-triangle box or a 2-million-triangle scan.
-- The highlight re-renders the model's **own geometry** with a tint shader
-  (`LASSO_FS`) that discards fragments outside the polygon (tested in NDC
-  against `gl_FragCoord`); `depthTest` keeps only the front-most surface. The
-  tint is pixel-exact on the visible surface — no offset, no speckle, correct
-  occlusion — and identical for glb / ifc / gaussian-splat. It updates live
-  while drawing (uniform refresh only), stays on the annotation that was just
-  created, and is rebuilt by `showAnnotationSurface()` whenever a saved
-  annotation is opened from the list (projected through the current camera).
+- The highlight is a **projective decal**. It re-renders the model's own
+  geometry with `LASSO_FS`, which re-projects every fragment through the camera
+  that made the selection (`uSelViewProj`) and tests it against the polygon in
+  *that* camera's NDC — so the tint is glued to the surface and **rotates with
+  the model**. Visibility is frozen at selection time by a depth map rendered
+  from the same camera (`_renderSelectionDepth`, RGBA-packed like three's shadow
+  maps): fragments that were occluded then stay excluded, so only the front
+  surface is ever highlighted. Pixel-exact boundary, no offset, no speckle,
+  identical for glb / ifc / gaussian-splat (the depth test is skipped for point
+  clouds, which `MeshDepthMaterial` cannot rasterise).
+- It updates live while drawing (uniform refresh only — same viewpoint), stays
+  on the annotation that was just created, and is rebuilt by
+  `showAnnotationSurface()` when a saved annotation is opened from the list.
+- `onModelLoaded` fits `camera.near`/`far` to the model so the selection depth
+  map has usable precision.
 - Only at pointer-up is the screen ring down-sampled to ≤64 points and
   projected to 3D for storage (rays that miss the mesh fall back to the focal
   plane, so the stored ring always has the drawn shape).
