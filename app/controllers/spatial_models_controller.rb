@@ -179,10 +179,13 @@ class SpatialModelsController < ApplicationController
   # attachment.content_type: a .gltf file is JSON and gets stored as
   # "application/json", which the front-end viewer would mistake for the
   # "conversion pending" envelope and poll this endpoint forever.
+  # NB: not text/*. Apache mod_deflate gzips text/plain, and gzipping a large
+  # model file on the fly can truncate it (the client then gets NaN geometry or
+  # a broken zip). Every entry here is a type mod_deflate leaves alone.
   MODEL_CONTENT_TYPES = {
     "glb" => "model/gltf-binary",
     "gltf" => "model/gltf+json",
-    "obj" => "text/plain",
+    "obj" => "application/octet-stream",
     "ply" => "application/octet-stream",
     "splat" => "application/octet-stream",
     "ksplat" => "application/octet-stream",
@@ -193,9 +196,15 @@ class SpatialModelsController < ApplicationController
   def serve_raw_attachment
     attachment = @spatial_model.model_attachment
     if attachment.present? && File.exist?(attachment.diskfile.path)
+      zip = File.extname(attachment.filename.to_s).casecmp(".zip").zero?
+      type = if zip
+               "application/zip"
+             else
+               MODEL_CONTENT_TYPES[@spatial_model.model_format] || "application/octet-stream"
+             end
       send_file attachment.diskfile.path,
                 filename: attachment.filename,
-                type: MODEL_CONTENT_TYPES[@spatial_model.model_format] || 'application/octet-stream',
+                type:,
                 disposition: 'inline'
     else
       render_404

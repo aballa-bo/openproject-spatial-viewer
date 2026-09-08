@@ -88,6 +88,7 @@
         if (app._animFrameId) cancelAnimationFrame(app._animFrameId);
         if (app._conversionPoll) clearTimeout(app._conversionPoll);
         if (app._gltfWorker) { try { app._gltfWorker.terminate(); } catch (ignore3) {} }
+        if (typeof app._revokeBundleUrls === 'function') { try { app._revokeBundleUrls(); } catch (e) {} }
         app._modelBlob = null;
         if (app._selDepthRT) { try { app._selDepthRT.dispose(); } catch (e) {} app._selDepthRT = null; }
         if (app._depthMat) { try { app._depthMat.dispose(); } catch (e) {} app._depthMat = null; }
@@ -104,6 +105,9 @@
         }
         if (app.controls) app.controls.dispose();
         if (app._resizeHandler) window.removeEventListener('resize', app._resizeHandler);
+        if (app._navKeyDown) window.removeEventListener('keydown', app._navKeyDown);
+        if (app._navKeyUp) window.removeEventListener('keyup', app._navKeyUp);
+        if (app._navBlur) window.removeEventListener('blur', app._navBlur);
       } catch(ignore) {}
       window.spatialViewerApp = null;
     }
@@ -163,9 +167,16 @@
     try {
       window.spatialViewerApp = new SpatialViewerApp('spatialViewerApp');
     } catch (err) {
+      var lt = document.getElementById('loaderText');
+      // A WebGL-context failure will not fix itself on the next Turbo event, and
+      // retrying only burns more contexts. Stop, and show what to do.
+      if (err && err.webglFatal) {
+        console.error('[SpatialViewer] WebGL unavailable:', err, err.cause || '');
+        if (lt) lt.innerText = err.message;
+        return;
+      }
       console.error('[SpatialViewer] init failed, will retry on next event:', err);
       container.dataset.spatialInit = ''; // release so a later Turbo event can retry
-      var lt = document.getElementById('loaderText');
       if (lt) lt.innerText = 'Viewer initialization error: ' + (err.message || err);
     }
   }
@@ -241,10 +252,28 @@
     this.modelMeshObjects = [];
     this._animFrameId = null;
 
-    this.initThree();
-    this.initEvents();
-    this.initUI();
-    this.loadProjectData();
+    try {
+      this.initThree();
+      this.initEvents();
+      this.initUI();
+      this.loadProjectData();
+    } catch (err) {
+      // Release the WebGL context of a half-built viewer so a retry / the next
+      // page does not inherit a leaked context (browsers cap them per process).
+      try {
+        if (this.renderer) {
+          this.renderer.setAnimationLoop(null);
+          this.renderer.dispose();
+          this.renderer.forceContextLoss();
+        }
+        if (this.controls) this.controls.dispose();
+        if (this._resizeHandler) window.removeEventListener('resize', this._resizeHandler);
+        if (this._navKeyDown) window.removeEventListener('keydown', this._navKeyDown);
+        if (this._navKeyUp) window.removeEventListener('keyup', this._navKeyUp);
+        if (this._navBlur) window.removeEventListener('blur', this._navBlur);
+      } catch (ignore) {}
+      throw err;
+    }
   }
 
   // ---- Render-quality settings ------------------------------------------
@@ -291,6 +320,34 @@
     (document.head || document.documentElement).appendChild(s);
   }
 
+  // Create the WebGLRenderer, degrading the options step by step. Browsers cap
+  // the number of live WebGL contexts (~16) per process; once that ceiling is
+  // hit (usually after many failed viewer inits or a GPU-process crash) every
+  // constructor call throws "Error creating WebGL context" until the *tab* is
+  // closed — a reload is not enough. Throw a clear, actionable message then.
+  function createWebGLRenderer(canvas) {
+    var attempts = [
+      { canvas: canvas, antialias: true, preserveDrawingBuffer: true, powerPreference: 'high-performance' },
+      { canvas: canvas, antialias: true, preserveDrawingBuffer: true },
+      { canvas: canvas, antialias: false, preserveDrawingBuffer: true, failIfMajorPerformanceCaveat: false },
+      { canvas: canvas, antialias: false }
+    ];
+    var lastErr;
+    for (var i = 0; i < attempts.length; i++) {
+      try { return new THREE.WebGLRenderer(attempts[i]); }
+      catch (e) { lastErr = e; }
+    }
+    var probe = document.createElement('canvas');
+    var gl = probe.getContext('webgl2') || probe.getContext('webgl') || probe.getContext('experimental-webgl');
+    var hint = gl
+      ? 'Your browser hit its limit of active 3D contexts. Close every other tab that has a 3D viewer open (and this one), then reopen the model. Restarting the browser also clears it.'
+      : 'WebGL is unavailable or disabled in this browser. Check chrome://gpu, enable hardware acceleration, or try another browser.';
+    var err = new Error('WebGL context could not be created. ' + hint);
+    err.webglFatal = true;
+    err.cause = lastErr;
+    throw err;
+  }
+
   SpatialViewerApp.prototype.initThree = function() {
     installBVH();
     ensureBVHLibLoaded();
@@ -305,12 +362,7 @@
     this.camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 2000);
     this.camera.position.set(10, 10, 10);
 
-    this.renderer = new THREE.WebGLRenderer({
-      canvas: this.canvas,
-      antialias: true,
-      preserveDrawingBuffer: true,
-      powerPreference: 'high-performance'
-    });
+    this.renderer = createWebGLRenderer(this.canvas);
     this.renderer.setSize(width, height);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
@@ -332,6 +384,18 @@
     this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.05;
+    // The wheel is handled by _onWheel (zoom toward the cursor), not by
+    // OrbitControls' dolly-toward-target — that one stalls as the camera nears
+    // the target and never actually reaches the surface you're looking at.
+    this.controls.enableZoom = false;
+
+    // Scratch vectors + state for WASD / R-F fly navigation.
+    this._navKeys = Object.create(null);
+    this._nav = {
+      fwd: new THREE.Vector3(), right: new THREE.Vector3(),
+      worldUp: new THREE.Vector3(0, 1, 0), move: new THREE.Vector3()
+    };
+    this._lastFrameT = (window.performance && performance.now) ? performance.now() : Date.now();
 
     // Base intensities are kept modest: the image-based environment map and
     // tone mapping carry most of the look. The "Light intensity" slider scales
@@ -352,6 +416,12 @@
     this.fillLight.position.set(-20, -20, -20);
     this.scene.add(this.fillLight);
 
+    // Soft sky/ground ambient — stands in for an image-based environment
+    // (no render-target juggling, works on every GPU). Intensity is driven by
+    // the "Environment light" toggle in _applyRenderSettings.
+    this.hemiLight = new THREE.HemisphereLight(0xdfe7f2, 0x8d8375, 0.0);
+    this.scene.add(this.hemiLight);
+
     // Invisible plane under the model that only catches shadows.
     this.shadowCatcher = new THREE.Mesh(
       new THREE.PlaneGeometry(1, 1),
@@ -365,8 +435,6 @@
     this.gridHelper = new THREE.GridHelper(50, 50, 0xb8c0cc, 0xdbe0e6);
     this.gridHelper.position.y = -0.01;
     this.scene.add(this.gridHelper);
-
-    this._buildEnvironment();
 
     this.annotationsGroup = new THREE.Group();
     this.scene.add(this.annotationsGroup);
@@ -387,13 +455,19 @@
       new THREE.Plane(new THREE.Vector3(0, 0, -1), 1000)
     ];
 
-    this._applyRenderSettings();
+    try { this._applyRenderSettings(); } catch (e) { console.warn('[SpatialViewer] render settings failed:', e); }
 
     var self = this;
     // setAnimationLoop (not requestAnimationFrame) is required for WebXR:
     // during an immersive session the browser drives the frame timing.
     this.renderer.setAnimationLoop(function() {
       var presenting = self.renderer.xr && self.renderer.xr.isPresenting;
+
+      var now = (window.performance && performance.now) ? performance.now() : Date.now();
+      var dt = Math.min(0.1, (now - self._lastFrameT) / 1000);
+      self._lastFrameT = now;
+      if (!presenting) self._processNavKeys(dt);
+
       if (self.controls && !presenting) self.controls.update();
       // Frame-rate-driven sampling of the drawing stroke: guarantees a dense
       // outline regardless of how the browser batches pointermove events.
@@ -425,41 +499,6 @@
     try { window.localStorage.setItem(RENDER_STORE_KEY, JSON.stringify(this.renderSettings)); } catch (e) {}
   };
 
-  // A cheap, asset-free image-based light: a vertical sky/horizon/ground
-  // gradient turned into a pre-filtered environment map. Gives glTF PBR
-  // materials soft ambient light and subtle reflections.
-  SpatialViewerApp.prototype._buildEnvironment = function() {
-    if (!THREE.PMREMGenerator || !THREE.DataTexture) return;
-    try {
-      var w = 16, h = 64, data = new Uint8Array(w * h * 4);
-      var sky = [232, 238, 247], horizon = [206, 210, 216], ground = [120, 120, 126];
-      var lerp = function(a, b, t) { return a + (b - a) * t; };
-      for (var y = 0; y < h; y++) {
-        var t = y / (h - 1);            // 0 = bottom row, 1 = top row
-        var up = 1 - t;                 // 1 = top of the sphere
-        var c = (up > 0.5)
-          ? [lerp(horizon[0], sky[0], (up - 0.5) * 2), lerp(horizon[1], sky[1], (up - 0.5) * 2), lerp(horizon[2], sky[2], (up - 0.5) * 2)]
-          : [lerp(ground[0], horizon[0], up * 2), lerp(ground[1], horizon[1], up * 2), lerp(ground[2], horizon[2], up * 2)];
-        for (var x = 0; x < w; x++) {
-          var i = (y * w + x) * 4;
-          data[i] = c[0]; data[i + 1] = c[1]; data[i + 2] = c[2]; data[i + 3] = 255;
-        }
-      }
-      var tex = new THREE.DataTexture(data, w, h, THREE.RGBAFormat);
-      tex.mapping = THREE.EquirectangularReflectionMapping;
-      tex.needsUpdate = true;
-
-      var pmrem = new THREE.PMREMGenerator(this.renderer);
-      pmrem.compileEquirectangularShader();
-      this._envMap = pmrem.fromEquirectangular(tex).texture;
-      tex.dispose();
-      pmrem.dispose();
-    } catch (e) {
-      console.warn('[SpatialViewer] environment map build failed:', e);
-      this._envMap = null;
-    }
-  };
-
   var TONE_MAP = {
     aces: 'ACESFilmicToneMapping',
     reinhard: 'ReinhardToneMapping',
@@ -468,7 +507,13 @@
   };
 
   // Push the current renderSettings onto the renderer / scene / lights / model.
+  // Guarded end-to-end: a bad setting must never stop a model from displaying.
   SpatialViewerApp.prototype._applyRenderSettings = function() {
+    try { this._applyRenderSettingsUnsafe(); }
+    catch (e) { console.warn('[SpatialViewer] _applyRenderSettings failed:', e); }
+  };
+
+  SpatialViewerApp.prototype._applyRenderSettingsUnsafe = function() {
     var r = this.renderer, s = this.renderSettings;
     if (!r || !s) return;
 
@@ -499,14 +544,13 @@
       m.receiveShadow = shadowsOn;
     });
 
-    // Environment light + reflections
-    this.scene.environment = (s.env && this._envMap) ? this._envMap : null;
-
     // Light intensity multiplier
     var k = s.light;
     if (this.ambientLight) this.ambientLight.intensity = 0.45 * k;
     if (this.keyLight) this.keyLight.intensity = 0.85 * k;
     if (this.fillLight) this.fillLight.intensity = 0.35 * k;
+    // "Environment light" -> soft sky/ground hemisphere ambient
+    if (this.hemiLight) this.hemiLight.intensity = s.env ? (0.65 * k) : 0;
 
     // Wireframe
     var wf = !!s.wireframe;
@@ -836,11 +880,98 @@
     });
   };
 
+  function isZipBuffer(buffer) {
+    if (!buffer || buffer.byteLength < 4) return false;
+    var b = new Uint8Array(buffer, 0, 4);
+    // "PK\x03\x04" (local file header) or "PK\x05\x06" (empty archive)
+    return b[0] === 0x50 && b[1] === 0x4B && (b[2] === 3 || b[2] === 5) && (b[3] === 4 || b[3] === 6);
+  }
+
+  // Minimal async ZIP reader — enough for a normal `zip -r` of an OBJ/glTF plus
+  // its .mtl and textures. Supports stored (0) and deflate (8) entries; rejects
+  // ZIP64 and other compression methods with a clear message. Resolves to
+  // { "<path/in/zip>": Uint8Array }.
+  function unzipBuffer(arrayBuffer) {
+    var bytes = new Uint8Array(arrayBuffer);
+    var dv = new DataView(arrayBuffer);
+    var n = bytes.length;
+    var td = new TextDecoder('utf-8');
+
+    var eocd = -1;
+    var minPos = Math.max(0, n - 22 - 65535);
+    for (var i = n - 22; i >= minPos; i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) return Promise.reject(new Error('not a valid .zip file'));
+
+    var count = dv.getUint16(eocd + 10, true);
+    var cdOffset = dv.getUint32(eocd + 16, true);
+    if (cdOffset === 0xffffffff || dv.getUint16(eocd + 8, true) === 0xffff) {
+      return Promise.reject(new Error('ZIP64 archives are not supported — re-create the zip'));
+    }
+
+    var entries = [];
+    var p = cdOffset;
+    for (var e = 0; e < count; e++) {
+      if (dv.getUint32(p, true) !== 0x02014b50) break;
+      var method = dv.getUint16(p + 10, true);
+      var compSize = dv.getUint32(p + 20, true);
+      var uncompSize = dv.getUint32(p + 24, true);
+      var nameLen = dv.getUint16(p + 28, true);
+      var extraLen = dv.getUint16(p + 30, true);
+      var commentLen = dv.getUint16(p + 32, true);
+      var localOffset = dv.getUint32(p + 42, true);
+      var name = td.decode(bytes.subarray(p + 46, p + 46 + nameLen));
+      p += 46 + nameLen + extraLen + commentLen;
+      if (/\/$/.test(name)) continue; // directory entry
+      entries.push({ name: name, method: method, compSize: compSize, uncompSize: uncompSize, localOffset: localOffset });
+    }
+
+    var out = {};
+    var chain = Promise.resolve();
+    entries.forEach(function(ent) {
+      chain = chain.then(function() {
+        if (ent.localOffset + 30 > n || dv.getUint32(ent.localOffset, true) !== 0x04034b50) {
+          throw new Error('corrupt or truncated zip (entry "' + ent.name + '")');
+        }
+        var lNameLen = dv.getUint16(ent.localOffset + 26, true);
+        var lExtraLen = dv.getUint16(ent.localOffset + 28, true);
+        var start = ent.localOffset + 30 + lNameLen + lExtraLen;
+        if (start + ent.compSize > n) {
+          throw new Error('the archive download is incomplete (entry "' + ent.name + '" is cut off)');
+        }
+        var comp = bytes.subarray(start, start + ent.compSize);
+        var check = function(u8) {
+          if (u8.length !== ent.uncompSize) {
+            throw new Error('"' + ent.name + '" unpacked to ' + u8.length + ' bytes, expected ' + ent.uncompSize + ' — the download was truncated');
+          }
+          out[ent.name] = u8;
+        };
+        if (ent.method === 0) { check(comp.slice()); return; }
+        if (ent.method !== 8) throw new Error('unsupported compression in "' + ent.name + '"');
+        if (typeof DecompressionStream === 'undefined') {
+          throw new Error('this browser cannot decompress the zip; upload an uncompressed archive');
+        }
+        var s = new Blob([comp]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        return new Response(s).arrayBuffer().then(function(buf) { check(new Uint8Array(buf)); });
+      });
+    });
+    return chain.then(function() { return out; });
+  }
+
+  // A Uint8Array's bytes as a standalone ArrayBuffer (offset 0, exact length).
+  function toArrayBuffer(u8) {
+    return (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength)
+      ? u8.buffer : u8.slice().buffer;
+  }
+
   SpatialViewerApp.prototype._parseModel = function(buffer, format) {
     var self = this;
     self.showLoader('Parsing 3D geometry...');
 
-    if (format === 'glb' || format === 'gltf') {
+    if (isZipBuffer(buffer)) {
+      self._parseBundle(buffer);
+    } else if (format === 'glb' || format === 'gltf') {
       self._parseGltf(buffer);
     } else if (format === 'obj') {
       self.onModelLoaded(new THREE.OBJLoader().parse(new TextDecoder('utf-8').decode(buffer)));
@@ -857,6 +988,129 @@
       self.hideLoader();
       self.createDemoModel();
     }
+  };
+
+  // ---- Zipped model bundles (OBJ/MTL/textures, multi-file glTF) ----------
+
+  SpatialViewerApp.prototype._revokeBundleUrls = function() {
+    (this._bundleUrls || []).forEach(function(u) { try { URL.revokeObjectURL(u); } catch (e) {} });
+    this._bundleUrls = [];
+  };
+
+  SpatialViewerApp.prototype._parseBundle = function(buffer) {
+    var self = this;
+    self.showLoader('Unpacking model archive…');
+    self._revokeBundleUrls();
+
+    unzipBuffer(buffer).then(function(files) {
+      // Drop macOS Finder cruft (__MACOSX/._foo AppleDouble forks, .DS_Store).
+      var names = Object.keys(files).filter(function(n) {
+        return n.indexOf('__MACOSX/') === -1 && n.split('/').pop().charAt(0) !== '.';
+      });
+      // shallowest match wins (top-level model file before one nested deep)
+      var pick = function(re) {
+        return names.filter(function(n) { return re.test(n); })
+                    .sort(function(a, b) { return a.split('/').length - b.split('/').length || a.length - b.length; })[0];
+      };
+      var obj = pick(/\.obj$/i), glb = pick(/\.glb$/i), gltf = pick(/\.gltf$/i), ply = pick(/\.ply$/i);
+
+      if (obj) { self._loadObjBundle(files, obj); return; }
+      if (glb) { self._parseGltf(toArrayBuffer(files[glb])); return; }
+      if (gltf) { self._loadGltfBundle(files, gltf); return; }
+      if (ply) { self._parseModel(toArrayBuffer(files[ply]), 'ply'); return; }
+      self.showLoader('The archive contains no .obj, .glb, .gltf or .ply file.');
+    }).catch(function(err) {
+      console.error('[SpatialViewer] bundle error:', err);
+      self.showLoader('Could not open the model archive: ' + (err && err.message || err) + '.');
+    });
+  };
+
+  // Build a LoadingManager that resolves every relative resource path referenced
+  // by a bundled file (textures in an .mtl, .bin/images in a .gltf) to a blob URL
+  // of the matching zip entry. Matches on full path first, then on basename.
+  SpatialViewerApp.prototype._bundleManager = function(files, baseDir) {
+    var self = this;
+    self._bundleUrls = self._bundleUrls || [];
+
+    var MIME = {
+      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
+      '.bmp': 'image/bmp', '.webp': 'image/webp', '.tif': 'image/tiff', '.tiff': 'image/tiff',
+      '.bin': 'application/octet-stream', '.ktx2': 'image/ktx2'
+    };
+    var norm = function(s) { return String(s).replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase(); };
+    var byPath = {}, byBase = {};
+    Object.keys(files).forEach(function(n) {
+      var k = norm(n);
+      byPath[k] = files[n];
+      byBase[k.split('/').pop()] = files[n];
+    });
+    var find = function(ref) {
+      var r = norm(ref);
+      return byPath[r] || byBase[r.split('/').pop()] || null;
+    };
+
+    var manager = new THREE.LoadingManager();
+    manager.setURLModifier(function(url) {
+      if (/^(blob:|data:|https?:)/i.test(url)) return url;
+      var u8 = find(url);
+      if (!u8) { console.warn('[SpatialViewer] not in bundle:', url); return url; }
+      var ext = (url.toLowerCase().match(/\.[a-z0-9]+$/) || [''])[0];
+      var blobUrl = URL.createObjectURL(new Blob([u8], { type: MIME[ext] || 'application/octet-stream' }));
+      self._bundleUrls.push(blobUrl);
+      return blobUrl;
+    });
+    manager._bundleFind = find; // reused by the callers
+    return manager;
+  };
+
+  SpatialViewerApp.prototype._loadObjBundle = function(files, objName) {
+    var self = this;
+    var dec = new TextDecoder('utf-8');
+    var baseDir = objName.replace(/\\/g, '/').replace(/[^/]*$/, ''); // '' or 'sub/'
+    var manager = this._bundleManager(files, baseDir);
+
+    var objText = dec.decode(files[objName]);
+    var materials = null;
+    var mtlRef = (objText.match(/^\s*mtllib\s+(.+?)\s*$/mi) || [])[1];
+    if (mtlRef) {
+      var mtlU8 = manager._bundleFind(mtlRef);
+      if (mtlU8) {
+        try {
+          materials = new THREE.MTLLoader(manager).parse(dec.decode(mtlU8), baseDir);
+          materials.preload();
+        } catch (e) {
+          console.warn('[SpatialViewer] MTL parse failed:', e);
+          materials = null;
+        }
+      } else {
+        console.warn('[SpatialViewer] .mtl referenced by the OBJ is not in the archive:', mtlRef);
+      }
+    }
+
+    var loader = new THREE.OBJLoader(manager);
+    if (materials) loader.setMaterials(materials);
+    try {
+      self.onModelLoaded(loader.parse(objText));
+    } catch (e) {
+      console.error('[SpatialViewer] OBJ parse failed:', e);
+      self.showLoader('Error parsing OBJ: ' + (e && e.message || e));
+    }
+  };
+
+  SpatialViewerApp.prototype._loadGltfBundle = function(files, gltfName) {
+    var self = this;
+    var baseDir = gltfName.replace(/\\/g, '/').replace(/[^/]*$/, '');
+    var manager = this._bundleManager(files, baseDir);
+    var json = new TextDecoder('utf-8').decode(files[gltfName]);
+    new THREE.GLTFLoader(manager).parse(json, baseDir,
+      function(gltf) {
+        try { self.onModelLoaded(gltf.scene); }
+        catch (e) { console.error(e); self.showLoader('The model loaded but could not be displayed: ' + (e && e.message || e)); }
+      },
+      function(err) {
+        console.error('[SpatialViewer] bundled glTF parse error:', err);
+        self.showLoader('Error parsing glTF from the archive: ' + (err && err.message || err));
+      });
   };
 
   // A text .gltf document can point at companion files (scene.bin, textures/*)
@@ -1138,6 +1392,48 @@
     self.onModelLoaded(cloud);
   };
 
+  // Some exporters (and some corrupt downloads) leave NaN/Infinity in vertex
+  // positions. three then reports "computed radius is NaN" and the whole model
+  // vanishes. Collapse any triangle that touches a non-finite vertex so the
+  // rest of the mesh still renders.
+  SpatialViewerApp.prototype._sanitizeModelGeometry = function() {
+    var fixed = 0;
+    (this.modelMeshObjects || []).forEach(function(m) {
+      var g = m.geometry;
+      var pos = g && g.attributes && g.attributes.position;
+      if (!pos || !pos.array) return;
+      var arr = pos.array;
+      var meshFixed = 0;
+
+      if (g.index && g.index.array) {
+        var idx = g.index.array;
+        for (var t = 0; t + 2 < idx.length; t += 3) {
+          var bad = false;
+          for (var k = 0; k < 3 && !bad; k++) {
+            var vi = idx[t + k] * 3;
+            if (!isFinite(arr[vi]) || !isFinite(arr[vi + 1]) || !isFinite(arr[vi + 2])) bad = true;
+          }
+          if (bad) { idx[t + 1] = idx[t]; idx[t + 2] = idx[t]; meshFixed++; }
+        }
+        if (meshFixed) g.index.needsUpdate = true;
+      } else {
+        for (var i = 0; i + 8 < arr.length; i += 9) {
+          var nan = false;
+          for (var j = 0; j < 9 && !nan; j++) if (!isFinite(arr[i + j])) nan = true;
+          if (nan) { for (var j2 = 0; j2 < 9; j2++) arr[i + j2] = 0; meshFixed++; }
+        }
+        if (meshFixed) pos.needsUpdate = true;
+      }
+
+      if (meshFixed) {
+        g.boundingBox = null;
+        g.boundingSphere = null;
+        fixed += meshFixed;
+      }
+    });
+    return fixed;
+  };
+
   SpatialViewerApp.prototype.onModelLoaded = function(object) {
     this.modelObject = object;
     this.scene.add(object);
@@ -1166,6 +1462,11 @@
       }
     });
 
+    // Reject NaN / non-finite vertex data before it poisons the camera, the
+    // bounding box and the BVH (symptom: "computed radius is NaN", blank view).
+    var cleaned = this._sanitizeModelGeometry();
+    if (cleaned) console.warn('[SpatialViewer] removed ' + cleaned + ' non-finite vertices from the model');
+
     // (1) Escalate to heavy mode if the mesh is dense even when the file is small.
     if (!heavy && triangles > 4000000) {
       heavy = this.heavyMode = true;
@@ -1180,7 +1481,13 @@
     var box = new THREE.Box3().setFromObject(object);
     var center = box.getCenter(new THREE.Vector3());
     var size = box.getSize(new THREE.Vector3());
-    var maxDim = Math.max(size.x, size.y, size.z) || 10;
+    var maxDim = Math.max(size.x, size.y, size.z);
+    if (!isFinite(maxDim) || maxDim <= 0) {
+      console.error('[SpatialViewer] model bounding box is not finite — falling back to a default view');
+      box = new THREE.Box3(new THREE.Vector3(-10, -10, -10), new THREE.Vector3(10, 10, 10));
+      center = new THREE.Vector3();
+      maxDim = 20;
+    }
 
     // Drawing tools: markup points sit exactly on the surface (outlines render
     // with depthTest:false, so no lift is needed). Point clouds / gaussian
@@ -1189,27 +1496,38 @@
     this.surfaceOffset = 0;
     if (this.raycaster) this.raycaster.params.Points.threshold = maxDim * 0.01;
 
-    // Fit the depth range to the model: the default 0.1..2000 wastes almost all
-    // depth precision up close, which the selection depth map depends on.
-    this.camera.near = Math.max(maxDim / 2000, 1e-4);
-    this.camera.far = Math.max(maxDim * 200, 100);
-    this.camera.updateProjectionMatrix();
-
     this.controls.target.copy(center);
     this.camera.position.set(center.x + maxDim * 1.5, center.y + maxDim * 1.2, center.z + maxDim * 1.5);
     this.camera.lookAt(center);
     this.controls.update();
 
-    // Size shadows to the model and remember this framing for the Home button.
-    this._fitShadowsToModel(box, center, maxDim);
-    this._homeView = { position: this.camera.position.clone(), target: this.controls.target.clone() };
+    // Depth range now tracks the viewing distance (see _updateClip) so you can
+    // zoom right onto a surface without clipping.
+    this._updateClip(true);
 
-    // Re-apply render settings now that the model (and its materials) exist, so
-    // shadows / wireframe / env map land on the new meshes.
-    this._applyRenderSettings();
+    // Size shadows to the model and remember this framing for the Home button.
+    // Never let a render-quality hiccup stop the model from being shown.
+    try {
+      this._fitShadowsToModel(box, center, maxDim);
+      this._homeView = { position: this.camera.position.clone(), target: this.controls.target.clone() };
+      this._applyRenderSettings();
+    } catch (e) {
+      console.warn('[SpatialViewer] post-load render setup failed:', e);
+    }
 
     this.hideLoader();
     this.renderExisting3DAnnotations();
+
+    // One-time navigation hint.
+    if (this.currentTool === 'orbit' && !this._navHintShown) {
+      this._navHintShown = true;
+      this.showTooltip('Drag to orbit · scroll to zoom to cursor · <b>W A S D</b> move · <b>R</b> / <b>F</b> up · down · Shift = faster');
+      var self = this;
+      setTimeout(function() {
+        var t = document.getElementById('drawingTooltip');
+        if (t && self.currentTool === 'orbit') t.style.display = 'none';
+      }, 7000);
+    }
   };
 
   SpatialViewerApp.prototype.createDemoModel = function() {
@@ -1256,9 +1574,138 @@
     this.viewport.addEventListener('pointermove', function(e) { self.onPointerMove(e); });
     this.viewport.addEventListener('pointerup', function(e) { self.onPointerUp(e); });
     this.viewport.addEventListener('pointercancel', function(e) { self.onPointerUp(e); });
+
+    // Zoom toward the point under the cursor (passive:false so we can preventDefault).
+    this.viewport.addEventListener('wheel', function(e) { self._onWheel(e); }, { passive: false });
+
+    // WASD + R/F fly navigation. Bound on window so it works as soon as the
+    // pointer is over the viewer, but ignored while typing in a field.
+    var isTyping = function(t) {
+      return t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+    };
+    this._navKeyDown = function(e) {
+      if (e.ctrlKey || e.metaKey || e.altKey || isTyping(e.target)) return;
+      var k = (e.key || '').toLowerCase();
+      if ('wasdrf'.indexOf(k) === -1 || k.length !== 1) return;
+      self._navKeys[k] = true;
+      self._navShift = e.shiftKey;
+      e.preventDefault();
+    };
+    this._navKeyUp = function(e) {
+      var k = (e.key || '').toLowerCase();
+      if (self._navKeys[k]) delete self._navKeys[k];
+      self._navShift = e.shiftKey;
+    };
+    this._navBlur = function() { self._navKeys = Object.create(null); };
+    window.addEventListener('keydown', this._navKeyDown);
+    window.addEventListener('keyup', this._navKeyUp);
+    window.addEventListener('blur', this._navBlur);
     // NOTE: deliberately no 'lostpointercapture' listener. It bubbles, and
     // OrbitControls captures the pointer on the canvas first; re-capturing
     // would fire it and abort the stroke after a couple of points.
+  };
+
+  // ---- Navigation: zoom-to-cursor + WASD/RF fly ------------------------
+
+  // Keep near/far tight around the current viewing distance so you can zoom
+  // right up to a surface without it clipping, and keep good depth precision.
+  SpatialViewerApp.prototype._updateClip = function(force) {
+    if (!this.camera || !this.controls) return;
+    var d = this.camera.position.distanceTo(this.controls.target) || 1;
+    var r = this.modelRadius || d;
+    var near = Math.max(1e-4, Math.min(r / 500, d * 0.02));
+    var far = Math.max(d + r * 4, r * 8, 100);
+    // Only touch the projection matrix on a meaningful change (avoids per-frame
+    // churn while flying with the keys).
+    if (force ||
+        Math.abs(near - this.camera.near) > near * 0.2 ||
+        Math.abs(far - this.camera.far) > far * 0.2) {
+      this.camera.near = near;
+      this.camera.far = far;
+      this.camera.updateProjectionMatrix();
+    }
+  };
+
+  // Wheel: dolly toward the world point under the cursor. Both the camera and
+  // the orbit target are scaled about that point, so it stays pinned on screen
+  // and there is always distance left to cover — no "stuck" zoom.
+  SpatialViewerApp.prototype._onWheel = function(e) {
+    if (!this.controls || !this.camera) return;
+    e.preventDefault();
+    if (this.isDrawing) return;
+
+    var rect = this.canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    this.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    this.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.mouse, this.camera);
+
+    var pivot = null;
+    var meshes = this.modelMeshObjects || [];
+    if (meshes.length) {
+      this._ensureBVH(); // keep the per-wheel raycast cheap on big meshes
+      var hit = this.raycaster.intersectObjects(meshes, true)[0];
+      if (hit) pivot = hit.point.clone();
+    }
+    if (!pivot) {
+      // no surface under the cursor: use the plane through the orbit target
+      var n = this.camera.getWorldDirection(new THREE.Vector3()).negate();
+      var plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n, this.controls.target);
+      pivot = this.raycaster.ray.intersectPlane(plane, new THREE.Vector3());
+      if (!pivot) return;
+    }
+
+    // deltaMode 1 = lines, 0 = pixels; normalise to roughly one "notch" = 1.
+    var notches = e.deltaY / (e.deltaMode === 1 ? 3 : 100);
+    var factor = Math.pow(1.18, notches);   // <1 zoom in, >1 zoom out
+
+    var camOff = this.camera.position.clone().sub(pivot);
+    var tgtOff = this.controls.target.clone().sub(pivot);
+    var r = this.modelRadius || camOff.length() || 10;
+    var origLen = camOff.length() || 1e-6;
+    var newLen = Math.max(r * 3e-4, Math.min(r * 60, origLen * factor));
+    var eff = newLen / origLen;
+
+    this.camera.position.copy(pivot).add(camOff.multiplyScalar(eff));
+    this.controls.target.copy(pivot).add(tgtOff.multiplyScalar(eff));
+    this.controls.update();
+    this._updateClip();
+  };
+
+  // Per-frame WASD / R-F movement. Camera and target move together (pan+dolly),
+  // so orbiting afterwards still pivots around what you flew to.
+  SpatialViewerApp.prototype._processNavKeys = function(dt) {
+    var keys = this._navKeys;
+    if (!keys) return;
+    var kw = keys.w, ks = keys.s, ka = keys.a, kd = keys.d, kr = keys.r, kf = keys.f;
+    if (!(kw || ks || ka || kd || kr || kf)) return;
+    if (!this.controls || !this.camera) return;
+
+    var n = this._nav;
+    this.camera.getWorldDirection(n.fwd).normalize();
+    n.right.crossVectors(n.fwd, n.worldUp);
+    if (n.right.lengthSq() < 1e-8) n.right.set(1, 0, 0); // looking straight up/down
+    n.right.normalize();
+
+    n.move.set(0, 0, 0);
+    if (kw) n.move.add(n.fwd);
+    if (ks) n.move.sub(n.fwd);
+    if (kd) n.move.add(n.right);
+    if (ka) n.move.sub(n.right);
+    if (kr) n.move.add(n.worldUp);
+    if (kf) n.move.sub(n.worldUp);
+    if (n.move.lengthSq() < 1e-8) return;
+
+    // Scale by the current viewing distance too, so keys stay usable whether
+    // you are far out or nosed up against a wall.
+    var d = this.camera.position.distanceTo(this.controls.target) || 1;
+    var reach = Math.min(this.modelRadius || 10, d * 1.5) || 10;
+    var speed = reach * (this._navShift ? 2.4 : 0.8);
+    n.move.normalize().multiplyScalar(speed * dt);
+
+    this.camera.position.add(n.move);
+    this.controls.target.add(n.move);
+    this._updateClip();
   };
 
   // Build BVH bounds trees for the model meshes (once). Synchronous: a one-time
@@ -1639,8 +2086,14 @@
     if (!this.renderer || !this.scene) return null;
     try {
       var size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
-      var w = Math.max(512, Math.min(2048, Math.round(size.x) || 1024));
-      var h = Math.max(512, Math.min(2048, Math.round(size.y) || 1024));
+      var sx = Math.round(size.x) || 1024;
+      var sy = Math.round(size.y) || 1024;
+      // Clamp preserving aspect: an independent clamp would render the scene
+      // into a differently-proportioned target, so the sampled depth (and the
+      // lasso fill built from it) ends up offset from the actual view.
+      var scale = Math.min(1, 2048 / Math.max(sx, sy));
+      var w = Math.max(256, Math.round(sx * scale));
+      var h = Math.max(256, Math.round(sy * scale));
 
       if (!this._selDepthRT || this._selDepthRT.width !== w || this._selDepthRT.height !== h) {
         if (this._selDepthRT) this._selDepthRT.dispose();
@@ -1660,9 +2113,12 @@
         });
       }
 
-      // Only the model belongs in the depth map.
+      // Only the model belongs in the depth map — not helpers like the invisible
+      // shadow-catcher plane, which would otherwise occlude the model surface
+      // and eat holes in the lasso fill.
       var hidden = [];
-      [this.annotationsGroup, this.tempMarkupGroup, this.lassoHighlightGroup, this.gridHelper]
+      [this.annotationsGroup, this.tempMarkupGroup, this.lassoHighlightGroup,
+       this.gridHelper, this.shadowCatcher]
         .forEach(function(o) { if (o && o.visible) { o.visible = false; hidden.push(o); } });
 
       var prevOverride = this.scene.overrideMaterial;
@@ -1808,6 +2264,7 @@
   SpatialViewerApp.prototype.openAnnotationModal = function(gd) {
     this.pendingGeometry = gd;
     this.pendingThumbnail = this.captureSnapshot();
+    this._detailAnnotation = null; // leave any open detail view
 
     var panel = document.getElementById('spatialSidePanel');
     var snap = document.getElementById('caSnapshot');
@@ -1843,7 +2300,7 @@
     if (newRadio) { newRadio.checked = true; this.updateCreateMode('new'); }
 
     this.openSidePanel();
-    if (panel) panel.classList.add('creating');
+    if (panel) { panel.classList.remove('detailing'); panel.classList.add('creating'); }
     if (subject) subject.focus();
   };
 
@@ -1877,9 +2334,10 @@
       sp.style.display = 'flex';
       sp.style.width = (width || panelWidthPref()) + 'px';
       sp.style.minWidth = '';
-      // A stale "creating" class would bring the panel back showing an empty
-      // New Work Package form instead of the tabs.
+      // A stale "creating" / "detailing" class would bring the panel back on a
+      // sub-view instead of the tabs.
       if (!app || !app.pendingGeometry) sp.classList.remove('creating');
+      if (!app || !app._detailAnnotation) sp.classList.remove('detailing');
     } else {
       sp.classList.add('collapsed');
       sp.style.display = 'none';
@@ -2181,12 +2639,223 @@
 
       card.innerHTML = html;
 
-      // Clicking the card (but not the WP link) restores the viewpoint.
+      // Click the card -> full annotation detail (also restores the viewpoint).
+      // Click the WP link -> straight to the Work Package (new tab).
       card.addEventListener('click', function(e) {
         if (e.target.closest && e.target.closest('.annotation-wp-link')) return;
-        self.flyToAnnotation(a);
+        self.openAnnotationDetail(a);
       });
       list.appendChild(card);
+    });
+  };
+
+  // ---- Annotation detail (view + edit annotation / edit linked WP) --------
+
+  SpatialViewerApp.prototype._annUrl = function(id) {
+    return this.apiUrl.replace('/api_data', '/spatial_annotations') + (id != null ? '/' + id : '');
+  };
+
+  SpatialViewerApp.prototype.openAnnotationDetail = function(a) {
+    var self = this;
+    this._detailAnnotation = a;
+    var $ = function(id) { return document.getElementById(id); };
+    var setv = function(id, v) { var el = $(id); if (el) el.value = (v == null ? '' : v); };
+    var wp = a.work_package || {};
+
+    var snap = $('adSnapshot');
+    if (snap) {
+      if (a.snapshot_url) { snap.src = a.snapshot_url; snap.style.display = ''; }
+      else { snap.removeAttribute('src'); snap.style.display = 'none'; }
+    }
+    if ($('adTypeBadge')) {
+      $('adTypeBadge').textContent = String(a.annotation_type || '').toUpperCase();
+      $('adTypeBadge').style.background = a.color || '#3b82f6';
+      $('adTypeBadge').style.color = '#fff';
+    }
+    if ($('adAuthor')) $('adAuthor').textContent = a.author_name || '';
+    if ($('adDate')) $('adDate').textContent = a.created_at || '';
+
+    setv('adTitle', a.title);
+    setv('adDesc', a.description);
+    this._adColor = a.color || '#3b82f6';
+    document.querySelectorAll('#adColorGroup .color-dot').forEach(function(d) {
+      d.classList.toggle('active', (d.dataset.color || '').toLowerCase() === self._adColor.toLowerCase());
+    });
+
+    var hasWp = !!a.work_package_id;
+    if ($('adWpFields')) $('adWpFields').style.display = hasWp ? '' : 'none';
+    if ($('adWpNum')) $('adWpNum').textContent = hasWp ? ('#' + a.work_package_id) : '(none linked)';
+    var openLink = $('adWpOpen');
+    if (openLink) {
+      openLink.style.display = hasWp ? '' : 'none';
+      openLink.href = a.work_package_url || ('/work_packages/' + a.work_package_id);
+    }
+    this._detailWpFields = {
+      adWpSubject: 'subject', adWpDesc: 'description', adWpType: 'type_id',
+      adWpStatus: 'status_id', adWpAssignee: 'assigned_to_id', adWpAccountable: 'responsible_id',
+      adWpPriority: 'priority_id', adWpCategory: 'category_id', adWpVersion: 'version_id',
+      adWpParent: 'parent_id', adWpStartDate: 'start_date', adWpDueDate: 'due_date',
+      adWpEstimatedHours: 'estimated_hours'
+    };
+    if (hasWp) {
+      setv('adWpSubject', wp.subject != null ? wp.subject : a.work_package_subject);
+      setv('adWpDesc', wp.description);
+      setv('adWpType', wp.type_id);
+      setv('adWpStatus', wp.status_id);
+      setv('adWpAssignee', wp.assigned_to_id);
+      setv('adWpAccountable', wp.responsible_id);
+      setv('adWpPriority', wp.priority_id);
+      setv('adWpCategory', wp.category_id);
+      setv('adWpVersion', wp.version_id);
+      // The parent may not be in the (capped) options list — add it so the
+      // prefill sticks and an unchanged parent is never accidentally cleared.
+      var parentSel = $('adWpParent');
+      if (parentSel && wp.parent_id && !parentSel.querySelector('option[value="' + wp.parent_id + '"]')) {
+        var o = document.createElement('option');
+        o.value = wp.parent_id;
+        o.textContent = '#' + wp.parent_id;
+        parentSel.appendChild(o);
+      }
+      setv('adWpParent', wp.parent_id);
+      setv('adWpStartDate', wp.start_date);
+      setv('adWpDueDate', wp.due_date);
+      setv('adWpEstimatedHours', wp.estimated_hours);
+      // Snapshot the rendered values so we can send only what actually changed.
+      this._detailWpSnapshot = {};
+      var snapF = this;
+      Object.keys(this._detailWpFields).forEach(function(id) {
+        var el = document.getElementById(id);
+        snapF._detailWpSnapshot[id] = el ? el.value : '';
+      });
+    }
+
+    var panel = document.getElementById('spatialSidePanel');
+    this.openSidePanel();
+    if (panel) { panel.classList.remove('creating'); panel.classList.add('detailing'); }
+    this.flyToAnnotation(a);
+  };
+
+  SpatialViewerApp.prototype.closeAnnotationDetail = function() {
+    this._detailAnnotation = null;
+    var panel = document.getElementById('spatialSidePanel');
+    if (panel) panel.classList.remove('detailing');
+    this._setLassoHighlight(null);
+    var annTab = document.querySelector('.tab-btn[data-tab="annotationsTab"]');
+    if (annTab) annTab.click();
+  };
+
+  // Persist the updated annotation into projectData + refresh the views.
+  SpatialViewerApp.prototype._applyUpdatedAnnotation = function(updated, keepView) {
+    if (!updated || !this.projectData || !this.projectData.annotations) return;
+    var list = this.projectData.annotations;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].id === updated.id) { list[i] = updated; break; }
+    }
+    this._detailAnnotation = updated;
+    this.renderAnnotationsList(list);
+    this.renderExisting3DAnnotations();
+    if (!keepView) this.showAnnotationSurface(updated);
+  };
+
+  SpatialViewerApp.prototype._sendAnnotation = function(method, payload, btn, onOk) {
+    var self = this;
+    var a = this._detailAnnotation;
+    if (!a) return;
+    var label = btn ? btn.innerHTML : null;
+    if (btn) { btn.disabled = true; btn.innerHTML = 'Saving…'; }
+
+    fetch(this._annUrl(a.id), {
+      method: method,
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': this.csrfToken },
+      body: payload ? JSON.stringify(payload) : null
+    })
+      .then(function(r) { return r.json().catch(function() { return {}; }); })
+      .then(function(res) {
+        if (btn) { btn.disabled = false; btn.innerHTML = label; }
+        if (res && res.success) { onOk(res); }
+        else { alert('Save failed: ' + ((res && res.errors) || ['unknown error']).join(', ')); }
+      })
+      .catch(function(err) {
+        if (btn) { btn.disabled = false; btn.innerHTML = label; }
+        alert('Network error: ' + err);
+      });
+  };
+
+  SpatialViewerApp.prototype.saveAnnotationEdits = function() {
+    var t = (document.getElementById('adTitle').value || '').trim();
+    if (!t) { alert('The annotation needs a title.'); return; }
+    var payload = {
+      spatial_annotation: {
+        title: t,
+        description: document.getElementById('adDesc').value,
+        color: this._adColor || '#3b82f6'
+      }
+    };
+    var self = this;
+    this._sendAnnotation('PATCH', payload, document.getElementById('adSaveAnnBtn'), function(res) {
+      self._applyUpdatedAnnotation(res.annotation);
+      self.showTooltip('Annotation saved.');
+    });
+  };
+
+  SpatialViewerApp.prototype.saveWorkPackageEdits = function() {
+    var a = this._detailAnnotation;
+    if (!a || !a.work_package_id) return;
+    var fields = this._detailWpFields || {};
+    var snap = this._detailWpSnapshot || {};
+
+    var wpPayload = {};
+    Object.keys(fields).forEach(function(id) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      if (el.value !== (snap[id] || '')) wpPayload[fields[id]] = el.value;
+    });
+    if (!Object.keys(wpPayload).length) { this.showTooltip('No work package changes to save.'); return; }
+
+    var self = this;
+    this._sendAnnotation('PATCH', { work_package: wpPayload }, document.getElementById('adSaveWpBtn'), function(res) {
+      self._applyUpdatedAnnotation(res.annotation, true);
+      // The fields on screen are now the saved truth — re-baseline the snapshot.
+      Object.keys(fields).forEach(function(id) {
+        var el = document.getElementById(id);
+        self._detailWpSnapshot[id] = el ? el.value : '';
+      });
+      self.showTooltip('Work package saved.');
+    });
+  };
+
+  SpatialViewerApp.prototype.deleteAnnotationFromDetail = function() {
+    var self = this;
+    var a = this._detailAnnotation;
+    if (!a) return;
+    if (!window.confirm('Delete this 3D annotation? The linked Work Package is not deleted.')) return;
+    this._sendAnnotation('DELETE', null, document.getElementById('adDeleteBtn'), function() {
+      if (self.projectData && self.projectData.annotations) {
+        self.projectData.annotations = self.projectData.annotations.filter(function(x) { return x.id !== a.id; });
+        var c = document.getElementById('annotationCountHeader');
+        if (c) c.textContent = self.projectData.annotations.length;
+      }
+      self._setLassoHighlight(null);
+      self.closeAnnotationDetail();
+      self.renderAnnotationsList(self.projectData.annotations);
+      self.renderExisting3DAnnotations();
+    });
+  };
+
+  SpatialViewerApp.prototype._initAnnotationDetail = function() {
+    var self = this;
+    var bind = function(id, fn) { var el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+    bind('adBackBtn', function() { self.closeAnnotationDetail(); });
+    bind('adCloseBtn', function() { self.closeAnnotationDetail(); });
+    bind('adSaveAnnBtn', function() { self.saveAnnotationEdits(); });
+    bind('adSaveWpBtn', function() { self.saveWorkPackageEdits(); });
+    bind('adDeleteBtn', function() { self.deleteAnnotationFromDetail(); });
+    document.querySelectorAll('#adColorGroup .color-dot').forEach(function(dot) {
+      dot.addEventListener('click', function() {
+        document.querySelectorAll('#adColorGroup .color-dot').forEach(function(d) { d.classList.remove('active'); });
+        dot.classList.add('active');
+        self._adColor = dot.dataset.color;
+      });
     });
   };
 
@@ -2289,6 +2958,7 @@
     });
 
     this._initSidePanel();
+    this._initAnnotationDetail();
 
     // Inline "New Work Package" create panel
     var caCancel = document.getElementById('caCancelBtn');

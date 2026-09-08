@@ -8,7 +8,7 @@ en:
     title_models: "3D Models & Gaussian Splatting"
     new_model: "New 3D Model"
     edit_model: "Edit 3D Model"
-    upload_help: "Supported formats: glTF (.gltf, .glb), OBJ (.obj or .zip with textures), Gaussian Splatting (.ply, .splat, .ksplat, .spz), IFC (.ifc)."
+    upload_help: "Supported formats: glTF (.gltf, .glb), OBJ (.obj), Gaussian Splatting (.ply, .splat, .ksplat, .spz), IFC (.ifc). For a model with external textures, upload a single .zip containing the .obj/.gltf together with its .mtl / .bin and all image files (keeping the same relative folder structure)."
     no_models: "No 3D models uploaded for this project."
     model_format: "Model Format"
     annotations_count: "3D Annotations"

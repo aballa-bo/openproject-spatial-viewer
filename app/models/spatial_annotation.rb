@@ -134,9 +134,34 @@ class SpatialAnnotation < ApplicationRecord
       work_package_url:,
       work_package_subject: work_package&.subject,
       work_package_status: work_package&.status&.name,
+      work_package: work_package_detail_payload,
       bcf_issue_uuid: bcf_issue&.uuid,
       author_name: author&.name,
       created_at: created_at&.strftime("%d/%m/%Y %H:%M")
+    }
+  end
+
+  # Editable fields of the linked Work Package, for the annotation detail panel.
+  def work_package_detail_payload
+    wp = work_package
+    return nil unless wp
+
+    {
+      id: wp.id,
+      subject: wp.subject,
+      description: wp.description,
+      type_id: wp.type_id,
+      status_id: wp.status_id,
+      status: wp.status&.name,
+      assigned_to_id: wp.assigned_to_id,
+      responsible_id: wp.responsible_id,
+      priority_id: wp.priority_id,
+      category_id: wp.category_id,
+      version_id: wp.version_id,
+      parent_id: wp.parent_id,
+      start_date: wp.start_date,
+      due_date: wp.due_date,
+      estimated_hours: wp.estimated_hours
     }
   end
 

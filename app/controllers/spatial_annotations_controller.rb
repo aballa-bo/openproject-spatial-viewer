@@ -35,14 +35,22 @@ class SpatialAnnotationsController < ApplicationController
   end
 
   def update
-    @annotation.assign_attributes(annotation_attributes)
+    @annotation.assign_attributes(annotation_attributes) if params[:spatial_annotation].present?
     if (wp = resolve_work_package(required: false))
       @annotation.work_package = wp
     end
     @annotation.snapshot = snapshot_param if snapshot_param
 
-    if @annotation.save
-      render json: { success: true, annotation: @annotation.as_json_payload }
+    if params[:work_package].present?
+      wp_error = update_linked_work_package
+      if wp_error
+        return render json: { success: false, errors: [wp_error] }, status: :unprocessable_entity
+      end
+    end
+
+    saved = @annotation.changed? ? @annotation.save : true
+    if saved
+      render json: { success: true, annotation: @annotation.reload.as_json_payload }
     else
       render json: { success: false, errors: @annotation.errors.full_messages }, status: :unprocessable_entity
     end
@@ -136,6 +144,24 @@ class SpatialAnnotationsController < ApplicationController
       @work_package_error = call.errors.full_messages.join(", ")
       nil
     end
+  end
+
+  # Edit the Work Package linked to the annotation, from the detail panel.
+  # Returns an error string on failure, nil on success.
+  def update_linked_work_package
+    wp = @annotation.work_package
+    return "This annotation has no linked Work Package" unless wp
+
+    permitted = params.require(:work_package).permit(
+      :subject, :description, :type_id, :status_id, :assigned_to_id, :responsible_id,
+      :priority_id, :category_id, :version_id, :parent_id, :start_date, :due_date, :estimated_hours
+    )
+    # Blank string means "clear this field"; drop keys the client did not send.
+    attrs = permitted.to_h.symbolize_keys.transform_values { |v| v == "" ? nil : v }
+    return nil if attrs.empty?
+
+    call = ::WorkPackages::UpdateService.new(user: User.current, model: wp).call(**attrs)
+    call.success? ? nil : call.errors.full_messages.join(", ")
   end
 
   def annotation_attributes

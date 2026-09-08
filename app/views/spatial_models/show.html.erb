@@ -36,7 +36,7 @@
     </div>
 
     <div class="toolbar-section toolbar-tools-group">
-      <button type="button" class="toolbar-btn tool-btn" id="toolOrbit" title="Navigate / Orbit Camera" data-tool="orbit">
+      <button type="button" class="toolbar-btn tool-btn" id="toolOrbit" title="Navigate — drag to orbit, scroll to zoom to cursor, W/A/S/D to move, R/F for up/down (Shift = faster)" data-tool="orbit">
         <i class="icon-cursor-move"></i> Navigate
       </button>
       <button type="button" class="toolbar-btn tool-btn" id="toolPin" title="Place 3D Pin on Surface" data-tool="pin">
@@ -137,7 +137,7 @@
             <span>Light intensity <b id="rqLightVal">1.0</b></span>
             <input type="range" id="rqLight" min="0.1" max="3" step="0.1" value="1">
           </label>
-          <label class="render-row -check"><input type="checkbox" id="rqEnv"> Environment light &amp; reflections</label>
+          <label class="render-row -check"><input type="checkbox" id="rqEnv"> Environment (sky) light</label>
           <label class="render-row -check"><input type="checkbox" id="rqHiDpi"> High-resolution (HiDPI)</label>
           <label class="render-row -check"><input type="checkbox" id="rqWireframe"> Wireframe</label>
           <label class="render-row -check"><input type="checkbox" id="rqGrid"> Ground grid</label>
@@ -320,6 +320,145 @@
         <div class="create-panel-footer">
           <button type="button" class="button" id="caCancelBtn2">Cancel</button>
           <button type="button" class="button -primary" id="caSaveBtn">Create</button>
+        </div>
+      </div>
+
+      <%# Annotation detail — full annotation + linked Work Package, both editable. %>
+      <div class="annotation-detail-panel" id="annotationDetailPanel">
+        <div class="create-panel-header">
+          <button type="button" class="button -small" id="adBackBtn"><i class="icon-arrow-left1"></i> Annotations</button>
+          <h3>Annotation</h3>
+          <button type="button" class="close-btn" id="adCloseBtn" title="Close">&times;</button>
+        </div>
+
+        <div class="create-panel-body">
+          <img id="adSnapshot" class="ca-snapshot" alt="Viewpoint snapshot">
+          <div class="ad-meta">
+            <span class="annotation-type-badge" id="adTypeBadge"></span>
+            <span class="text-muted small" id="adAuthor"></span>
+            <span class="text-muted small" id="adDate"></span>
+          </div>
+
+          <p class="create-panel-section">Annotation</p>
+          <div class="form-group">
+            <label>Title *</label>
+            <input type="text" id="adTitle" class="form-input">
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <textarea id="adDesc" class="form-textarea" rows="3"></textarea>
+          </div>
+          <div class="form-group">
+            <label>Annotation colour</label>
+            <div class="color-picker-group" id="adColorGroup">
+              <button type="button" class="color-dot" data-color="#3b82f6" style="background:#3b82f6"></button>
+              <button type="button" class="color-dot" data-color="#ef4444" style="background:#ef4444"></button>
+              <button type="button" class="color-dot" data-color="#10b981" style="background:#10b981"></button>
+              <button type="button" class="color-dot" data-color="#f59e0b" style="background:#f59e0b"></button>
+              <button type="button" class="color-dot" data-color="#8b5cf6" style="background:#8b5cf6"></button>
+            </div>
+          </div>
+          <div class="detail-actions">
+            <button type="button" class="button -primary -small" id="adSaveAnnBtn">Save annotation</button>
+          </div>
+
+          <p class="create-panel-section">
+            Work Package <b id="adWpNum"></b>
+            <a id="adWpOpen" class="annotation-wp-link" target="_blank" rel="noopener" href="#"><i class="icon-relations"></i> Open</a>
+          </p>
+          <div id="adWpFields">
+            <div class="form-group">
+              <label>Subject</label>
+              <input type="text" id="adWpSubject" class="form-input">
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Type</label>
+                <select id="adWpType" class="form-select">
+                  <% @wp_types.each do |t| %><option value="<%= t.id %>"><%= t.name %></option><% end %>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Status</label>
+                <select id="adWpStatus" class="form-select">
+                  <% @wp_statuses.each do |s| %><option value="<%= s.id %>"><%= s.name %></option><% end %>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Description</label>
+              <textarea id="adWpDesc" class="form-textarea" rows="3"></textarea>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Assignee</label>
+                <select id="adWpAssignee" class="form-select">
+                  <option value="">Unassigned</option>
+                  <% @wp_assignees.each do |u| %><option value="<%= u.id %>"><%= u.name %></option><% end %>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Accountable</label>
+                <select id="adWpAccountable" class="form-select">
+                  <option value="">Nobody</option>
+                  <% @wp_assignees.each do |u| %><option value="<%= u.id %>"><%= u.name %></option><% end %>
+                </select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Priority</label>
+                <select id="adWpPriority" class="form-select">
+                  <option value="">Default</option>
+                  <% @wp_priorities.each do |p| %><option value="<%= p.id %>"><%= p.name %></option><% end %>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Category</label>
+                <select id="adWpCategory" class="form-select">
+                  <option value="">None</option>
+                  <% @wp_categories.each do |c| %><option value="<%= c.id %>"><%= c.name %></option><% end %>
+                </select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Version</label>
+                <select id="adWpVersion" class="form-select">
+                  <option value="">None</option>
+                  <% @wp_versions.each do |v| %><option value="<%= v.id %>"><%= v.name %></option><% end %>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Parent</label>
+                <select id="adWpParent" class="form-select">
+                  <option value="">None</option>
+                  <% @work_packages.each do |wp| %><option value="<%= wp.id %>">#<%= wp.id %> - <%= wp.subject %></option><% end %>
+                </select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Start date</label>
+                <input type="date" id="adWpStartDate" class="form-input">
+              </div>
+              <div class="form-group">
+                <label>Finish date</label>
+                <input type="date" id="adWpDueDate" class="form-input">
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Estimated time (h)</label>
+              <input type="number" id="adWpEstimatedHours" class="form-input" min="0" step="0.25">
+            </div>
+            <div class="detail-actions">
+              <button type="button" class="button -primary -small" id="adSaveWpBtn">Save work package</button>
+            </div>
+          </div>
+
+          <div class="detail-actions -danger">
+            <button type="button" class="button -small text-danger" id="adDeleteBtn">Delete annotation</button>
+          </div>
         </div>
       </div>
     </div>
