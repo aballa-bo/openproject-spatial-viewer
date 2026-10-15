@@ -7,3 +7,92 @@
 </div>
 
 <%= render 'form' %>
+
+<div class="spatial-layer-manager"
+     id="spatialLayerManager"
+     data-create-url="<%= project_spatial_model_spatial_layers_path(@project, @spatial_model) %>"
+     data-base-url="<%= project_spatial_model_spatial_layers_path(@project, @spatial_model) %>"
+     data-csrf-token="<%= form_authenticity_token %>">
+
+  <h2><%= t('spatial_viewer.layers_title', default: 'Model layers') %></h2>
+  <p class="text-muted">
+    <%= t('spatial_viewer.layers_help',
+          default: 'Upload each format of this model as a separate layer — IFC, mesh (obj/glb/gltf, .zip if it has textures), point cloud (las/laz/e57), gaussian splatting (ply/splat/sog). Every file must already be in the same scale and coordinate system. In the 3D viewer you can then show or hide each layer.') %>
+  </p>
+
+  <% legacy = @spatial_model.model_attachment %>
+  <table class="generic-table">
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Kind</th>
+        <th>Format</th>
+        <th>Size</th>
+        <th>Status</th>
+        <th class="generic-table--actions-header"></th>
+      </tr>
+    </thead>
+    <tbody id="layerRows">
+      <% if legacy %>
+        <tr>
+          <td><%= @spatial_model.title %> <span class="badge">primary file</span></td>
+          <td><%= SpatialLayer.kind_for(@spatial_model.model_format) %></td>
+          <td><span class="badge -primary"><%= @spatial_model.model_format.upcase %></span></td>
+          <td class="text-muted small"><%= @spatial_model.formatted_size %></td>
+          <td class="text-muted small">managed on the form above</td>
+          <td></td>
+        </tr>
+      <% end %>
+      <% @spatial_model.spatial_layers.each do |layer| %>
+        <tr data-layer-id="<%= layer.id %>">
+          <td><%= layer.title %></td>
+          <td><%= layer.kind %></td>
+          <td><span class="badge -primary"><%= layer.source_format.upcase %></span></td>
+          <td class="text-muted small"><%= layer.formatted_size %></td>
+          <td class="layer-status text-muted small">
+            <% if layer.needs_conversion? %>
+              <%= (layer.conversion_payload || {})[:status] %>
+            <% else %>
+              ready
+            <% end %>
+          </td>
+          <td class="buttons">
+            <button type="button" class="button -transparent icon icon-delete text-danger layer-delete" title="Remove layer"></button>
+          </td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+
+  <form id="addLayerForm" class="box tabular" enctype="multipart/form-data">
+    <div class="form--field -required">
+      <label class="form--label">Add a layer file</label>
+      <div class="form--field-container">
+        <input type="file" name="file" id="layerFile" class="form--file-field" required
+               accept=".ifc,.obj,.glb,.gltf,.zip,.ply,.splat,.sog,.las,.laz,.e57">
+      </div>
+    </div>
+    <div class="form--field">
+      <label class="form--label">Kind (auto-detected from the extension — override if needed)</label>
+      <div class="form--field-container">
+        <select name="kind" id="layerKind" class="form--select">
+          <option value="">Auto</option>
+          <option value="ifc">IFC</option>
+          <option value="mesh">Mesh + textures</option>
+          <option value="pointcloud">Point cloud</option>
+          <option value="splat">Gaussian splatting</option>
+        </select>
+      </div>
+    </div>
+    <div class="form--field">
+      <label class="form--label">Layer name (optional)</label>
+      <div class="form--field-container">
+        <input type="text" name="title" id="layerTitle" class="form--text-field" placeholder="from the file name">
+      </div>
+    </div>
+    <div class="form--actions">
+      <button type="submit" class="button -primary" id="addLayerBtn">Add layer</button>
+    </div>
+    <p class="form--field-instructions" id="addLayerMsg"></p>
+  </form>
+</div>

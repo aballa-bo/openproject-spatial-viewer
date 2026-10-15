@@ -3,7 +3,7 @@
 class SpatialModelsController < ApplicationController
   before_action :find_project_by_project_id
   before_action :authorize
-  before_action :find_model, only: %i[show edit update destroy api_data model_file]
+  before_action :find_model, only: %i[show edit update destroy api_data model_file set_start_view download_exe]
   before_action :relax_csp_for_3d_viewer, only: :show
 
   menu_item :spatial_models
@@ -26,6 +26,25 @@ class SpatialModelsController < ApplicationController
     @wp_assignees = Principal.possible_assignee(@project).ordered_by_name.limit(200)
     @wp_categories = @project.categories
     @wp_versions = @project.assignable_versions
+    # Custom fields are enabled per (project, type) in OpenProject, not
+    # globally -- the native work package form shows a different set once
+    # you pick a type, which this plugin's inline panel didn't do at all.
+    # Keyed by type id so the client can swap the rendered fields on change.
+    @custom_fields_by_type = @wp_types.each_with_object({}) do |type, hash|
+      wp = WorkPackage.new(project: @project, type:)
+      hash[type.id] = WorkPackage.available_custom_fields(wp).map do |cf|
+        {
+          id: cf.id,
+          name: cf.name,
+          format: cf.field_format,
+          required: cf.is_required?,
+          multi_value: cf.multi_value?,
+          options: %w[list user version].include?(cf.field_format) ? cf.possible_values_options(wp) : nil
+        }
+      end
+    end
+    @can_set_start_view = User.current.allowed_in_project?(:manage_spatial_models, @project)
+    @unity_player_available = SpatialViewer::UnityExportBuilder.player_available?
 
     @spatial_model.enqueue_conversion
   end
@@ -101,6 +120,37 @@ class SpatialModelsController < ApplicationController
     serve_raw_attachment
   end
 
+  # "Download as .exe": a standalone Unity viewer pre-loaded with this
+  # model's layers. See SpatialViewer::UnityExportBuilder for the zip layout.
+  def download_exe
+    zip = SpatialViewer::UnityExportBuilder.new(@spatial_model, server_base_url: request.base_url).call
+    (request.env["rack.tempfiles"] ||= []) << zip # let Rack::TempfileReaper unlink it once sent
+    send_file zip.path,
+              filename: "#{@spatial_model.title.parameterize.presence || 'model'}-3d-viewer.zip",
+              type: "application/zip",
+              disposition: "attachment"
+  rescue SpatialViewer::UnityExportBuilder::BuildError => e
+    render json: { success: false, error: e.message }, status: :unprocessable_entity
+  end
+
+  # Persists the camera position + orbit target the viewer's "Navigate" menu
+  # captured, so the model opens there next time. { clear: true } removes it
+  # and falls back to the automatic fit-to-view.
+  def set_start_view
+    if ActiveModel::Type::Boolean.new.cast(params[:clear])
+      @spatial_model.clear_start_view
+      render json: { success: true, start_view: nil }
+      return
+    end
+
+    position = params.require(:position).permit(:x, :y, :z).to_h
+    target = params.require(:target).permit(:x, :y, :z).to_h
+    @spatial_model.set_start_view(position:, target:)
+    render json: { success: true, start_view: @spatial_model.start_view }
+  rescue ActionController::ParameterMissing => e
+    render json: { success: false, error: e.message }, status: :unprocessable_entity
+  end
+
   def api_data
     annotations_json = @spatial_model.spatial_annotations
                                      .includes(:work_package, :author, :attachments, spatial_model: :project)
@@ -131,6 +181,7 @@ class SpatialModelsController < ApplicationController
                 end
 
     @spatial_model.enqueue_conversion if @spatial_model.needs_conversion?
+    @spatial_model.spatial_layers.each { |l| l.enqueue_conversion if l.needs_conversion? }
 
     render json: {
       id: @spatial_model.id,
@@ -141,6 +192,7 @@ class SpatialModelsController < ApplicationController
       model_url: file_url,
       file_size:,
       conversion: conversion_payload,
+      layers: layers_payload,
       settings: @spatial_model.settings,
       annotations: annotations_json,
       work_packages: work_packages_json,
@@ -149,6 +201,46 @@ class SpatialModelsController < ApplicationController
   end
 
   private
+
+  # Every renderable file of the model as a "layer" the viewer can toggle.
+  # The model's own (legacy, single-file) attachment is exposed as layer "model".
+  def layers_payload
+    out = []
+
+    if @spatial_model.model_attachment.present?
+      converted = @spatial_model.needs_conversion? && @spatial_model.converted_file_ready?
+      out << {
+        id: "model",
+        title: @spatial_model.title,
+        kind: SpatialLayer.kind_for(@spatial_model.model_format),
+        source_format: @spatial_model.model_format,
+        format: @spatial_model.viewer_format,
+        visible: true,
+        url: model_file_project_spatial_model_path(@project, @spatial_model),
+        conversion: conversion_payload,
+        file_size: (converted ? @spatial_model.converted_file_path.size : @spatial_model.model_attachment.filesize)
+      }
+    end
+
+    @spatial_model.spatial_layers.each do |layer|
+      next if layer.file_attachment.blank?
+
+      converted = layer.needs_conversion? && layer.converted_file_ready?
+      out << {
+        id: layer.id,
+        title: layer.title,
+        kind: layer.kind,
+        source_format: layer.source_format,
+        format: layer.viewer_format,
+        visible: layer.visible,
+        url: file_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer),
+        conversion: layer.conversion_payload,
+        file_size: (converted ? layer.converted_file_path.size : layer.file_attachment.filesize)
+      }
+    end
+
+    out
+  end
 
   # three.js' GLTFLoader turns the textures embedded in a GLB into `blob:` URLs
   # and any data-URI resources into `data:` URLs, then loads them with `fetch()`
@@ -189,6 +281,7 @@ class SpatialModelsController < ApplicationController
     "ply" => "application/octet-stream",
     "splat" => "application/octet-stream",
     "ksplat" => "application/octet-stream",
+    "sog" => "application/octet-stream",
     "gaussian_splat" => "application/octet-stream",
     "ifc" => "application/octet-stream"
   }.freeze

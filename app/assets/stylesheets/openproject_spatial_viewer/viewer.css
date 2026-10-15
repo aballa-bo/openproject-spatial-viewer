@@ -293,6 +293,62 @@
   margin-top: 2px;
 }
 
+/* ---- Layers panel -------------------------------------------------- */
+
+#layerList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.layer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8125rem;
+  color: var(--body-font-color);
+  cursor: pointer;
+}
+
+.layer-row input[type=checkbox] {
+  flex: 0 0 auto;
+}
+
+.layer-row span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.layer-row em {
+  flex: 0 0 auto;
+  font-style: normal;
+  font-size: 0.72rem;
+  color: var(--fgColor-muted);
+}
+
+/* ---- Layer manager (model edit page) ------------------------------- */
+
+.spatial-layer-manager {
+  margin-top: 28px;
+  padding-top: 16px;
+  border-top: 1px solid var(--borderColor-default);
+}
+
+.spatial-layer-manager h2 {
+  margin: 0 0 4px;
+}
+
+.spatial-layer-manager .generic-table {
+  margin: 12px 0 20px;
+}
+
+.spatial-layer-manager .layer-status[style*="9E2A1C"],
+.spatial-layer-manager td.layer-status {
+  white-space: normal;
+}
+
 /* ---- Side panel --------------------------------------------------------- */
 
 .spatial-side-panel {

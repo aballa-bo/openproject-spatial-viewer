@@ -21,6 +21,7 @@
               ['glTF / GLB (3D Mesh)', 'glb'],
               ['OBJ / Wavefront (.obj — textures via .zip bundle)', 'obj'],
               ['3D Gaussian Splatting (.ply / .splat / .ksplat)', 'gaussian_splat'],
+              ['3D Gaussian Splatting — PlayCanvas SOG (.sog)', 'sog'],
               ['IFC (BIM Model)', 'ifc']
             ], {}, class: 'form--select' %>
       </div>
@@ -29,7 +30,7 @@
     <div class="form--field">
       <label class="form--label"><%= t('attributes.attachments') %></label>
       <div class="form--field-container">
-        <input type="file" name="file" id="file" class="form--file-field" accept=".glb,.gltf,.obj,.ply,.splat,.ksplat,.ifc,.zip">
+        <input type="file" name="file" id="file" class="form--file-field" accept=".glb,.gltf,.obj,.ply,.splat,.ksplat,.sog,.ifc,.zip">
         <% if @spatial_model.model_attachment.present? %>
           <div class="text-muted small mt-1">
             Current file: <strong><%= @spatial_model.model_attachment.filename %></strong> (<%= @spatial_model.formatted_size %>)

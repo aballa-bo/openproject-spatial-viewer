@@ -19,66 +19,62 @@
     });
   }
 
-  // ---- Lasso surface-highlight shader --------------------------------------
-  // A projective decal. The lasso polygon lives in the NDC of the camera that
-  // made the selection; every fragment of the model is re-projected through
-  // that camera (uSelViewProj) and tested against it, so the tint is glued to
-  // the SURFACE and rotates with the model. Visibility is frozen at selection
-  // time with a depth map rendered from the same camera (uSelDepth), so only
-  // the surface that was actually in front stays highlighted.
-  var LASSO_MAX_PTS = 48;
-  var LASSO_VS =
-    'uniform mat4 uSelViewProj;\n' +
-    'varying vec4 vSelClip;\n' +
-    'void main() {\n' +
-    '  vSelClip = uSelViewProj * modelMatrix * vec4(position, 1.0);\n' +
-    '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);\n' +
-    '}';
-  var LASSO_POINTS_VS =
-    'uniform mat4 uSelViewProj;\n' +
-    'uniform float uSize;\n' +
-    'varying vec4 vSelClip;\n' +
-    'void main() {\n' +
-    '  vSelClip = uSelViewProj * modelMatrix * vec4(position, 1.0);\n' +
-    '  vec4 mv = modelViewMatrix * vec4(position, 1.0);\n' +
-    '  gl_PointSize = clamp(uSize * 350.0 / max(-mv.z, 0.001), 2.0, 24.0);\n' +
-    '  gl_Position = projectionMatrix * mv;\n' +
-    '}';
-  // uPoly holds an already-closed polygon (last point == first); unused tail
-  // slots repeat the last point (degenerate edges contribute nothing). All
-  // array indexing is loop-index based for maximum driver compatibility.
-  var LASSO_FS =
-    '#include <packing>\n' +
-    'uniform vec3 uColor;\n' +
-    'uniform float uOpacity;\n' +
-    'uniform vec2 uPoly[' + LASSO_MAX_PTS + '];\n' +
-    'uniform int uPolyLen;\n' +
-    'uniform sampler2D uSelDepth;\n' +
-    'uniform bool uUseDepth;\n' +
-    'uniform float uDepthBias;\n' +
-    'varying vec4 vSelClip;\n' +
-    'void main() {\n' +
-    '  if (vSelClip.w <= 0.0) discard;\n' +
-    '  vec2 ndc = vSelClip.xy / vSelClip.w;\n' +
-    '  if (abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0) discard;\n' +
-    '  bool inside = false;\n' +
-    '  for (int i = 0; i < ' + (LASSO_MAX_PTS - 1) + '; i++) {\n' +
-    '    if (i + 1 >= uPolyLen) break;\n' +
-    '    vec2 a = uPoly[i];\n' +
-    '    vec2 b = uPoly[i + 1];\n' +
-    '    if (((a.y > ndc.y) != (b.y > ndc.y)) &&\n' +
-    '        (ndc.x < (b.x - a.x) * (ndc.y - a.y) / (b.y - a.y) + a.x)) {\n' +
-    '      inside = !inside;\n' +
-    '    }\n' +
-    '  }\n' +
-    '  if (!inside) discard;\n' +
-    '  if (uUseDepth) {\n' +
-    '    float myDepth = 0.5 * (vSelClip.z / vSelClip.w) + 0.5;\n' +
-    '    float mapDepth = unpackRGBAToDepth(texture2D(uSelDepth, ndc * 0.5 + 0.5));\n' +
-    '    if (myDepth > mapDepth + uDepthBias) discard;\n' +
-    '  }\n' +
-    '  gl_FragColor = vec4(uColor, uOpacity);\n' +
-    '}';
+  // ---- Lasso surface-highlight: raycast grid --------------------------------
+  // The fill is built by casting a grid of rays (one per sample point inside
+  // the lasso's screen polygon) at the model and meshing the hits together.
+  // Every vertex of the resulting patch IS a point where a ray actually met a
+  // surface, so it can never drift off of it — it literally *is* the nearest
+  // surface along each ray, across all visible layers. (An earlier version
+  // projected the model's own geometry through a frozen camera matrix and
+  // depth-tested it against a cached depth map; that approach kept drifting
+  // out of alignment whenever the aspect ratio, camera, or scene changed
+  // between selection and render, so it has been replaced outright.)
+
+  // Even-odd point-in-polygon test, polygon implicitly closed (last point
+  // pairs with the first via the `j = i++` wrap).
+  function pointInPolygon(x, y, poly) {
+    var inside = false;
+    for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      var xi = poly[i].x, yi = poly[i].y, xj = poly[j].x, yj = poly[j].y;
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  // Cap the polygon used for hit-testing so a long freehand stroke (up to
+  // 4000 points) never makes the per-sample inside-test expensive.
+  function downsamplePolyPx(path, maxPts) {
+    if (path.length <= maxPts) return path;
+    var out = [], stride = path.length / maxPts;
+    for (var i = 0; i < maxPts; i++) out.push(path[Math.floor(i * stride)]);
+    return out;
+  }
+
+  // Keeps a stored lasso fill grid's JSON compact -- 1e-5 units of precision
+  // is far finer than visually meaningful for this viewer's models.
+  function round5(n) { return Math.round(n * 1e5) / 1e5; }
+
+  // Two independent triangles per grid cell (a-b-c, b-d-c) rather than
+  // requiring all 4 corners: a lasso edge or a small gap in the surface then
+  // only loses a sliver instead of the whole cell. `grid` is a flat
+  // rows*cols array of {x,y,z}-like points, with a falsy entry wherever
+  // there was no hit at that cell. Shared by the live fill (built from fresh
+  // raycasts every time it's called) and by rebuilding a SAVED fill directly
+  // from its stored grid (no raycasting at all -- see _buildLassoFillFromGrid).
+  function triangulateLassoGrid(grid, rows, cols) {
+    var positions = [];
+    for (var j = 0; j < rows - 1; j++) {
+      for (var k = 0; k < cols - 1; k++) {
+        var a = grid[j * cols + k], b = grid[j * cols + k + 1];
+        var c = grid[(j + 1) * cols + k], d = grid[(j + 1) * cols + k + 1];
+        if (a && b && c) { positions.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z); }
+        if (b && d && c) { positions.push(b.x, b.y, b.z, d.x, d.y, d.z, c.x, c.y, c.z); }
+      }
+    }
+    return positions;
+  }
 
   // ---- Cleanup previous viewer instance ----
   function destroyExistingViewer() {
@@ -90,8 +86,6 @@
         if (app._gltfWorker) { try { app._gltfWorker.terminate(); } catch (ignore3) {} }
         if (typeof app._revokeBundleUrls === 'function') { try { app._revokeBundleUrls(); } catch (e) {} }
         app._modelBlob = null;
-        if (app._selDepthRT) { try { app._selDepthRT.dispose(); } catch (e) {} app._selDepthRT = null; }
-        if (app._depthMat) { try { app._depthMat.dispose(); } catch (e) {} app._depthMat = null; }
         if (app.modelMeshObjects) {
           app.modelMeshObjects.forEach(function(m) {
             try { if (m.geometry && m.geometry.disposeBoundsTree) m.geometry.disposeBoundsTree(); } catch (e) {}
@@ -234,6 +228,11 @@
 
     this.apiUrl = this.container.dataset.apiUrl;
     this.csrfToken = this.container.dataset.csrfToken;
+    // { "<type_id>": [{id, name, format, required, multi_value, options}, ...], ... }
+    // -- custom fields are enabled per (project, type) in OpenProject, see
+    // SpatialModelsController#show's @custom_fields_by_type.
+    try { this.customFieldsByType = JSON.parse(this.container.dataset.customFieldsByType || '{}'); }
+    catch (e) { this.customFieldsByType = {}; }
     this.canvas = document.getElementById('threeCanvas');
     this.viewport = document.getElementById('spatialViewport');
 
@@ -389,12 +388,16 @@
     // the target and never actually reaches the surface you're looking at.
     this.controls.enableZoom = false;
 
-    // Scratch vectors + state for WASD / R-F fly navigation.
+    // Scratch vectors + state for WASD / R-F fly navigation (desktop) and
+    // thumbstick locomotion (VR) — the two never run in the same frame, so
+    // they share the same scratch objects.
     this._navKeys = Object.create(null);
     this._nav = {
       fwd: new THREE.Vector3(), right: new THREE.Vector3(),
-      worldUp: new THREE.Vector3(0, 1, 0), move: new THREE.Vector3()
+      worldUp: new THREE.Vector3(0, 1, 0), move: new THREE.Vector3(),
+      xrHead: new THREE.Vector3()
     };
+    this._xrTurnArmed = false;
     this._lastFrameT = (window.performance && performance.now) ? performance.now() : Date.now();
 
     // Base intensities are kept modest: the image-based environment map and
@@ -466,7 +469,15 @@
       var now = (window.performance && performance.now) ? performance.now() : Date.now();
       var dt = Math.min(0.1, (now - self._lastFrameT) / 1000);
       self._lastFrameT = now;
-      if (!presenting) self._processNavKeys(dt);
+      if (presenting) self._processXRInput(dt);
+      else self._processNavKeys(dt);
+      if (self._layerFades) self._tickLayerFades();
+      if (self._splatRenderers && self._splatRenderers.length) {
+        var vw = self.viewport.clientWidth || 1, vh = self.viewport.clientHeight || 1;
+        for (var si = 0; si < self._splatRenderers.length; si++) {
+          self._splatRenderers[si].updateFrame(self.camera, vw, vh);
+        }
+      }
 
       if (self.controls && !presenting) self.controls.update();
       // Frame-rate-driven sampling of the drawing stroke: guarantees a dense
@@ -608,6 +619,63 @@
     this.controls.update();
   };
 
+  // "Set as start view" — persist the current camera position + orbit target
+  // so the model opens there (instead of the auto fit-to-view) next time.
+  SpatialViewerApp.prototype._setCurrentViewAsStart = function() {
+    var self = this;
+    if (!this.apiUrl) return;
+    var pos = this.camera.position.clone(), tgt = this.controls.target.clone();
+    var url = this.apiUrl.replace('/api_data', '/set_start_view');
+    fetch(url, {
+      method: 'PATCH',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': this.csrfToken },
+      body: JSON.stringify({
+        position: { x: pos.x, y: pos.y, z: pos.z },
+        target: { x: tgt.x, y: tgt.y, z: tgt.z }
+      })
+    })
+      .then(function(r) { return r.json().catch(function() { return {}; }); })
+      .then(function(res) {
+        if (!res || !res.success) { window.alert('Could not save the start view.'); return; }
+        if (self.projectData) {
+          self.projectData.settings = self.projectData.settings || {};
+          self.projectData.settings.start_view = res.start_view;
+        }
+        self._homeView = { position: pos, target: tgt };
+        self._flashTooltip('Start view saved — the model will open here next time.');
+      })
+      .catch(function() { window.alert('Network error while saving the start view.'); });
+  };
+
+  SpatialViewerApp.prototype._clearStartView = function() {
+    var self = this;
+    if (!this.apiUrl) return;
+    var url = this.apiUrl.replace('/api_data', '/set_start_view');
+    fetch(url, {
+      method: 'PATCH',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': this.csrfToken },
+      body: JSON.stringify({ clear: true })
+    })
+      .then(function(r) { return r.json().catch(function() { return {}; }); })
+      .then(function(res) {
+        if (!res || !res.success) { window.alert('Could not clear the start view.'); return; }
+        if (self.projectData && self.projectData.settings) self.projectData.settings.start_view = null;
+        self._flashTooltip('Start view cleared — the model will open with the default fit-to-view.');
+      })
+      .catch(function() { window.alert('Network error while clearing the start view.'); });
+  };
+
+  // Brief status message reusing the drawing tooltip box.
+  SpatialViewerApp.prototype._flashTooltip = function(text) {
+    this.showTooltip(text);
+    setTimeout(function() {
+      var t = document.getElementById('drawingTooltip');
+      if (t) t.style.display = 'none';
+    }, 3000);
+  };
+
   // Reflect renderSettings into the Render panel's inputs.
   SpatialViewerApp.prototype._syncRenderPanel = function() {
     var s = this.renderSettings;
@@ -700,33 +768,242 @@
         self.renderAnnotationsList(data.annotations);
         self.renderWorkPackagesList(data.work_packages);
 
-        // Formats converted server-side (e.g. IFC -> GLB): wait for the job.
-        var conv = data.conversion;
-        if (conv && conv.status && conv.status !== 'completed') {
-          if (conv.status === 'error') {
-            self.showLoader('IFC conversion failed: ' + (conv.message || 'unknown error'));
-            return;
-          }
-          self.showLoader('Converting IFC on the server (this may take a few minutes)...');
-          clearTimeout(self._conversionPoll);
-          self._conversionPoll = setTimeout(function() { self.loadProjectData(); }, 8000);
-          return;
+        var layers = (data.layers && data.layers.length) ? data.layers.slice() : [];
+        if (!layers.length && data.model_url) {
+          layers = [{
+            id: 'model', title: data.title || 'Model', kind: 'mesh',
+            format: data.model_format, url: data.model_url, visible: true,
+            conversion: data.conversion, file_size: data.file_size
+          }];
         }
-
-        // Authoritative uncompressed size from the server — model_file is gzip'd
-        // so its Content-Length can't be trusted for the heavy-model decision.
-        var heavyMb = parseInt(self.container.dataset.heavyModelMb, 10) || 40;
-        if (data.file_size) {
-          self._modelBytes = data.file_size;
-          self.heavyMode = data.file_size >= heavyMb * 1048576;
-        }
-
-        self.load3DModel(data.model_url, data.model_format);
+        self._startLayerLoading(layers);
       })
       .catch(function(err) {
         console.error('[SpatialViewer] API Error:', err);
         self.showLoader('Error loading model configuration: ' + err.message);
       });
+  };
+
+  // ---- Multi-layer loading (IFC / mesh / point cloud / splat) -----------
+
+  SpatialViewerApp.prototype._startLayerLoading = function(layers) {
+    var self = this;
+    if (!this.layersRoot) { this.layersRoot = new THREE.Group(); this.scene.add(this.layersRoot); }
+    while (this.layersRoot.children.length) this.layersRoot.remove(this.layersRoot.children[0]);
+
+    this.layerGroups = {};
+    this.layerMeta = {};
+    this.layerError = {};
+    this._splatRenderers = [];
+    this._allLayerMeshes = [];
+    this.modelMeshObjects = [];
+    this._loadingLayerId = null;
+    this._framed = false;
+    this._layerTotal = layers.length;
+    this._layerIndex = 0;
+    layers.forEach(function(l) { self.layerMeta[l.id] = l; });
+
+    var heavyMb = parseInt(this.container.dataset.heavyModelMb, 10) || 40;
+    var maxSize = 0;
+    layers.forEach(function(l) { if (l.file_size > maxSize) maxSize = l.file_size; });
+    if (maxSize) this.heavyMode = maxSize >= heavyMb * 1048576;
+
+    this._layerQueue = layers.filter(function(l) { return !!l.url; });
+    if (!this._layerQueue.length) {
+      this.showLoader('This model has no uploaded files yet — add layers from the model edit page.');
+      setTimeout(function() { self.hideLoader(); self.createDemoModel(); }, 3500);
+      this._buildLayerPanel();
+      return;
+    }
+    this._loadNextLayer();
+  };
+
+  SpatialViewerApp.prototype._loadNextLayer = function() {
+    var self = this;
+    clearTimeout(this._layerWatchdog);
+
+    if (!this._layerQueue || !this._layerQueue.length) {
+      this._loadingLayerId = null;
+      // fitToView / bbox helpers operate on the whole stack from here on.
+      this.modelObject = this.layersRoot;
+      this.hideLoader();
+      this._buildLayerPanel();
+      var errs = Object.keys(this.layerError || {});
+      if (errs.length) {
+        this.showTooltip(errs.length + ' layer(s) could not be loaded — see the console.');
+      }
+      return;
+    }
+
+    var l = this._layerQueue.shift();
+    this._loadingLayerId = l.id;
+    this._layerIndex++;
+    this.showLoader('Loading layer ' + this._layerIndex + '/' + this._layerTotal + ': ' + (l.title || l.id) + '…');
+
+    var conv = l.conversion;
+    if (conv && conv.status === 'error') {
+      console.warn('[SpatialViewer] layer', l.id, 'conversion error:', conv.message);
+      this.layerError[l.id] = 'conversion: ' + (conv.message || 'failed');
+      return this._loadNextLayer();
+    }
+
+    // Last-resort watchdog: real download/convert/parse failures short-circuit
+    // via _layerLoadFailed, so this only catches a genuine hang. Kept long
+    // because a big server-side conversion can legitimately run for minutes.
+    this._layerWatchdog = setTimeout(function() {
+      if (self._loadingLayerId !== l.id) return;
+      console.warn('[SpatialViewer] layer', l.id, 'timed out');
+      self.layerError[l.id] = 'timed out';
+      self.modelObject = null;
+      self._loadNextLayer();
+    }, 1200000);
+
+    this.load3DModel(l.url, l.format);
+  };
+
+  // Called at the end of onModelLoaded: move the just-loaded object into its
+  // own toggleable layer group and start the next layer.
+  SpatialViewerApp.prototype._harvestLayer = function(id) {
+    clearTimeout(this._layerWatchdog);
+    var obj = this.modelObject;
+    if (obj) {
+      if (obj.parent) obj.parent.remove(obj);
+      var g = new THREE.Group();
+      g.name = 'layer:' + id;
+      var meta = this.layerMeta[id] || {};
+      g.visible = false;
+      g.add(obj);
+      this.layersRoot.add(g);
+      this.layerGroups[id] = g;
+      this._allLayerMeshes = (this._allLayerMeshes || []).concat(this._lastLayerMeshes || []);
+      this.modelMeshObjects = this._allLayerMeshes;
+      if (meta.visible !== false) this._fadeLayer(id, true, 320);
+    }
+    this.modelObject = null;
+    this._loadNextLayer();
+  };
+
+  // Terminal parse failure: advance the layer queue if loading layered,
+  // otherwise just show the message on the loader.
+  SpatialViewerApp.prototype._parseError = function(msg) {
+    if (this._loadingLayerId != null) this._layerLoadFailed(msg);
+    else this.showLoader(msg);
+  };
+
+  // A layer failed to download / convert / parse: note it and move on so one
+  // bad layer never blocks the rest of the stack.
+  SpatialViewerApp.prototype._layerLoadFailed = function(msg) {
+    var id = this._loadingLayerId;
+    console.warn('[SpatialViewer] layer', id, 'failed:', msg);
+    if (id == null) { this.showLoader('Error loading model: ' + msg); return; }
+    this.layerError = this.layerError || {};
+    this.layerError[id] = msg;
+    this.modelObject = null;
+    clearTimeout(this._layerWatchdog);
+    this._loadNextLayer();
+  };
+
+  // Cross-fade a layer in / out (opacity ramp on all its materials).
+  SpatialViewerApp.prototype._fadeLayer = function(id, show, ms) {
+    var g = this.layerGroups && this.layerGroups[id];
+    if (!g) return;
+    ms = ms || 380;
+    this._layerFades = this._layerFades || {};
+
+    var mats = [];
+    g.traverse(function(o) {
+      if (!o.material) return;
+      (Array.isArray(o.material) ? o.material : [o.material]).forEach(function(m) {
+        if (!m || mats.indexOf(m) !== -1) return;
+        if (!m.userData._fadeOrig) {
+          m.userData._fadeOrig = {
+            opacity: (m.opacity == null ? 1 : m.opacity),
+            transparent: !!m.transparent,
+            depthWrite: (m.depthWrite !== false)
+          };
+        }
+        mats.push(m);
+      });
+    });
+    if (!mats.length) { g.visible = !!show; return; }
+
+    mats.forEach(function(m) { m.transparent = true; m.depthWrite = false; });
+    if (show) { g.visible = true; mats.forEach(function(m) { m.opacity = 0; }); }
+
+    this._layerFades[id] = {
+      group: g, mats: mats, show: !!show, ms: ms,
+      start: (window.performance && performance.now) ? performance.now() : Date.now()
+    };
+  };
+
+  SpatialViewerApp.prototype._tickLayerFades = function() {
+    var fades = this._layerFades;
+    if (!fades) return;
+    var now = (window.performance && performance.now) ? performance.now() : Date.now();
+    Object.keys(fades).forEach(function(id) {
+      var f = fades[id];
+      var t = Math.min(1, (now - f.start) / f.ms);
+      var e = t * t * (3 - 2 * t);            // smoothstep
+      var k = f.show ? e : (1 - e);
+      f.mats.forEach(function(m) {
+        m.opacity = ((m.userData._fadeOrig && m.userData._fadeOrig.opacity) || 1) * k;
+      });
+      if (t >= 1) {
+        f.mats.forEach(function(m) {
+          var o = m.userData._fadeOrig || { opacity: 1, transparent: false, depthWrite: true };
+          m.opacity = o.opacity;
+          m.transparent = o.transparent;
+          m.depthWrite = o.depthWrite;
+        });
+        if (!f.show) f.group.visible = false;
+        delete fades[id];
+      }
+    });
+  };
+
+  SpatialViewerApp.prototype.setLayerVisible = function(id, visible) {
+    this._fadeLayer(id, !!visible);
+    if (this.layerMeta[id]) this.layerMeta[id].visible = !!visible;
+    // Persist for real layers (not the legacy "model" file).
+    if (id !== 'model' && this.apiUrl) {
+      var base = this.apiUrl.replace('/api_data', '/spatial_layers/' + id);
+      fetch(base, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': this.csrfToken },
+        body: JSON.stringify({ spatial_layer: { visible: !!visible } })
+      }).catch(function() {});
+    }
+  };
+
+  SpatialViewerApp.prototype._buildLayerPanel = function() {
+    var self = this;
+    var panel = document.getElementById('layerPanel');
+    var list = document.getElementById('layerList');
+    var btn = document.getElementById('btnLayers');
+    if (!panel || !list) return;
+
+    var ids = Object.keys(this.layerMeta || {});
+    if (ids.length <= 1) { if (btn) btn.style.display = 'none'; return; }
+    if (btn) btn.style.display = '';
+
+    list.innerHTML = '';
+    ids.forEach(function(id) {
+      var m = self.layerMeta[id];
+      var row = document.createElement('label');
+      row.className = 'layer-row';
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = m.visible !== false && !self.layerError[id];
+      cb.disabled = !self.layerGroups[id];
+      cb.addEventListener('change', function() { self.setLayerVisible(id, cb.checked); });
+      var span = document.createElement('span');
+      span.textContent = (m.title || id);
+      var tag = document.createElement('em');
+      tag.textContent = self.layerError[id] ? ('— ' + self.layerError[id])
+        : (m.kind || '') + (m.source_format ? ' · ' + String(m.source_format).toUpperCase() : '');
+      row.appendChild(cb); row.appendChild(span); row.appendChild(tag);
+      list.appendChild(row);
+    });
   };
 
   SpatialViewerApp.prototype.load3DModel = function(url, format) {
@@ -790,12 +1067,13 @@
         return self._downloadModel(url, format);
       })
       .then(function(res) {
+        if (res && res.convError) { self._layerLoadFailed('conversion: ' + res.convError); return; }
         if (!res || res.aborted || res.pending) return;
         self._parseModel(res.buffer, format);
       })
       .catch(function(err) {
         console.error('[SpatialViewer] Model loading failed:', err);
-        self.showLoader('Error loading model: ' + (err && err.message || err));
+        self._layerLoadFailed(err && err.message || String(err));
       });
   };
 
@@ -831,11 +1109,11 @@
           try { j = JSON.parse(head); } catch (e) {}
           if (j && j.status === 'error') {
             self.showLoader('Conversion failed: ' + (j.message || 'unknown error'));
-          } else {
-            self.showLoader('Converting the model on the server...');
-            clearTimeout(self._conversionPoll);
-            self._conversionPoll = setTimeout(function() { self.load3DModel(url, format); }, 8000);
+            return { convError: (j.message || 'conversion failed') };
           }
+          self.showLoader('Converting on the server…');
+          clearTimeout(self._conversionPoll);
+          self._conversionPoll = setTimeout(function() { self.load3DModel(url, format); }, 8000);
           return { pending: true };
         });
       }
@@ -965,25 +1243,1055 @@
       ? u8.buffer : u8.slice().buffer;
   }
 
+  var PLY_TYPE_SIZES = {
+    char: 1, uchar: 1, int8: 1, uint8: 1,
+    short: 2, ushort: 2, int16: 2, uint16: 2,
+    int: 4, uint: 4, int32: 4, uint32: 4,
+    float: 4, float32: 4,
+    double: 8, float64: 8
+  };
+
+  // Reads one scalar PLY property value at a byte offset, by type name.
+  function plyReadScalar(dv, offset, type) {
+    switch (type) {
+      case 'char': case 'int8': return dv.getInt8(offset);
+      case 'uchar': case 'uint8': return dv.getUint8(offset);
+      case 'short': case 'int16': return dv.getInt16(offset, true);
+      case 'ushort': case 'uint16': return dv.getUint16(offset, true);
+      case 'int': case 'int32': return dv.getInt32(offset, true);
+      case 'uint': case 'uint32': return dv.getUint32(offset, true);
+      case 'double': case 'float64': return dv.getFloat64(offset, true);
+      default: return dv.getFloat32(offset, true); // float / float32
+    }
+  }
+
+  // Parses a binary-little-endian PLY trained as a 3D Gaussian Splat (the
+  // de-facto standard produced by the original INRIA 3DGS codebase and every
+  // compatible tool): per-vertex float properties x/y/z, scale_0..2 (log
+  // scale), rot_0..3 (quaternion w,x,y,z, not necessarily normalized),
+  // opacity (logit -- needs a sigmoid), f_dc_0..2 (DC spherical-harmonic
+  // color, same convention as SOG's sh0). Higher-order f_rest_* (view-
+  // dependent color) is present in most such files but intentionally not
+  // decoded, same scope limit as SOG.
+  //
+  // THREE.PLYLoader (vendored) only ever builds position/normal/uv/color
+  // attributes and silently drops every other named property -- it cannot
+  // be reused here, so this reads the binary vertex block directly.
+  //
+  // Returns null (not an error) when the file doesn't have these properties
+  // -- the caller falls back to the plain colored-point-cloud path, since
+  // .ply/.splat/.ksplat are also used in this plugin for ordinary point
+  // clouds with no Gaussian training data at all.
+  function parseSplatPLY(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var headerEnd = -1;
+    var ascii = '';
+    // The header is pure ASCII and short; decode a generous prefix only.
+    var scanLen = Math.min(bytes.length, 8192);
+    for (var i = 0; i < scanLen; i++) ascii += String.fromCharCode(bytes[i]);
+    var marker = ascii.indexOf('end_header\n');
+    if (marker === -1) throw new Error('not a PLY file (no end_header)');
+    headerEnd = marker + 'end_header\n'.length;
+    var header = ascii.slice(0, marker);
+
+    if (!/format\s+binary_little_endian/i.test(header)) return null; // ASCII/BE PLY: not handled here, fall back
+
+    var vertexCountMatch = header.match(/element\s+vertex\s+(\d+)/i);
+    if (!vertexCountMatch) return null;
+    var count = parseInt(vertexCountMatch[1], 10);
+    if (!count) return null;
+
+    // Only the properties of the `vertex` element (the first `element`
+    // block up to the next `element` line or end_header) matter here --
+    // a `face` element, if present, is ignored entirely (splat plys don't
+    // have one, but a defensive reader shouldn't assume that).
+    var vertexBlockMatch = header.match(/element\s+vertex\s+\d+\n([\s\S]*?)(?=\nelement\s|\n?$)/i);
+    var propText = vertexBlockMatch ? vertexBlockMatch[1] : header;
+    var props = [];
+    var propRe = /property\s+(\w+)\s+(\w+)/gi;
+    var m;
+    while ((m = propRe.exec(propText))) props.push({ type: m[1].toLowerCase(), name: m[2] });
+    if (props.some(function(p) { return !PLY_TYPE_SIZES[p.type]; })) return null; // a `list` property (e.g. face indices) -- not a plain vertex record
+
+    var offsets = {};
+    var cursor = 0;
+    props.forEach(function(p) {
+      offsets[p.name] = cursor;
+      cursor += PLY_TYPE_SIZES[p.type];
+    });
+    var recordSize = cursor;
+
+    var need = ['x', 'y', 'z', 'scale_0', 'scale_1', 'scale_2',
+                'rot_0', 'rot_1', 'rot_2', 'rot_3', 'opacity', 'f_dc_0', 'f_dc_1', 'f_dc_2'];
+    if (need.some(function(k) { return !(k in offsets); })) return null; // no Gaussian splat data in this ply
+
+    // Optional view-dependent colour (spherical harmonics, degree 1-2). The
+    // reference 3DGS trainer always exports all 3 bands (45 f_rest_* floats,
+    // 15 per channel) when SH data is present at all, but this only reads
+    // the first 8 (degree 1+2 -- the lowest-frequency, highest-impact
+    // coefficients per channel) -- see the SplatRenderer comment on why
+    // degree is capped there. f_rest_* is stored channel-major (all of R's
+    // coefficients, then all of G's, then all of B's), unlike the
+    // interleaved-per-coefficient layout used everywhere else in this file.
+    var restCount = 0;
+    while (('f_rest_' + restCount) in offsets) restCount++;
+    // 0 (no SH data) unless restCount divides evenly into 3 equal channel
+    // blocks -- a malformed/non-standard restCount is treated the same as
+    // "no SH data" rather than risking a fractional, garbage offset below.
+    var coeffsPerChannel = (restCount > 0 && restCount % 3 === 0) ? restCount / 3 : 0;
+
+    var propType = {};
+    props.forEach(function(p) { propType[p.name] = p.type; });
+    var read = function(dv, base, name) { return plyReadScalar(dv, base + offsets[name], propType[name]); };
+
+    if (headerEnd + count * recordSize > buffer.byteLength) {
+      throw new Error('PLY file is truncated (vertex data shorter than the header promises)');
+    }
+
+    var dv = new DataView(buffer);
+    var step = count > TRUE_SPLAT_MAX_POINTS ? Math.ceil(count / TRUE_SPLAT_MAX_POINTS) : 1;
+    // Each dropped splat was itself covering part of the surface; thinning
+    // the set to 1-in-`step` without compensation leaves visible gaps
+    // between the survivors (reported as "big, separated dots" instead of a
+    // continuous surface) -- each kept splat's own scale was fitted assuming
+    // its now-discarded neighbours were still there to cover the rest. Grow
+    // the survivors to compensate, same cube-root density heuristic already
+    // used by _adaptivePointSize for the point-cloud approximation path.
+    var scaleComp = step > 1 ? Math.cbrt(step) : 1;
+    var n = Math.floor((count + step - 1) / step);
+    var positions = new Float32Array(n * 3);
+    var cov6 = new Float32Array(n * 6);
+    var colors = new Float32Array(n * 4);
+    // Degree-1/2 SH coefficients (zero-filled -- i.e. no view-dependent term
+    // -- when the file has no f_rest_* data, or not enough of it, at all).
+    var sh1 = new Float32Array(n * 3), sh2 = new Float32Array(n * 3), sh3 = new Float32Array(n * 3);
+    var sh4 = new Float32Array(n * 3), sh5 = new Float32Array(n * 3), sh6 = new Float32Array(n * 3);
+    var sh7 = new Float32Array(n * 3), sh8 = new Float32Array(n * 3);
+    var shOut = [sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8];
+    var maxCoeff = Math.min(coeffsPerChannel, 8);
+    var k = 0;
+    for (var vi = 0; vi < count; vi += step) {
+      var base = headerEnd + vi * recordSize;
+
+      positions[k * 3]     = read(dv, base, 'x');
+      // Same ground-truth-down vs. viewer-Y-up correction as SOG (see
+      // parseSOG) -- a 180 degree rotation about X (flip Y AND Z), not a
+      // single-axis mirror; the matching covariance sign fix-up follows
+      // below.
+      positions[k * 3 + 1] = -read(dv, base, 'y');
+      positions[k * 3 + 2] = -read(dv, base, 'z');
+
+      var sx = Math.exp(read(dv, base, 'scale_0')) * scaleComp;
+      var sy = Math.exp(read(dv, base, 'scale_1')) * scaleComp;
+      var sz = Math.exp(read(dv, base, 'scale_2')) * scaleComp;
+
+      var qw = read(dv, base, 'rot_0'), qx = read(dv, base, 'rot_1');
+      var qy = read(dv, base, 'rot_2'), qz = read(dv, base, 'rot_3');
+      var qlen = Math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz) || 1;
+      qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen;
+
+      var c6 = quatScaleToCovariance6(sx, sy, sz, qw, qx, qy, qz);
+      // Sigma' = F*Sigma*F^T for F = diag(1,-1,-1) (180 deg about X): cross
+      // terms get multiplied by the product of the two flipped signs --
+      // xy and xz each touch exactly one flipped axis (sign flips), yz
+      // touches two (signs cancel, stays unflipped). Diagonal entries are
+      // always unaffected (each sign squares to 1).
+      cov6[k * 6] = c6[0];
+      cov6[k * 6 + 1] = -c6[1]; // xy
+      cov6[k * 6 + 2] = -c6[2]; // xz
+      cov6[k * 6 + 3] = c6[3];
+      cov6[k * 6 + 4] = c6[4];  // yz
+      cov6[k * 6 + 5] = c6[5];
+
+      var opacityLogit = read(dv, base, 'opacity');
+      // Raw DC coefficient -- NOT yet scaled by SH_C0 or offset by 0.5; the
+      // vertex shader does that (and adds the degree-1 term below) every
+      // frame, since the degree-1 contribution depends on view direction.
+      colors[k * 4]     = read(dv, base, 'f_dc_0');
+      colors[k * 4 + 1] = read(dv, base, 'f_dc_1');
+      colors[k * 4 + 2] = read(dv, base, 'f_dc_2');
+      colors[k * 4 + 3] = 1 / (1 + Math.exp(-opacityLogit)); // sigmoid: 3DGS stores opacity as a logit
+
+      // f_rest_* is channel-major: coefficient c of channel R/G/B lives at
+      // f_rest_{c}, f_rest_{coeffsPerChannel+c}, f_rest_{2*coeffsPerChannel+c}
+      // respectively. Coefficient index c here = CUDA sh[c+1] (sh1=c0, ...,
+      // sh8=c7).
+      for (var c = 0; c < maxCoeff; c++) {
+        var dst = shOut[c];
+        dst[k * 3] = read(dv, base, 'f_rest_' + c);
+        dst[k * 3 + 1] = read(dv, base, 'f_rest_' + (coeffsPerChannel + c));
+        dst[k * 3 + 2] = read(dv, base, 'f_rest_' + (2 * coeffsPerChannel + c));
+      }
+      k++;
+    }
+
+    return {
+      positions: positions.subarray(0, k * 3),
+      cov6: cov6.subarray(0, k * 6),
+      colors: colors.subarray(0, k * 4),
+      sh1: sh1.subarray(0, k * 3),
+      sh4: sh4.subarray(0, k * 3),
+      sh5: sh5.subarray(0, k * 3),
+      sh6: sh6.subarray(0, k * 3),
+      sh7: sh7.subarray(0, k * 3),
+      sh8: sh8.subarray(0, k * 3),
+      sh2: sh2.subarray(0, k * 3),
+      sh3: sh3.subarray(0, k * 3)
+    };
+  }
+
+  // Minimal LAS reader (point data record formats 0-3 and 6-8, the common ones).
+  // No LAZ: those are converted to LAS server-side. Coordinates are used as-is
+  // (the uploader is responsible for a shared, near-origin coordinate system).
+  function parseLAS(buffer) {
+    var dv = new DataView(buffer);
+    if (dv.getUint8(0) !== 0x4C || dv.getUint8(1) !== 0x41 ||
+        dv.getUint8(2) !== 0x53 || dv.getUint8(3) !== 0x46) {
+      throw new Error('not a LAS file (bad signature)');
+    }
+    var verMinor = dv.getUint8(25);
+    var offsetToPoints = dv.getUint32(96, true);
+    var pdrf = dv.getUint8(104) & 0x7f;
+    var pdrLen = dv.getUint16(105, true);
+    var count = dv.getUint32(107, true);
+    if (verMinor >= 4 && count === 0 && dv.getBigUint64) {
+      try { count = Number(dv.getBigUint64(247, true)); } catch (e) {}
+    }
+    var sx = dv.getFloat64(131, true), sy = dv.getFloat64(139, true), sz = dv.getFloat64(147, true);
+    var ox = dv.getFloat64(155, true), oy = dv.getFloat64(163, true), oz = dv.getFloat64(171, true);
+    if (!count || !pdrLen) throw new Error('LAS header reports no points');
+
+    var hasRGB = [2, 3, 5, 7, 8, 10].indexOf(pdrf) !== -1;
+    var rgbOff = (pdrf <= 5) ? 20 : 30;
+
+    var MAX = 4000000;
+    var step = count > MAX ? Math.ceil(count / MAX) : 1;
+    var n = Math.floor((count + step - 1) / step);
+    var positions = new Float32Array(n * 3);
+    var colors = hasRGB ? new Float32Array(n * 3) : null;
+
+    var k = 0;
+    for (var i = 0; i < count && k < n; i += step) {
+      var p = offsetToPoints + i * pdrLen;
+      if (p + 12 > buffer.byteLength) break;
+      // Raw X/Y/Z -> x/y/z, no axis swap and no recentering: consistent with
+      // PLYLoader, and the uploader owns the shared, near-origin coordinate
+      // system across all layers.
+      positions[k * 3]     = dv.getInt32(p, true) * sx + ox;
+      positions[k * 3 + 1] = dv.getInt32(p + 4, true) * sy + oy;
+      positions[k * 3 + 2] = dv.getInt32(p + 8, true) * sz + oz;
+      if (colors && p + rgbOff + 6 <= buffer.byteLength) {
+        var r = dv.getUint16(p + rgbOff, true);
+        var g = dv.getUint16(p + rgbOff + 2, true);
+        var b = dv.getUint16(p + rgbOff + 4, true);
+        var d = (r > 255 || g > 255 || b > 255) ? 65535 : 255;
+        colors[k * 3] = r / d; colors[k * 3 + 1] = g / d; colors[k * 3 + 2] = b / d;
+      }
+      k++;
+    }
+    return {
+      positions: k === n ? positions : positions.subarray(0, k * 3),
+      colors: colors ? (k === n ? colors : colors.subarray(0, k * 3)) : null
+    };
+  }
+
+  // Decode one lossless WebP entry into its raw RGBA pixel bytes. SOG's spec
+  // requires reading image data "as raw 8-bit integers with no gamma
+  // conversion" -- a plain canvas 2D readback matches that (no color
+  // management applied beyond default sRGB, same as any other WebP texture
+  // decode path in a browser).
+  function decodeWebpToImageData(bytes) {
+    return createImageBitmap(new Blob([bytes], { type: 'image/webp' })).then(function(bitmap) {
+      var canvas = (typeof OffscreenCanvas !== 'undefined')
+        ? new OffscreenCanvas(bitmap.width, bitmap.height)
+        : document.createElement('canvas');
+      if (!(canvas instanceof OffscreenCanvas)) { canvas.width = bitmap.width; canvas.height = bitmap.height; }
+      var ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(bitmap, 0, 0);
+      var img = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+      if (bitmap.close) bitmap.close();
+      return img;
+    });
+  }
+
+  // 3x3 world-space covariance Sigma = M*M^T, M = R(quat) * diag(sx,sy,sz),
+  // returned as its 6 unique symmetric entries [xx,xy,xz,yy,yz,zz]. Shared by
+  // every true-splat source (SOG, 3DGS-trained .ply). Verified by hand against
+  // two known cases (identity rotation -> diag(sx^2,sy^2,sz^2); 90 deg around Z
+  // swaps the x/y variances) before relying on it here.
+  function quatScaleToCovariance6(sx, sy, sz, w, x, y, z) {
+    var R00 = 1 - 2 * (y * y + z * z), R01 = 2 * (x * y - w * z), R02 = 2 * (x * z + w * y);
+    var R10 = 2 * (x * y + w * z), R11 = 1 - 2 * (x * x + z * z), R12 = 2 * (y * z - w * x);
+    var R20 = 2 * (x * z - w * y), R21 = 2 * (y * z + w * x), R22 = 1 - 2 * (x * x + y * y);
+    var M00 = R00 * sx, M01 = R01 * sy, M02 = R02 * sz;
+    var M10 = R10 * sx, M11 = R11 * sy, M12 = R12 * sz;
+    var M20 = R20 * sx, M21 = R21 * sy, M22 = R22 * sz;
+    return [
+      M00 * M00 + M01 * M01 + M02 * M02, // xx
+      M00 * M10 + M01 * M11 + M02 * M12, // xy
+      M00 * M20 + M01 * M21 + M02 * M22, // xz
+      M10 * M10 + M11 * M11 + M12 * M12, // yy
+      M10 * M20 + M11 * M21 + M12 * M22, // yz
+      M20 * M20 + M21 * M21 + M22 * M22  // zz
+    ];
+  }
+
+  // Decode a SOG (.sog) bundle -- PlayCanvas's "Spatially Ordered Gaussians"
+  // compressed container: a zip of meta.json + a handful of lossless WebP
+  // textures, each pixel holding quantized per-Gaussian data. Spec:
+  // https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/sog/
+  //
+  // Decodes position (means_l/means_u), scale+rotation (scales/quats), DC
+  // color+opacity (sh0) and, when present, the degree-1 view-dependent color
+  // term (shN, first 3 of its coefficients per channel only -- see
+  // SplatRenderer for why degree is capped there) -- everything
+  // SplatRenderer needs for true elliptical splat shading.
+  function parseSOG(buffer) {
+    return unzipBuffer(buffer).then(function(files) {
+      var names = Object.keys(files);
+      var metaName = names.filter(function(n) { return /(^|\/)meta\.json$/i.test(n); })[0];
+      if (!metaName) throw new Error('.sog archive has no meta.json');
+      var meta = JSON.parse(new TextDecoder('utf-8').decode(files[metaName]));
+
+      if (!meta.means || !meta.means.files || meta.means.files.length < 2) {
+        throw new Error('.sog meta.json is missing means.files');
+      }
+      if (!meta.sh0 || !meta.sh0.files || !meta.sh0.files[0] || !meta.sh0.codebook) {
+        throw new Error('.sog meta.json is missing sh0');
+      }
+      if (!meta.scales || !meta.scales.files || !meta.scales.files[0] || !meta.scales.codebook) {
+        throw new Error('.sog meta.json is missing scales');
+      }
+      if (!meta.quats || !meta.quats.files || !meta.quats.files[0]) {
+        throw new Error('.sog meta.json is missing quats');
+      }
+      var count = meta.count | 0;
+      if (!count) throw new Error('.sog meta.json reports zero Gaussians');
+
+      var dir = metaName.indexOf('/') !== -1 ? metaName.slice(0, metaName.lastIndexOf('/') + 1) : '';
+      var findFile = function(name) {
+        var key = names.filter(function(n) { return n === dir + name || n.split('/').pop() === name; })[0];
+        if (!key) throw new Error('.sog archive is missing "' + name + '"');
+        return files[key];
+      };
+
+      // shN (degree-1+ view-dependent color) is optional -- only decoded when
+      // the file actually has it.
+      var hasSHN = !!(meta.shN && meta.shN.files && meta.shN.files[0] && meta.shN.files[1] &&
+                       meta.shN.codebook && meta.shN.bands >= 1);
+      var corePromises = [
+        decodeWebpToImageData(findFile(meta.means.files[0])),  // means_l: lower 8 bits / axis
+        decodeWebpToImageData(findFile(meta.means.files[1])),  // means_u: upper 8 bits / axis
+        decodeWebpToImageData(findFile(meta.sh0.files[0])),    // sh0: RGB = DC color index, A = opacity
+        decodeWebpToImageData(findFile(meta.scales.files[0])), // scales: per-axis codebook index
+        decodeWebpToImageData(findFile(meta.quats.files[0]))   // quats: RGB = smallest-three, A = mode
+      ];
+      if (hasSHN) {
+        corePromises.push(decodeWebpToImageData(findFile(meta.shN.files[0]))); // shN_centroids: palette
+        corePromises.push(decodeWebpToImageData(findFile(meta.shN.files[1]))); // shN_labels: per-Gaussian index
+      }
+      return Promise.all(corePromises).then(function(imgs) {
+        var l = imgs[0].data, u = imgs[1].data, sh0 = imgs[2].data, sc = imgs[3].data, qt = imgs[4].data;
+        var shNCentroids = hasSHN ? imgs[5].data : null;
+        var shNCentroidsWidth = hasSHN ? imgs[5].width : 0;
+        var shNLabels = hasSHN ? imgs[6].data : null;
+        var shNCodebook = hasSHN ? meta.shN.codebook : null;
+        // Coefficients per channel in the FILE (3/8/15 for bands 1/2/3) --
+        // needed to compute the centroid texture's column stride even though
+        // only the first 8 (degree 1+2) are actually read below.
+        var shNCoeffsPerChannel = hasSHN ? ({ 1: 3, 2: 8, 3: 15 }[meta.shN.bands] || 3) : 0;
+        var shNMaxCoeff = Math.min(shNCoeffsPerChannel, 8);
+        var mins = meta.means.mins, maxs = meta.means.maxs;
+        var shCodebook = meta.sh0.codebook, scCodebook = meta.scales.codebook;
+        // Only skip truly zero-opacity Gaussians. A real splat scene relies on
+        // many individually low-opacity Gaussians stacking up via back-to-front
+        // alpha blending to read as a solid surface -- dropping anything under
+        // ~4% opacity (the old threshold) looked harmless splat-by-splat but
+        // removed exactly the contributors that fill the gaps between the
+        // higher-opacity ones, which is part of why the result looked like
+        // separated dots instead of a continuous surface. The actual
+        // performance budget is TRUE_SPLAT_MAX_POINTS/the decimation step
+        // above, not this filter.
+        var MIN_ALPHA = 1;
+
+        var lerp = function(a, b, t) { return a + (b - a) * t; };
+        var unlog = function(n) { return Math.sign(n) * (Math.exp(Math.abs(n)) - 1); };
+        var INV_SQRT2 = 1 / Math.SQRT2;
+
+        // Stride over the source rather than decoding every Gaussian and
+        // decimating afterwards -- saves the (otherwise wasted) decode work
+        // for whatever gets thrown away on a heavy file. SOG's own ordering
+        // ("Spatially Ordered Gaussians") means a strided subsample stays
+        // reasonably representative of the whole scene rather than just its
+        // first chunk.
+        //
+        // Capped against TRUE_SPLAT_MAX_POINTS (not the point-cloud
+        // approximation's higher SPLAT_MAX_POINTS) -- SOG always has
+        // scale/quat data and always goes through the true-splat renderer
+        // (_buildTrueSplats), never the plain-point fallback, so it must
+        // respect that renderer's (lower) performance budget.
+        var step = count > TRUE_SPLAT_MAX_POINTS ? Math.ceil(count / TRUE_SPLAT_MAX_POINTS) : 1;
+        // See parseSplatPLY's matching comment: compensate thinned-out
+        // splats' scale so survivors still cover the gaps left by their
+        // discarded neighbours, instead of reading as separated dots.
+        var scaleComp = step > 1 ? Math.cbrt(step) : 1;
+        var n = Math.floor((count + step - 1) / step);
+        var positions = new Float32Array(n * 3);
+        var cov6 = new Float32Array(n * 6);
+        var colors = new Float32Array(n * 4);
+        var sh1 = new Float32Array(n * 3), sh2 = new Float32Array(n * 3), sh3 = new Float32Array(n * 3);
+        var sh4 = new Float32Array(n * 3), sh5 = new Float32Array(n * 3), sh6 = new Float32Array(n * 3);
+        var sh7 = new Float32Array(n * 3), sh8 = new Float32Array(n * 3);
+        var shOut = [sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8];
+        var k = 0;
+        for (var i = 0; i < count; i += step) {
+          var o = i * 4; // ImageData is row-major RGBA, same (x,y) layout as the spec's i = x + y*W
+          var a8 = sh0[o + 3];
+          if (a8 < MIN_ALPHA) continue;
+
+          var qx = (u[o] << 8) | l[o];
+          var qy = (u[o + 1] << 8) | l[o + 1];
+          var qz = (u[o + 2] << 8) | l[o + 2];
+
+          positions[k * 3] = unlog(lerp(mins[0], maxs[0], qx / 65535));
+          // Gaussian-splat training pipelines commonly author +Y pointing
+          // down (ground), the opposite of three.js/this viewer's Y-up
+          // convention -- the same reason other splat viewers apply a
+          // correction rotation on load. Flipping Y ALONE was tried first,
+          // but a single-axis flip is a mirror reflection (determinant -1):
+          // it inverts the scene's chirality, which reads to a viewer as a
+          // left/right mirroring of any asymmetric content (text, faces,
+          // most real objects) even though X itself was never touched -- the
+          // classic "looks like a mirror image" effect. Flipping Y AND Z
+          // instead is a proper 180 degree rotation about X (determinant
+          // +1): same fix for up/down, no chirality inversion, X still
+          // genuinely untouched. The matching covariance fix-up is applied
+          // below, right after it's built.
+          positions[k * 3 + 1] = -unlog(lerp(mins[1], maxs[1], qy / 65535));
+          positions[k * 3 + 2] = -unlog(lerp(mins[2], maxs[2], qz / 65535));
+
+          var sx = Math.exp(scCodebook[sc[o]]) * scaleComp;
+          var sy = Math.exp(scCodebook[sc[o + 1]]) * scaleComp;
+          var sz = Math.exp(scCodebook[sc[o + 2]]) * scaleComp;
+
+          var qa = (qt[o] / 255 - 0.5) * 2.0 * INV_SQRT2;
+          var qb = (qt[o + 1] / 255 - 0.5) * 2.0 * INV_SQRT2;
+          var qc = (qt[o + 2] / 255 - 0.5) * 2.0 * INV_SQRT2;
+          var mode = qt[o + 3] - 252;
+          var t = qa * qa + qb * qb + qc * qc;
+          var qd = Math.sqrt(Math.max(0, 1 - t));
+          var qw, qx_, qy_, qz_;
+          if (mode === 0) { qw = qd; qx_ = qa; qy_ = qb; qz_ = qc; }
+          else if (mode === 1) { qw = qa; qx_ = qd; qy_ = qb; qz_ = qc; }
+          else if (mode === 2) { qw = qa; qx_ = qb; qy_ = qd; qz_ = qc; }
+          else { qw = qa; qx_ = qb; qy_ = qc; qz_ = qd; }
+
+          var c6 = quatScaleToCovariance6(sx, sy, sz, qw, qx_, qy_, qz_);
+          // Sigma' = F*Sigma*F^T for F = diag(1,-1,-1) (180 deg about X): see
+          // the position fix-up comment above. xy/xz each touch exactly one
+          // flipped axis (sign flips); yz touches two (signs cancel).
+          cov6[k * 6] = c6[0];       // xx
+          cov6[k * 6 + 1] = -c6[1];  // xy
+          cov6[k * 6 + 2] = -c6[2];  // xz
+          cov6[k * 6 + 3] = c6[3];   // yy
+          cov6[k * 6 + 4] = c6[4];   // yz
+          cov6[k * 6 + 5] = c6[5];   // zz
+
+          // Raw DC coefficient -- NOT yet scaled by SH_C0 or offset by 0.5;
+          // the vertex shader does that (and adds the degree-1 term below)
+          // every frame, since the degree-1 contribution depends on view
+          // direction.
+          colors[k * 4]     = shCodebook[sh0[o]];
+          colors[k * 4 + 1] = shCodebook[sh0[o + 1]];
+          colors[k * 4 + 2] = shCodebook[sh0[o + 2]];
+          colors[k * 4 + 3] = a8 / 255;
+
+          if (hasSHN) {
+            var label = shNLabels[o] | (shNLabels[o + 1] << 8);
+            var colBase = (label % 64) * shNCoeffsPerChannel;
+            var rowBase = Math.floor(label / 64) * shNCentroidsWidth;
+            // Coefficient index c here = CUDA sh[c+1] (sh1=c0, ..., sh8=c7),
+            // same ascending (coefficient-index, then R/G/B) order as
+            // parseSplatPLY's f_rest_* reader.
+            for (var c = 0; c < shNMaxCoeff; c++) {
+              var px = (rowBase + colBase + c) * 4;
+              var dst = shOut[c];
+              dst[k * 3] = shNCodebook[shNCentroids[px]];
+              dst[k * 3 + 1] = shNCodebook[shNCentroids[px + 1]];
+              dst[k * 3 + 2] = shNCodebook[shNCentroids[px + 2]];
+            }
+          }
+          k++;
+        }
+
+        return {
+          positions: positions.subarray(0, k * 3),
+          cov6: cov6.subarray(0, k * 6),
+          colors: colors.subarray(0, k * 4),
+          sh1: sh1.subarray(0, k * 3),
+          sh2: sh2.subarray(0, k * 3),
+          sh3: sh3.subarray(0, k * 3),
+          sh4: sh4.subarray(0, k * 3),
+          sh5: sh5.subarray(0, k * 3),
+          sh6: sh6.subarray(0, k * 3),
+          sh7: sh7.subarray(0, k * 3),
+          sh8: sh8.subarray(0, k * 3)
+        };
+      });
+    });
+  }
+
+  // Adaptive point size: a flat "modelRadius * constant" guess looks fine
+  // for a dense LIDAR/photogrammetry scan, but a far sparser point set
+  // (e.g. one point per Gaussian in a splat scene, vs. millions of samples
+  // over the same volume) leaves visible gaps with that same guess -- looks
+  // like scattered dots instead of a covered surface. Derive the size
+  // instead from actual point density: the average spacing implied by this
+  // cloud's own bounding-box volume and point count, with a small overlap
+  // factor so neighbouring points' discs touch rather than gap.
+  SpatialViewerApp.prototype._adaptivePointSize = function(geom, count) {
+    var size = (this.modelRadius || 20) * 0.0012;
+    if (geom.boundingBox && count > 1) {
+      var bsize = new THREE.Vector3();
+      geom.boundingBox.getSize(bsize);
+      var volume = Math.max(bsize.x, 1e-6) * Math.max(bsize.y, 1e-6) * Math.max(bsize.z, 1e-6);
+      var spacing = Math.cbrt(volume / count);
+      if (isFinite(spacing) && spacing > 0) {
+        var floor = (this.modelRadius || 20) * 0.0003, ceil = (this.modelRadius || 20) * 0.03;
+        size = Math.min(ceil, Math.max(floor, spacing * 1.8));
+      }
+    }
+    return size;
+  };
+
+  SpatialViewerApp.prototype._buildPointCloud = function(data) {
+    var geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(data.positions), 3));
+    geom.computeBoundingBox();
+    var size = this._adaptivePointSize(geom, data.positions.length / 3);
+
+    var mat;
+    if (data.colors) {
+      geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(data.colors), 3));
+      mat = new THREE.PointsMaterial({ size: size, vertexColors: true, sizeAttenuation: true });
+    } else {
+      mat = new THREE.PointsMaterial({ size: size, color: 0x9aa7b4, sizeAttenuation: true });
+    }
+    geom.computeBoundingSphere();
+    return new THREE.Points(geom, mat);
+  };
+
+  // Max Gaussians/vertices actually submitted to the GPU for a splat-kind
+  // layer (.ply/.splat/.ksplat/.sog). Heavy scenes had NO cap at all before
+  // this, unlike LAS point clouds (capped at 4M in parseLAS) -- the main
+  // cause of "very slow on heavy models". Splats also tend to render as
+  // bigger discs than LAS's tiny dots (see _adaptivePointSize), so the
+  // fill-rate cost per point is higher too; the cap is set lower than LAS's.
+  var SPLAT_MAX_POINTS = 2000000;
+
+  // Strided (not random) subsample: cheap, and for spatially-ordered data
+  // (SOG's own design, see decodeWebpToImageData's caller) still reasonably
+  // representative of the whole cloud rather than clustering losses in one area.
+  function decimateXYZ(positions, colors, maxCount) {
+    var count = positions.length / 3;
+    if (count <= maxCount) return { positions: positions, colors: colors };
+    var step = Math.ceil(count / maxCount);
+    var n = Math.floor((count + step - 1) / step);
+    var outP = new Float32Array(n * 3);
+    var outC = colors ? new Float32Array(n * 3) : null;
+    var k = 0;
+    for (var i = 0; i < count; i += step) {
+      outP[k * 3] = positions[i * 3]; outP[k * 3 + 1] = positions[i * 3 + 1]; outP[k * 3 + 2] = positions[i * 3 + 2];
+      if (outC) { outC[k * 3] = colors[i * 3]; outC[k * 3 + 1] = colors[i * 3 + 1]; outC[k * 3 + 2] = colors[i * 3 + 2]; }
+      k++;
+    }
+    return { positions: outP.subarray(0, k * 3), colors: outC ? outC.subarray(0, k * 3) : null };
+  }
+
+  // Gaussian-splat-kind rendering (.ply/.splat/.ksplat/.sog): same adaptive
+  // point sizing as _buildPointCloud, plus a soft round falloff instead of a
+  // hard square/disc, loosely "inspired by" how dedicated splat renderers
+  // (e.g. SuperSplat) blend overlapping splats -- this is still a point-cloud
+  // approximation, not true per-Gaussian covariance shading (no scale/
+  // rotation/SH data is decoded anywhere in this viewer), but the falloff
+  // reads much closer to a real splat surface than a grid of hard dots, and
+  // the early `discard` on the PointsMaterial's unused square corners trims
+  // some otherwise-wasted fill-rate on top of the point-count cap above.
+  SpatialViewerApp.prototype._buildSplatPoints = function(rawPositions, rawColors) {
+    var decimated = decimateXYZ(rawPositions, rawColors, SPLAT_MAX_POINTS);
+
+    var geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(decimated.positions), 3));
+    geom.computeBoundingBox();
+    var size = this._adaptivePointSize(geom, decimated.positions.length / 3);
+
+    var mat = decimated.colors
+      ? new THREE.PointsMaterial({ size: size, vertexColors: true, sizeAttenuation: true })
+      : new THREE.PointsMaterial({ size: size, color: 0x9aa7b4, sizeAttenuation: true });
+    if (decimated.colors) geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(decimated.colors), 3));
+
+    // Leaves three.js's own vertex shader (and its size-attenuation / pixel
+    // ratio uniform bookkeeping, refreshed automatically every frame) alone
+    // entirely -- only the fragment shader gets a few extra lines, via the
+    // same hook THREE.Material itself documents for exactly this kind of
+    // small, targeted customization.
+    mat.onBeforeCompile = function(shader) {
+      shader.fragmentShader = shader.fragmentShader.replace(
+        'void main() {',
+        'void main() {\n' +
+        '\tvec2 _splatUv = gl_PointCoord * 2.0 - 1.0;\n' +
+        '\tfloat _splatD2 = dot(_splatUv, _splatUv);\n' +
+        '\tif (_splatD2 > 1.0) discard;\n' +
+        '\tfloat _splatFalloff = exp(-_splatD2 * 4.0);\n'
+      ).replace(
+        '#include <dithering_fragment>',
+        'gl_FragColor.a *= _splatFalloff;\n\t#include <dithering_fragment>'
+      );
+    };
+    mat.transparent = true;
+    mat.depthWrite = false;
+
+    geom.computeBoundingSphere();
+    return new THREE.Points(geom, mat);
+  };
+
+  // ---- True Gaussian-splat rendering --------------------------------------
+  // Per-splat 3D->2D covariance projection (EWA splatting, the technique
+  // behind the original "3D Gaussian Splatting" paper and every WebGL splat
+  // viewer, including SuperSplat/PlayCanvas) instead of a plain colored
+  // point. Each Gaussian is drawn as a camera-facing quad sized/oriented to
+  // its own projected covariance ellipse; the fragment shader evaluates the
+  // actual 2D Gaussian falloff inside it. Depth-sorted back-to-front for
+  // correct alpha blending (see SplatRenderer.resort), throttled rather than
+  // re-sorted every single frame -- see maybeResort.
+  //
+  // Lower point budget than the plain point-cloud path: each splat carries
+  // 37 floats (vs. 6-7 for a plain point) and the vertex shader does real
+  // per-instance matrix math plus a spherical-harmonics evaluation, so the
+  // same "heavy model" budget costs more here. Capped at degree-2 SH (8 of
+  // up to 15 possible per-channel coefficients) rather than the full
+  // degree-3 a file may contain: each additional band roughly doubles the
+  // per-splat payload (and so the resort/reorder cost, already this
+  // renderer's single most expensive operation -- see SplatRenderer.resort),
+  // for steeply diminishing visual return past the first couple of bands.
+  // Raised from the original "same resort-cost budget as before SH" value
+  // (420,000) to 1,000,000 at the user's explicit request, after confirming
+  // speed was still acceptable at the lower cap -- this knowingly costs
+  // roughly 2.4x the resort/reorder time (linear in splat count at a fixed
+  // stride), paid once per idle-settle (see maybeResort's debounce), not
+  // per frame while navigating.
+  var TRUE_SPLAT_MAX_POINTS = 1000000;
+
+  var SPLAT_VERTEX_SHADER = [
+    'precision highp float;',
+    'attribute vec2 corner;',
+    'attribute vec3 center;',
+    'attribute vec3 covA;', // Sxx, Sxy, Sxz
+    'attribute vec3 covB;', // Syy, Syz, Szz
+    'attribute vec4 colorOpacity;', // rgb = RAW DC coefficient (not yet scaled/offset), a = opacity
+    // Spherical harmonics coefficients, degree 1 (sh1-3) and 2 (sh4-8),
+    // rgb per coefficient, zero when the source has no (or less) view-
+    // dependent data than this. Indices/signs match the reference 3DGS
+    // computeColorFromSH: sh[1]=y-term, sh[2]=z-term, sh[3]=x-term (degree
+    // 1); sh[4..8] per the degree-2 term below.
+    'attribute vec3 sh1;',
+    'attribute vec3 sh2;',
+    'attribute vec3 sh3;',
+    'attribute vec3 sh4;',
+    'attribute vec3 sh5;',
+    'attribute vec3 sh6;',
+    'attribute vec3 sh7;',
+    'attribute vec3 sh8;',
+    'uniform vec2 focal;',    // fx, fy in pixels
+    'uniform vec2 viewport;', // drawing-buffer size in pixels
+    'varying vec4 vColor;',
+    'varying vec2 vPos;',
+    'void main() {',
+    '  vec4 mvPosition = modelViewMatrix * vec4(center, 1.0);',
+    '  float zc = mvPosition.z;',
+    '  if (zc > -0.05) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }', // behind/at the camera: clip it
+    '  mat3 Vrk = mat3(',
+    '    covA.x, covA.y, covA.z,',
+    '    covA.y, covB.x, covB.y,',
+    '    covA.z, covB.y, covB.z',
+    '  );',
+    '  mat3 W = mat3(modelViewMatrix);',
+    '  mat3 J = mat3(',
+    '    focal.x / -zc, 0.0, 0.0,',
+    '    0.0, focal.y / -zc, 0.0,',
+    '    (focal.x * mvPosition.x) / (zc * zc), (focal.y * mvPosition.y) / (zc * zc), 0.0',
+    '  );',
+    '  mat3 T = J * W;',
+    '  mat3 cov2d = T * Vrk * transpose(T);',
+    '  float a = cov2d[0][0] + 0.25;', // + a small, constant px^2 dilation: numerical
+    '  float b = cov2d[0][1];',        // floor against degenerate/zero-size splats, and a
+    '  float c = cov2d[1][1] + 0.25;', // touch of antialiasing (same trick as common 3DGS renderers)
+    '  float mid = 0.5 * (a + c);',
+    '  float diff = 0.5 * (a - c);',
+    '  float rad = sqrt(max(0.0, diff * diff + b * b));',
+    '  float lambda1 = mid + rad;',
+    '  float lambda2 = max(mid - rad, 0.01);',
+    '  vec2 eig1 = (abs(b) > 1e-4) ? normalize(vec2(b, lambda1 - a)) : (a >= c ? vec2(1.0, 0.0) : vec2(0.0, 1.0));',
+    '  vec2 eig2 = vec2(-eig1.y, eig1.x);',
+    '  float r1 = min(sqrt(lambda1) * 3.0, 2048.0);', // 3 sigma, clamped against pathological scales
+    '  float r2 = min(sqrt(lambda2) * 3.0, 2048.0);',
+    '  vec2 screenOffsetPx = corner.x * eig1 * r1 + corner.y * eig2 * r2;',
+    '  vec4 clip = projectionMatrix * mvPosition;',
+    '  clip.xy += screenOffsetPx * (2.0 / viewport) * clip.w;',
+    '  gl_Position = clip;',
+    // View-dependent color: ported from the reference 3DGS computeColorFromSH
+    // (degree 1+2 -- see the TRUE_SPLAT_MAX_POINTS comment on why it stops
+    // there). `dir` is the world-space direction from the splat to the
+    // camera, matching the reference's `dir = pos - campos` (both built-in
+    // uniforms three.js provides to every ShaderMaterial).
+    '  vec3 worldCenter = (modelMatrix * vec4(center, 1.0)).xyz;',
+    '  vec3 dir = normalize(worldCenter - cameraPosition);',
+    '  float dx = dir.x, dy = dir.y, dz = dir.z;',
+    '  float dxx = dx * dx, dyy = dy * dy, dzz = dz * dz;',
+    '  float dxy = dx * dy, dyz = dy * dz, dxz = dx * dz;',
+    '  vec3 col = 0.28209479177387814 * colorOpacity.rgb',
+    '    + 0.4886025119029199 * (-dy * sh1 + dz * sh2 - dx * sh3)',
+    '    + 1.0925484305920792 * dxy * sh4',
+    '    - 1.0925484305920792 * dyz * sh5',
+    '    + 0.31539156525252005 * (2.0 * dzz - dxx - dyy) * sh6',
+    '    - 1.0925484305920792 * dxz * sh7',
+    '    + 0.5462742152960396 * (dxx - dyy) * sh8',
+    '    + 0.5;',
+    '  vColor = vec4(clamp(col, 0.0, 1.0), colorOpacity.a);',
+    '  vPos = corner * 3.0;', // corner in {-1..1} along each ellipse axis -> *3 = "how many sigma", since r1/r2 above already encode the 3-sigma extent
+    '}'
+  ].join('\n');
+
+  var SPLAT_FRAGMENT_SHADER = [
+    'precision highp float;',
+    'uniform float opacity;',
+    // 0 (default, every non-glTF source): the reconstructed color is
+    // already display-referred (matches "srgb_rec709_display" per the
+    // KHR_gaussian_splatting spec, the same convention .sog/.ply already
+    // assume) -- used as-is. 1: the source declared "lin_rec709_display"
+    // (linear-light) color -- gl_FragColor is written with no further
+    // encoding pass (see the note on custom ShaderMaterial bypassing
+    // three.js's output-encoding pipeline), so the standard sRGB OETF is
+    // applied here instead, once per fragment, before writing it out.
+    'uniform float linearColor;',
+    'varying vec4 vColor;',
+    'varying vec2 vPos;',
+    'void main() {',
+    '  float r2 = dot(vPos, vPos);',
+    '  if (r2 > 9.0) discard;', // outside the 3-sigma ellipse
+    '  float falloff = exp(-0.5 * r2);',
+    '  float a = vColor.a * falloff * opacity;',
+    '  if (a < 0.01) discard;',
+    '  vec3 outColor = vColor.rgb;',
+    '  if (linearColor > 0.5) {',
+    '    vec3 lo = outColor * 12.92;',
+    '    vec3 hi = 1.055 * pow(outColor, vec3(1.0 / 2.4)) - 0.055;',
+    '    outColor = mix(lo, hi, step(vec3(0.0031308), outColor));',
+    '  }',
+    '  gl_FragColor = vec4(outColor, a);',
+    '}'
+  ].join('\n');
+
+  // positions: Float32Array(n*3); cov6: Float32Array(n*6) [xx,xy,xz,yy,yz,zz];
+  // colors: Float32Array(n*4) [r,g,b,a] -- rgb is the RAW DC coefficient (not
+  // yet scaled/offset, see parseSOG/parseSplatPLY), a is opacity in its final
+  // 0..1 form; sh1..sh8: Float32Array(n*3) each, degree-1 (sh1-3) and
+  // degree-2 (sh4-8) SH coefficients (zero-filled when the source has no, or
+  // less, view-dependent data than this); colorSpaceLinear: true only for a
+  // glTF KHR_gaussian_splatting primitive declaring "lin_rec709_display"
+  // (see SPLAT_FRAGMENT_SHADER) -- falsy/omitted for every other source.
+  function SplatRenderer(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear) {
+    var n = positions.length / 3;
+    this.count = n;
+
+    // All per-instance data lives in ONE interleaved buffer (center.xyz,
+    // covA.xyz, covB.xyz, colorOpacity.xyzw, sh1.xyz .. sh8.xyz -- 37
+    // floats/splat). A resort reorders every splat's data every time it
+    // runs; profiling showed a single combined copy loop over one contiguous
+    // buffer is roughly 2x faster than the same copy spread across several
+    // separate attribute arrays (cache locality -- one run per splat instead
+    // of several smaller, scattered ones), which matters a lot given resort
+    // is already the single most expensive operation this renderer does.
+    var STRIDE = 37;
+    this.STRIDE = STRIDE;
+    var shAll = [sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8];
+    var src = new Float32Array(n * STRIDE);
+    for (var i0 = 0; i0 < n; i0++) {
+      var o0 = i0 * STRIDE;
+      src[o0] = positions[i0 * 3]; src[o0 + 1] = positions[i0 * 3 + 1]; src[o0 + 2] = positions[i0 * 3 + 2];
+      src[o0 + 3] = cov6[i0 * 6]; src[o0 + 4] = cov6[i0 * 6 + 1]; src[o0 + 5] = cov6[i0 * 6 + 2];
+      src[o0 + 6] = cov6[i0 * 6 + 3]; src[o0 + 7] = cov6[i0 * 6 + 4]; src[o0 + 8] = cov6[i0 * 6 + 5];
+      src[o0 + 9] = colors[i0 * 4]; src[o0 + 10] = colors[i0 * 4 + 1];
+      src[o0 + 11] = colors[i0 * 4 + 2]; src[o0 + 12] = colors[i0 * 4 + 3];
+      for (var sc = 0; sc < 8; sc++) {
+        var so = o0 + 13 + sc * 3, sh = shAll[sc];
+        src[so] = sh[i0 * 3]; src[so + 1] = sh[i0 * 3 + 1]; src[so + 2] = sh[i0 * 3 + 2];
+      }
+    }
+    this.srcInterleaved = src;
+
+    var geom = new THREE.InstancedBufferGeometry();
+    geom.instanceCount = n;
+    geom.setAttribute('corner', new THREE.BufferAttribute(new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), 2));
+    geom.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 2, 1, 3]), 1));
+
+    this.dataBuffer = new THREE.InstancedInterleavedBuffer(new Float32Array(n * STRIDE), STRIDE, 1);
+    geom.setAttribute('center', new THREE.InterleavedBufferAttribute(this.dataBuffer, 3, 0));
+    geom.setAttribute('covA', new THREE.InterleavedBufferAttribute(this.dataBuffer, 3, 3));
+    geom.setAttribute('covB', new THREE.InterleavedBufferAttribute(this.dataBuffer, 3, 6));
+    geom.setAttribute('colorOpacity', new THREE.InterleavedBufferAttribute(this.dataBuffer, 4, 9));
+    for (var sa = 0; sa < 8; sa++) {
+      geom.setAttribute('sh' + (sa + 1), new THREE.InterleavedBufferAttribute(this.dataBuffer, 3, 13 + sa * 3));
+    }
+
+    // World-space extent of the actual splat centers. This geometry has no
+    // attribute literally named "position" (the per-vertex quad corner is
+    // "corner", per-instance offsets only exist inside the vertex shader),
+    // so BOTH of these must be set explicitly -- three.js's own
+    // computeBoundingBox()/computeBoundingSphere() look specifically for
+    // "position" and silently produce an empty/degenerate box otherwise.
+    // That empty box is what Box3.expandByObject (used by onModelLoaded to
+    // frame the camera and fit the near/far clip planes) would then
+    // silently copy in -- union'd into a scene that's otherwise empty, it
+    // collapses the whole framing to onModelLoaded's generic "model
+    // bounding box is not finite" fallback (centered at the origin,
+    // maxDim=20) regardless of this layer's real size. That mismatch is
+    // exactly what produced "huge, disconnected" splats (camera framed far
+    // too close relative to the real scene scale) and splats disappearing
+    // past an incorrectly-near far clip plane as soon as the camera moved
+    // away from the lucky initial position -- fixed by giving three.js the
+    // real extent for both.
+    var minX = Infinity, minY = Infinity, minZ = Infinity;
+    var maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (var i = 0; i < n; i++) {
+      var px = positions[i * 3], py = positions[i * 3 + 1], pz = positions[i * 3 + 2];
+      if (px < minX) minX = px; if (px > maxX) maxX = px;
+      if (py < minY) minY = py; if (py > maxY) maxY = py;
+      if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
+    }
+    geom.boundingBox = new THREE.Box3(new THREE.Vector3(minX, minY, minZ), new THREE.Vector3(maxX, maxY, maxZ));
+    geom.boundingSphere = new THREE.Sphere();
+    geom.boundingBox.getBoundingSphere(geom.boundingSphere);
+    // Splat centers aren't the full visual extent -- each one is actually
+    // drawn as a quad up to 3-sigma wide around its center. Pad the culling
+    // radius a bit so splats right at the edge of the cloud don't get
+    // clipped out just because their center (not their visible edge) left
+    // the frustum/sphere first.
+    geom.boundingSphere.radius *= 1.15;
+
+    var mat = new THREE.ShaderMaterial({
+      uniforms: {
+        focal: { value: new THREE.Vector2(1000, 1000) },
+        viewport: { value: new THREE.Vector2(1000, 1000) },
+        opacity: { value: 1.0 },
+        linearColor: { value: colorSpaceLinear ? 1.0 : 0.0 }
+      },
+      vertexShader: SPLAT_VERTEX_SHADER,
+      fragmentShader: SPLAT_FRAGMENT_SHADER,
+      transparent: true,
+      // Explicit, even though it's three.js's own default: back-to-front
+      // depth-sorted splats only composite correctly under standard "over"
+      // blending, so this is pinned rather than left implicit.
+      blending: THREE.NormalBlending,
+      depthWrite: false,
+      depthTest: true
+    });
+
+    this.mesh = new THREE.Mesh(geom, mat);
+    // The real per-splat position only exists after the vertex shader's
+    // GPU-side billboard math -- THREE.Mesh's default CPU raycast tests the
+    // (meaningless, 4-vertex) base quad instead, so disable it rather than
+    // let it report wrong/spurious hits. Lasso/pin/measurement tools simply
+    // cannot target a true-splat layer; same trade-off every WebGL splat
+    // viewer makes, since none of them are CPU-raycastable either.
+    this.mesh.raycast = function() {};
+    this.mesh.frustumCulled = true;
+
+    this._order = new Uint32Array(n);
+    for (var oi = 0; oi < n; oi++) this._order[oi] = oi;
+    this._depths = new Float32Array(n);
+    this._bucketOf = new Uint32Array(n);
+    // Counting sort is O(n + buckets): raising this is one bigger
+    // fixed-size pass per resort, not more per-splat work, so it's
+    // effectively free at this renderer's point counts. A coarser bucket
+    // count left splats sharing a bucket (common in a thin depth slice,
+    // e.g. a wall viewed at a shallow angle) blended in arbitrary order
+    // relative to each other -- small but visible blending artifacts in
+    // dense regions.
+    this._BUCKETS = 65536;
+    this._counts = new Uint32Array(this._BUCKETS + 1);
+    this._tmpMatrix = new THREE.Matrix4();
+    this._lastSeenPos = null;
+    this._lastSeenQuat = null;
+    this._idleSince = -Infinity; // forces a sort on the very first updateFrame, even with zero camera movement
+    this._idleDelayMs = 140;
+    this._dirty = true;
+    this._moveEpsSq = 1e-6;
+
+    this._applyOrder(this._order); // initial fill, unsorted (still correct, just not depth-ordered until the first resort)
+  }
+
+  // Copies source data into the GPU-bound interleaved buffer in the given
+  // draw order (order[slot] = source splat index), as one contiguous
+  // per-splat run (see the constructor's note on why this is interleaved).
+  SplatRenderer.prototype._applyOrder = function(order) {
+    var n = this.count, STRIDE = this.STRIDE;
+    var src = this.srcInterleaved, dst = this.dataBuffer.array;
+    for (var slot = 0; slot < n; slot++) {
+      var so = order[slot] * STRIDE, doff = slot * STRIDE;
+      for (var c = 0; c < STRIDE; c++) dst[doff + c] = src[so + c];
+    }
+    this.dataBuffer.needsUpdate = true;
+  };
+
+  // O(n) back-to-front depth sort via bucket/counting sort (never a
+  // comparator-based Array.sort -- too slow at a million-plus elements to
+  // run on the main thread at interactive rates). Buckets the view-space
+  // depth of every splat, counting-sorts by bucket, then physically
+  // reorders the interleaved GPU buffer into that order. Reordering the
+  // full per-splat record (not just a lightweight index) costs more per
+  // call, but keeps the shader simple (no data-texture indirection) --
+  // affordable specifically because resort calls are debounced on camera
+  // idle, not run every frame (see maybeResort).
+  SplatRenderer.prototype.resort = function(camera) {
+    var n = this.count;
+    if (n < 2) return;
+    var mv = this._tmpMatrix.multiplyMatrices(camera.matrixWorldInverse, this.mesh.matrixWorld);
+    var e = mv.elements;
+    var e2 = e[2], e6 = e[6], e10 = e[10], e14 = e[14];
+    var src = this.srcInterleaved, STRIDE = this.STRIDE, depths = this._depths;
+    var minD = Infinity, maxD = -Infinity;
+    for (var i = 0; i < n; i++) {
+      var o = i * STRIDE;
+      var d = e2 * src[o] + e6 * src[o + 1] + e10 * src[o + 2] + e14;
+      depths[i] = d;
+      if (d < minD) minD = d;
+      if (d > maxD) maxD = d;
+    }
+    var range = Math.max(1e-6, maxD - minD);
+    var BUCKETS = this._BUCKETS, bucketOf = this._bucketOf, counts = this._counts;
+    counts.fill(0);
+    for (var j = 0; j < n; j++) {
+      var bk = Math.min(BUCKETS - 1, Math.max(0, ((depths[j] - minD) / range * BUCKETS) | 0));
+      bucketOf[j] = bk;
+      counts[bk + 1]++;
+    }
+    for (var bi = 0; bi < BUCKETS; bi++) counts[bi + 1] += counts[bi];
+    // Ascending bucket = most negative view-space Z first = farthest first
+    // = correct back-to-front order for standard "over" alpha blending.
+    var cursor = counts.slice();
+    var order = this._order;
+    for (var k = 0; k < n; k++) {
+      var b = bucketOf[k];
+      order[cursor[b]++] = k;
+    }
+    this._applyOrder(order);
+  };
+
+  // Resorts on IDLE, not on movement: a full resort reorders every splat's
+  // attributes (measured ~70-150ms at this renderer's point budget, mostly
+  // the attribute copy, not the O(n) bucket sort itself -- far too slow to
+  // run on every frame a moving camera would otherwise demand). Sorting
+  // *while* the camera is actively moving would mean a multi-frame stall
+  // repeating throughout the whole gesture; instead this waits for the
+  // camera to stop changing for _idleDelayMs before sorting once. The
+  // visible cost is a slightly stale blend order *during* motion (far less
+  // noticeable than a stutter) and a single settle-time hitch when the user
+  // stops to look, not a recurring one while they're actively navigating.
+  SplatRenderer.prototype.maybeResort = function(camera) {
+    var now = (window.performance && performance.now) ? performance.now() : Date.now();
+    var p = camera.position, q = camera.quaternion;
+    var moved = !this._lastSeenPos ||
+      this._lastSeenPos.distanceToSquared(p) > this._moveEpsSq ||
+      (1 - Math.abs(this._lastSeenQuat.dot(q))) > 1e-6;
+
+    if (moved) {
+      this._lastSeenPos = (this._lastSeenPos || new THREE.Vector3()).copy(p);
+      this._lastSeenQuat = (this._lastSeenQuat || new THREE.Quaternion()).copy(q);
+      this._idleSince = now;
+      this._dirty = true;
+      return;
+    }
+    if (!this._dirty) return; // already sorted for this resting view
+    if (now - this._idleSince < this._idleDelayMs) return; // still inside the debounce window
+
+    this.resort(camera);
+    this._dirty = false;
+  };
+
+  SplatRenderer.prototype.updateFrame = function(camera, viewportW, viewportH) {
+    var u = this.mesh.material.uniforms;
+    u.focal.value.set(
+      camera.projectionMatrix.elements[0] * viewportW * 0.5,
+      camera.projectionMatrix.elements[5] * viewportH * 0.5
+    );
+    u.viewport.value.set(viewportW, viewportH);
+    this.maybeResort(camera);
+  };
+
+  // Builds the renderer, registers it for the per-frame focal/sort updates
+  // (see the render loop in initThree), and returns the THREE.Mesh to add
+  // to the scene -- same call shape as _buildSplatPoints/_buildPointCloud.
+  SpatialViewerApp.prototype._buildTrueSplats = function(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear) {
+    var splat = new SplatRenderer(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear);
+    this._splatRenderers = this._splatRenderers || [];
+    this._splatRenderers.push(splat);
+    return splat.mesh;
+  };
+
   SpatialViewerApp.prototype._parseModel = function(buffer, format) {
     var self = this;
     self.showLoader('Parsing 3D geometry...');
 
-    if (isZipBuffer(buffer)) {
+    // .sog is itself a zip (meta.json + WebP textures) -- must be checked
+    // before the generic isZipBuffer/_parseBundle branch below, which would
+    // otherwise mistake it for an OBJ/glTF/PLY archive and reject it.
+    if (format === 'sog') {
+      // Scale + rotation are required core fields in the SOG spec (unlike
+      // shN), so a conformant .sog always has what true-splat rendering needs.
+      parseSOG(buffer).then(function(data) {
+        self.onModelLoaded(self._buildTrueSplats(data.positions, data.cov6, data.colors,
+          data.sh1, data.sh2, data.sh3, data.sh4, data.sh5, data.sh6, data.sh7, data.sh8));
+      }).catch(function(err) {
+        console.error('[SpatialViewer] .sog parse failed:', err);
+        self._parseError('gaussian splat (.sog) unreadable: ' + (err && err.message || err));
+      });
+    } else if (isZipBuffer(buffer)) {
       self._parseBundle(buffer);
     } else if (format === 'glb' || format === 'gltf') {
       self._parseGltf(buffer);
     } else if (format === 'obj') {
       self.onModelLoaded(new THREE.OBJLoader().parse(new TextDecoder('utf-8').decode(buffer)));
     } else if (format === 'ply' || format === 'gaussian_splat' || format === 'splat' || format === 'ksplat') {
-      var geom = new THREE.PLYLoader().parse(buffer);
-      geom.computeVertexNormals();
-      var mat = geom.hasAttribute('color')
-        ? new THREE.PointsMaterial({ size: 0.05, vertexColors: true })
-        : new THREE.PointsMaterial({ size: 0.05, color: 0x38bdf8 });
-      self.onModelLoaded(new THREE.Points(geom, mat));
+      // Try true-splat data first (scale_*/rot_*/opacity/f_dc_* -- a 3DGS-
+      // trained .ply); parseSplatPLY returns null (not an error) when those
+      // properties aren't present, e.g. a plain colored point-cloud .ply
+      // with no Gaussian training data -- fall back to the point-cloud
+      // approximation for that case, same as before.
+      var splatData = null;
+      try { splatData = parseSplatPLY(buffer); }
+      catch (e) { console.warn('[SpatialViewer] 3DGS .ply parse failed, falling back to point cloud:', e); }
+
+      if (splatData) {
+        self.onModelLoaded(self._buildTrueSplats(splatData.positions, splatData.cov6, splatData.colors,
+          splatData.sh1, splatData.sh2, splatData.sh3, splatData.sh4, splatData.sh5, splatData.sh6, splatData.sh7, splatData.sh8));
+      } else {
+        var plyGeom = new THREE.PLYLoader().parse(buffer);
+        var plyPos = plyGeom.getAttribute('position').array;
+        var plyCol = plyGeom.hasAttribute('color') ? plyGeom.getAttribute('color').array : null;
+        self.onModelLoaded(self._buildSplatPoints(plyPos, plyCol));
+      }
+    } else if (format === 'las' || format === 'laz' || format === 'e57') {
+      try {
+        self.onModelLoaded(self._buildPointCloud(parseLAS(buffer)));
+      } catch (e) {
+        console.error('[SpatialViewer] LAS parse failed:', e);
+        self._parseError('point cloud unreadable: ' + (e && e.message || e));
+      }
     } else if (format === 'ifc') {
       self.parseIfcBuffer(buffer);
+    } else if (self._loadingLayerId != null) {
+      self._parseError('unsupported layer format: ' + format);
     } else {
       self.hideLoader();
       self.createDemoModel();
@@ -1018,10 +2326,10 @@
       if (glb) { self._parseGltf(toArrayBuffer(files[glb])); return; }
       if (gltf) { self._loadGltfBundle(files, gltf); return; }
       if (ply) { self._parseModel(toArrayBuffer(files[ply]), 'ply'); return; }
-      self.showLoader('The archive contains no .obj, .glb, .gltf or .ply file.');
+      self._parseError('the archive contains no .obj, .glb, .gltf or .ply file');
     }).catch(function(err) {
       console.error('[SpatialViewer] bundle error:', err);
-      self.showLoader('Could not open the model archive: ' + (err && err.message || err) + '.');
+      self._parseError('archive error: ' + (err && err.message || err));
     });
   };
 
@@ -1093,7 +2401,7 @@
       self.onModelLoaded(loader.parse(objText));
     } catch (e) {
       console.error('[SpatialViewer] OBJ parse failed:', e);
-      self.showLoader('Error parsing OBJ: ' + (e && e.message || e));
+      self._parseError('OBJ parse: ' + (e && e.message || e));
     }
   };
 
@@ -1109,7 +2417,7 @@
       },
       function(err) {
         console.error('[SpatialViewer] bundled glTF parse error:', err);
-        self.showLoader('Error parsing glTF from the archive: ' + (err && err.message || err));
+        self._parseError('glTF parse: ' + (err && err.message || err));
       });
   };
 
@@ -1137,6 +2445,270 @@
     return refs;
   };
 
+  // The glTF JSON document's top-level `extensionsUsed`/`extensionsRequired`
+  // arrays, read directly rather than through GLTFLoader (which silently
+  // ignores any extension it doesn't recognize and reports nothing) -- used
+  // to explain an otherwise-mysterious "model loaded but nothing shows up"
+  // result. Handles both binary .glb (JSON is the first chunk after the
+  // 12-byte header) and plain-text .gltf; returns [] rather than throwing on
+  // anything unexpected.
+  SpatialViewerApp.prototype._gltfUsedExtensions = function(buffer) {
+    try {
+      var dv = new DataView(buffer);
+      var json;
+      if (buffer.byteLength >= 4 && dv.getUint32(0, true) === 0x46546C67) {
+        if (buffer.byteLength < 20) return [];
+        var chunkLength = dv.getUint32(12, true);
+        var chunkType = dv.getUint32(16, true);
+        if (chunkType !== 0x4E4F534A) return []; // not a JSON chunk
+        json = JSON.parse(new TextDecoder('utf-8').decode(buffer.slice(20, 20 + chunkLength)));
+      } else {
+        json = JSON.parse(new TextDecoder('utf-8').decode(buffer));
+      }
+      var names = (json.extensionsUsed || []).concat(json.extensionsRequired || []);
+      return names.filter(function(n, i) { return names.indexOf(n) === i; }); // de-dup
+    } catch (e) { return []; }
+  };
+
+  // ---- glTF-embedded Gaussian Splatting (KHR_gaussian_splatting) ---------
+  // Ratified Khronos extension for storing 3D Gaussian splats directly in a
+  // glTF/GLB mesh primitive (POSITION + several "KHR_gaussian_splatting:*"
+  // attribute semantics on a POINTS-mode primitive). Spec:
+  // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_gaussian_splatting
+  //
+  // THREE.GLTFLoader (vendored here) has no idea this extension exists --
+  // it just logs "Unknown extension" and drops whatever that primitive
+  // described, which for a file that stores ALL its geometry this way means
+  // "parsed fine" but an empty, mesh-less scene (see _parseGltf's
+  // reportEmptyResult). This reads the glTF JSON + binary buffer directly
+  // and builds true splats (SplatRenderer), the same approach already used
+  // for .sog/3DGS-.ply, bypassing GLTFLoader entirely for these primitives.
+  //
+  // Unlike .sog/.ply, no axis-flip/chirality correction is needed here: the
+  // glTF coordinate system (+Y up, +Z front, right-handed) already matches
+  // three.js's, and the spec explicitly recommends training/exporting
+  // directly into it.
+  var GLTF_COMPONENT_SIZE = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 };
+  var GLTF_TYPE_COMPONENTS = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 };
+
+  function readGltfComponent(dv, offset, componentType, normalized) {
+    switch (componentType) {
+      case 5120: { var v1 = dv.getInt8(offset); return normalized ? Math.max(v1 / 127, -1) : v1; }
+      case 5121: { var v2 = dv.getUint8(offset); return normalized ? v2 / 255 : v2; }
+      case 5122: { var v3 = dv.getInt16(offset, true); return normalized ? Math.max(v3 / 32767, -1) : v3; }
+      case 5123: { var v4 = dv.getUint16(offset, true); return normalized ? v4 / 65535 : v4; }
+      case 5125: return dv.getUint32(offset, true);
+      case 5126: return dv.getFloat32(offset, true);
+      default: return 0;
+    }
+  }
+
+  // Resolves one accessor to a flat Float32Array (count * numComponents).
+  // Returns null (never throws) for anything this doesn't handle: a sparse
+  // accessor, an unknown component/element type, or data that would read
+  // past the buffer -- callers treat null as "skip this primitive".
+  function readGltfAccessor(json, buffers, accIndex) {
+    if (accIndex == null) return null;
+    var acc = json.accessors && json.accessors[accIndex];
+    if (!acc || acc.sparse || acc.bufferView == null) return null;
+    var bv = json.bufferViews && json.bufferViews[acc.bufferView];
+    if (!bv) return null;
+    var buf = buffers[bv.buffer];
+    if (!buf) return null;
+    var compSize = GLTF_COMPONENT_SIZE[acc.componentType];
+    var numComp = GLTF_TYPE_COMPONENTS[acc.type];
+    if (!compSize || !numComp) return null;
+    var elementSize = compSize * numComp;
+    var stride = bv.byteStride || elementSize;
+    var base = (bv.byteOffset || 0) + (acc.byteOffset || 0);
+    if (base + stride * Math.max(0, acc.count - 1) + elementSize > buf.byteLength) return null;
+    var dv = new DataView(buf);
+    var normalized = !!acc.normalized;
+    var out = new Float32Array(acc.count * numComp);
+    for (var i = 0; i < acc.count; i++) {
+      var elOff = base + i * stride;
+      for (var c = 0; c < numComp; c++) {
+        out[i * numComp + c] = readGltfComponent(dv, elOff + c * compSize, acc.componentType, normalized);
+      }
+    }
+    return out;
+  }
+
+  // buffers[i] -> ArrayBuffer, for the common cases here: the implicit GLB
+  // binary chunk (buffer 0 with no `uri`) and a `data:` URI (plain .gltf
+  // with everything embedded inline). An external-file `uri` resolves to
+  // null, but _parseGltf already rejects those before this ever runs.
+  function resolveGltfBuffers(json, glbBinChunk) {
+    return (json.buffers || []).map(function(b) {
+      if (!b.uri) return glbBinChunk;
+      if (b.uri.slice(0, 5) === 'data:') {
+        try {
+          var comma = b.uri.indexOf(',');
+          var bin = atob(b.uri.slice(comma + 1));
+          var bytes = new Uint8Array(bin.length);
+          for (var j = 0; j < bin.length; j++) bytes[j] = bin.charCodeAt(j);
+          return bytes.buffer;
+        } catch (e) { return null; }
+      }
+      return null;
+    });
+  }
+
+  // Walks the active scene's node hierarchy, returning { meshIndex:
+  // [THREE.Matrix4, ...] } -- the accumulated world transform of every node
+  // that instantiates that mesh (a mesh can be referenced by more than one
+  // node). Needed because a splat primitive's effective position/covariance
+  // depend on its containing node's global transform (see the spec's
+  // Sigma = M*C*C^T*M^T), which this viewer applies via the mesh's own
+  // position/quaternion/scale rather than by baking it into the data.
+  function gltfMeshNodeMatrices(json) {
+    var byMesh = {};
+    var nodes = json.nodes || [];
+    function localMatrix(node) {
+      var m = new THREE.Matrix4();
+      if (node.matrix) { m.fromArray(node.matrix); return m; }
+      var t = node.translation || [0, 0, 0], r = node.rotation || [0, 0, 0, 1], s = node.scale || [1, 1, 1];
+      m.compose(new THREE.Vector3(t[0], t[1], t[2]), new THREE.Quaternion(r[0], r[1], r[2], r[3]), new THREE.Vector3(s[0], s[1], s[2]));
+      return m;
+    }
+    function visit(idx, parentWorld) {
+      var node = nodes[idx];
+      if (!node) return;
+      var world = parentWorld.clone().multiply(localMatrix(node));
+      if (node.mesh != null) (byMesh[node.mesh] = byMesh[node.mesh] || []).push(world);
+      (node.children || []).forEach(function(ci) { visit(ci, world); });
+    }
+    var scene = (json.scenes || [])[json.scene || 0] || { nodes: [] };
+    (scene.nodes || []).forEach(function(ni) { visit(ni, new THREE.Matrix4()); });
+    return byMesh;
+  }
+
+  // Parses every KHR_gaussian_splatting primitive in the file into the same
+  // shape _buildTrueSplats expects, one entry per (primitive x instantiating
+  // node) pair, each already carrying its own world position/quaternion/
+  // scale. Returns null (not an error) when the file doesn't actually use
+  // the extension, or no primitive could be decoded, so _parseGltf can fall
+  // back to the normal GLTFLoader mesh path unchanged.
+  SpatialViewerApp.prototype._parseGltfGaussianSplatting = function(buffer) {
+    var dv = new DataView(buffer);
+    var json, binChunk = null;
+    if (buffer.byteLength >= 12 && dv.getUint32(0, true) === 0x46546C67) {
+      if (buffer.byteLength < 20) return null;
+      var jsonChunkLen = dv.getUint32(12, true);
+      if (dv.getUint32(16, true) !== 0x4E4F534A) return null;
+      json = JSON.parse(new TextDecoder('utf-8').decode(buffer.slice(20, 20 + jsonChunkLen)));
+      var afterJson = 20 + jsonChunkLen;
+      if (afterJson + 8 <= buffer.byteLength) {
+        var binLen = dv.getUint32(afterJson, true);
+        var binType = dv.getUint32(afterJson + 4, true);
+        if (binType === 0x004e4942) binChunk = buffer.slice(afterJson + 8, afterJson + 8 + binLen); // 'BIN\0'
+      }
+    } else {
+      json = JSON.parse(new TextDecoder('utf-8').decode(buffer));
+    }
+    if (!json || !json.extensionsUsed || json.extensionsUsed.indexOf('KHR_gaussian_splatting') === -1) return null;
+
+    var buffers = resolveGltfBuffers(json, binChunk);
+    var meshNodeMatrices = gltfMeshNodeMatrices(json);
+    var results = [];
+
+    (json.meshes || []).forEach(function(mesh, meshIndex) {
+      (mesh.primitives || []).forEach(function(prim) {
+        var ext = prim.extensions && prim.extensions.KHR_gaussian_splatting;
+        if (!ext || prim.mode !== 0) return; // mode MUST be POINTS (0) per spec
+        var attrs = prim.attributes || {};
+        var posAcc = readGltfAccessor(json, buffers, attrs.POSITION);
+        var rotAcc = readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:ROTATION']);
+        var scaleAcc = readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SCALE']);
+        var opAcc = readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:OPACITY']);
+        var dc = readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SH_DEGREE_0_COEF_0']);
+        if (!posAcc || !rotAcc || !scaleAcc || !opAcc || !dc) {
+          console.warn('[SpatialViewer] KHR_gaussian_splatting primitive is missing a required attribute (or uses an accessor layout this viewer cannot read) -- skipping it');
+          return;
+        }
+        var n = posAcc.length / 3;
+
+        // Degree 1+2 only -- same cap as .sog/.ply, see SplatRenderer/
+        // TRUE_SPLAT_MAX_POINTS for why. Each SH degree is all-or-nothing
+        // per spec, so only probe degree 2 once degree 1 is confirmed whole.
+        var sh1Acc = readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SH_DEGREE_1_COEF_0']);
+        var sh2Acc = readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SH_DEGREE_1_COEF_1']);
+        var sh3Acc = readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SH_DEGREE_1_COEF_2']);
+        var hasDeg1 = !!(sh1Acc && sh2Acc && sh3Acc);
+        var sh4Acc = hasDeg1 ? readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SH_DEGREE_2_COEF_0']) : null;
+        var sh5Acc = hasDeg1 ? readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SH_DEGREE_2_COEF_1']) : null;
+        var sh6Acc = hasDeg1 ? readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SH_DEGREE_2_COEF_2']) : null;
+        var sh7Acc = hasDeg1 ? readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SH_DEGREE_2_COEF_3']) : null;
+        var sh8Acc = hasDeg1 ? readGltfAccessor(json, buffers, attrs['KHR_gaussian_splatting:SH_DEGREE_2_COEF_4']) : null;
+        var hasDeg2 = hasDeg1 && !!(sh4Acc && sh5Acc && sh6Acc && sh7Acc && sh8Acc);
+
+        var zero3 = new Float32Array(n * 3);
+        var srcSh = hasDeg1
+          ? [sh1Acc, sh2Acc, sh3Acc,
+             hasDeg2 ? sh4Acc : zero3, hasDeg2 ? sh5Acc : zero3, hasDeg2 ? sh6Acc : zero3,
+             hasDeg2 ? sh7Acc : zero3, hasDeg2 ? sh8Acc : zero3]
+          : [zero3, zero3, zero3, zero3, zero3, zero3, zero3, zero3];
+
+        // Same decimation + scale-compensation as parseSOG/parseSplatPLY
+        // (see their comments): thinning without growing the survivors
+        // leaves visible gaps.
+        var step = n > TRUE_SPLAT_MAX_POINTS ? Math.ceil(n / TRUE_SPLAT_MAX_POINTS) : 1;
+        var scaleComp = step > 1 ? Math.cbrt(step) : 1;
+        var outN = Math.floor((n + step - 1) / step);
+
+        var positions = new Float32Array(outN * 3), cov6 = new Float32Array(outN * 6), colors = new Float32Array(outN * 4);
+        var outSh = [];
+        for (var oi = 0; oi < 8; oi++) outSh.push(new Float32Array(outN * 3));
+
+        var k = 0;
+        for (var i = 0; i < n; i += step) {
+          positions[k * 3] = posAcc[i * 3]; positions[k * 3 + 1] = posAcc[i * 3 + 1]; positions[k * 3 + 2] = posAcc[i * 3 + 2];
+
+          // glTF VEC4 quaternions are always (x, y, z, w).
+          var qx = rotAcc[i * 4], qy = rotAcc[i * 4 + 1], qz = rotAcc[i * 4 + 2], qw = rotAcc[i * 4 + 3];
+          var qlen = Math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz) || 1;
+          qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen;
+
+          var sx = scaleAcc[i * 3] * scaleComp, sy = scaleAcc[i * 3 + 1] * scaleComp, sz = scaleAcc[i * 3 + 2] * scaleComp;
+
+          // No axis-flip sign fix-up here (unlike .sog/.ply) -- the glTF
+          // coordinate system already matches three.js's.
+          var c6 = quatScaleToCovariance6(sx, sy, sz, qw, qx, qy, qz);
+          cov6[k * 6] = c6[0]; cov6[k * 6 + 1] = c6[1]; cov6[k * 6 + 2] = c6[2];
+          cov6[k * 6 + 3] = c6[3]; cov6[k * 6 + 4] = c6[4]; cov6[k * 6 + 5] = c6[5];
+
+          // Raw DC coefficient, same "shader applies SH_C0 + 0.5" convention
+          // as .sog/.ply.
+          colors[k * 4] = dc[i * 3]; colors[k * 4 + 1] = dc[i * 3 + 1]; colors[k * 4 + 2] = dc[i * 3 + 2];
+          // Linear [0,1] opacity per spec -- unlike 3DGS .ply's logit, no
+          // sigmoid needed.
+          colors[k * 4 + 3] = opAcc[i];
+
+          for (var s = 0; s < 8; s++) {
+            outSh[s][k * 3] = srcSh[s][i * 3]; outSh[s][k * 3 + 1] = srcSh[s][i * 3 + 1]; outSh[s][k * 3 + 2] = srcSh[s][i * 3 + 2];
+          }
+          k++;
+        }
+
+        var matrices = meshNodeMatrices[meshIndex] || [new THREE.Matrix4()];
+        matrices.forEach(function(worldMatrix) {
+          var pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scl = new THREE.Vector3();
+          worldMatrix.decompose(pos, quat, scl);
+          results.push({
+            positions: positions.subarray(0, k * 3), cov6: cov6.subarray(0, k * 6), colors: colors.subarray(0, k * 4),
+            sh1: outSh[0].subarray(0, k * 3), sh2: outSh[1].subarray(0, k * 3), sh3: outSh[2].subarray(0, k * 3),
+            sh4: outSh[3].subarray(0, k * 3), sh5: outSh[4].subarray(0, k * 3), sh6: outSh[5].subarray(0, k * 3),
+            sh7: outSh[6].subarray(0, k * 3), sh8: outSh[7].subarray(0, k * 3),
+            position: pos, quaternion: quat, scale: scl,
+            colorSpaceLinear: ext.colorSpace === 'lin_rec709_display'
+          });
+        });
+      });
+    });
+
+    return results.length ? results : null;
+  };
+
   // (7) Parse GLB/GLTF in a Web Worker so the main thread does not freeze.
   // Falls back to a main-thread GLTFLoader.parse() on any failure (e.g. the GLB
   // has textures / KHR extensions the worker path can't handle).
@@ -1146,12 +2718,67 @@
     var refs = this._gltfExternalRefs(buffer);
     if (refs.length) {
       var shown = refs.slice(0, 3).join(', ') + (refs.length > 3 ? ', …' : '');
-      this.showLoader(
-        'This .gltf file references ' + refs.length + ' external file(s) that were ' +
-        'not uploaded (' + shown + '). Upload a single self-contained .glb instead, ' +
-        'or a .gltf with embedded (data-URI) buffers and textures.');
       console.warn('[SpatialViewer] glTF references external resources:', refs);
+      this._parseError(
+        'this .gltf needs ' + refs.length + ' external file(s) that were not uploaded (' +
+        shown + ') — upload a self-contained .glb, or a .zip with the .gltf + .bin + textures');
       return;
+    }
+
+    // Captured up front: the worker path below transfers `buffer` itself
+    // (postMessage's transfer list), which detaches it in this thread, so it
+    // can no longer be read by the time the worker's response arrives.
+    var usedExt = this._gltfUsedExtensions(buffer);
+
+    if (usedExt.indexOf('KHR_gaussian_splatting') !== -1) {
+      var splats = null;
+      try { splats = self._parseGltfGaussianSplatting(buffer); }
+      catch (err) {
+        console.warn('[SpatialViewer] KHR_gaussian_splatting parse failed, falling back to the normal glTF path:', err);
+      }
+      if (splats) {
+        var group = new THREE.Group();
+        splats.forEach(function(s) {
+          var meshObj = self._buildTrueSplats(s.positions, s.cov6, s.colors,
+            s.sh1, s.sh2, s.sh3, s.sh4, s.sh5, s.sh6, s.sh7, s.sh8, s.colorSpaceLinear);
+          meshObj.position.copy(s.position);
+          meshObj.quaternion.copy(s.quaternion);
+          meshObj.scale.copy(s.scale);
+          group.add(meshObj);
+        });
+        self.onModelLoaded(group);
+        return;
+      }
+      // Fall through to the normal GLTFLoader-based path below only as a
+      // last resort (e.g. an unexpected accessor layout this parser can't
+      // read) -- better a best-effort attempt than nothing at all.
+    }
+
+    function hasGeometry(obj) {
+      var found = false;
+      obj.traverse(function(child) { if (child.isMesh || child.isPoints) found = true; });
+      return found;
+    }
+
+    // GLTFLoader doesn't error on an extension it doesn't understand -- it
+    // just drops whatever that extension described, which for a file that
+    // stores ALL its geometry through one (e.g. native glTF Gaussian
+    // Splatting) means "parsed fine" but an empty, mesh-less scene. Silently
+    // falling through to onModelLoaded's generic empty-model fallback would
+    // just show an unexplained blank viewport, so this is reported as its
+    // own specific error instead.
+    function reportEmptyResult() {
+      var splatExt = usedExt.filter(function(e) { return /gaussian_splatting/i.test(e); });
+      if (splatExt.length) {
+        self._parseError(
+          'this glTF/GLB stores its geometry via the "' + splatExt.join('", "') + '" extension' +
+          (splatExt.length > 1 ? 's' : '') + ' (native glTF Gaussian Splatting) -- not supported ' +
+          'yet (it is a very new, not-yet-finalized Khronos extension). Export/upload as .sog, ' +
+          '.ply or .splat instead for full true-splat rendering.');
+      } else {
+        self._parseError('this glTF/GLB has no mesh or point data to display' +
+          (usedExt.length ? ' (uses extension(s): ' + usedExt.join(', ') + ')' : ''));
+      }
     }
 
     function mainThreadParse(buf) {
@@ -1166,6 +2793,7 @@
             // separately and let the real stack surface.
             parsed = true;
             try {
+              if (!hasGeometry(gltf.scene)) { reportEmptyResult(); return; }
               self.onModelLoaded(gltf.scene);
             } catch (err) {
               console.error('[SpatialViewer] Post-load processing failed:', err);
@@ -1176,13 +2804,12 @@
           function(err) {
             if (parsed) return; // already past parsing — error came from onLoad
             console.error('[SpatialViewer] GLTF parse error:', err);
-            self.showLoader('Error parsing GLTF/GLB: ' + (err && err.message || err) +
-              '. If this is a large or highly detailed model, the browser tab may ' +
-              'have run out of memory — try a decimated / Draco-compressed export.');
+            self._parseError('glTF parse: ' + (err && err.message || err) +
+              ' (a very large / detailed model may have run out of memory — try a decimated export)');
           });
       } catch (err) {
         console.error('[SpatialViewer] GLTFLoader.parse threw:', err);
-        self.showLoader('Error parsing GLTF/GLB: ' + (err && err.message || err));
+        self._parseError('glTF parse: ' + (err && err.message || err));
       }
     }
 
@@ -1190,9 +2817,9 @@
       if (self._modelBlob) {
         self._modelBlob.arrayBuffer()
           .then(mainThreadParse)
-          .catch(function(err) { self.showLoader('Error loading model: ' + (err && err.message || err)); });
+          .catch(function(err) { self._parseError('load error: ' + (err && err.message || err)); });
       } else {
-        self.showLoader('Could not load the 3D model (background parse failed).');
+        self._parseError('background parse failed');
       }
     }
 
@@ -1230,6 +2857,7 @@
       if (d.type === 'done') {
         finish(function() {
           try {
+            if (!d.meshes || !d.meshes.length) { reportEmptyResult(); return; }
             self.onModelLoaded(self._rebuildFromWorker(d.meshes));
           } catch (err) {
             console.error('[SpatialViewer] Rebuilding worker meshes failed:', err);
@@ -1435,12 +3063,19 @@
   };
 
   SpatialViewerApp.prototype.onModelLoaded = function(object) {
+    var layerId = this._loadingLayerId;
+    var layered = (layerId != null);
+
     this.modelObject = object;
     this.scene.add(object);
 
-    this._bvhReady = false; // rebuild BVH for the new model on next tool use
+    this._bvhReady = false; // rebuild BVH for the new geometry on next tool use
     this._setLassoHighlight(null); // any old highlight references the old geometry
-    this.modelMeshObjects = [];
+    // During this call modelMeshObjects holds only this layer's meshes (so
+    // sanitize / BVH / bbox scope to it); _harvestLayer then merges the set.
+    var thisLayerMeshes = [];
+    this.modelMeshObjects = thisLayerMeshes;
+    this._lastLayerMeshes = thisLayerMeshes;
     var self = this;
     var heavy = !!this.heavyMode;
     var triangles = 0;
@@ -1454,7 +3089,7 @@
             child.material.clippingPlanes = self.clipPlanes;
           }
         }
-        self.modelMeshObjects.push(child);
+        thisLayerMeshes.push(child);
 
         var g = child.geometry;
         if (g && g.index) triangles += g.index.count / 3;
@@ -1489,34 +3124,47 @@
       maxDim = 20;
     }
 
-    // Drawing tools: markup points sit exactly on the surface (outlines render
-    // with depthTest:false, so no lift is needed). Point clouds / gaussian
-    // splats need a scale-relative ray threshold to be pickable.
-    this.modelRadius = maxDim;
-    this.surfaceOffset = 0;
-    if (this.raycaster) this.raycaster.params.Points.threshold = maxDim * 0.01;
+    // Frame the camera on the FIRST layer only — later layers are already in
+    // the same coordinate system, so we keep the user's current viewpoint.
+    if (!this._framed) {
+      this._framed = true;
+      this.modelRadius = maxDim;
+      this.surfaceOffset = 0;
+      if (this.raycaster) this.raycaster.params.Points.threshold = maxDim * 0.01;
 
-    this.controls.target.copy(center);
-    this.camera.position.set(center.x + maxDim * 1.5, center.y + maxDim * 1.2, center.z + maxDim * 1.5);
-    this.camera.lookAt(center);
-    this.controls.update();
+      // Open on the saved "start view" (camera position + orbit target) when
+      // the model has one, otherwise auto fit-to-view as before.
+      var startView = this.projectData && this.projectData.settings && this.projectData.settings.start_view;
+      if (startView && startView.position && startView.target) {
+        this.controls.target.set(startView.target.x, startView.target.y, startView.target.z);
+        this.camera.position.set(startView.position.x, startView.position.y, startView.position.z);
+      } else {
+        this.controls.target.copy(center);
+        this.camera.position.set(center.x + maxDim * 1.5, center.y + maxDim * 1.2, center.z + maxDim * 1.5);
+      }
+      this.camera.lookAt(this.controls.target);
+      this.controls.update();
+      this._updateClip(true);
 
-    // Depth range now tracks the viewing distance (see _updateClip) so you can
-    // zoom right onto a surface without clipping.
-    this._updateClip(true);
-
-    // Size shadows to the model and remember this framing for the Home button.
-    // Never let a render-quality hiccup stop the model from being shown.
-    try {
-      this._fitShadowsToModel(box, center, maxDim);
-      this._homeView = { position: this.camera.position.clone(), target: this.controls.target.clone() };
-      this._applyRenderSettings();
-    } catch (e) {
-      console.warn('[SpatialViewer] post-load render setup failed:', e);
+      try {
+        this._fitShadowsToModel(box, center, maxDim);
+        this._homeView = { position: this.camera.position.clone(), target: this.controls.target.clone() };
+      } catch (e) { console.warn('[SpatialViewer] shadow fit failed:', e); }
+    } else {
+      // keep modelRadius representative of the biggest layer
+      this.modelRadius = Math.max(this.modelRadius || 0, maxDim);
     }
 
-    this.hideLoader();
+    try { this._applyRenderSettings(); }
+    catch (e) { console.warn('[SpatialViewer] post-load render setup failed:', e); }
+
     this.renderExisting3DAnnotations();
+
+    if (layered) {
+      this._harvestLayer(layerId);
+    } else {
+      this.hideLoader();
+    }
 
     // One-time navigation hint.
     if (this.currentTool === 'orbit' && !this._navHintShown) {
@@ -1680,6 +3328,12 @@
     var kw = keys.w, ks = keys.s, ka = keys.a, kd = keys.d, kr = keys.r, kf = keys.f;
     if (!(kw || ks || ka || kd || kr || kf)) return;
     if (!this.controls || !this.camera) return;
+    // Never move the camera mid-stroke: the lasso/draw/measure tools freeze a
+    // "selection" camera matrix for their screen-space math on the first
+    // sample and only refresh it when the gesture ends — moving the camera
+    // while held (e.g. a stray WASD key) desyncs that frozen matrix from the
+    // live one and the lasso fill renders offset from what you're drawing.
+    if (this.isDrawing) return;
 
     var n = this._nav;
     this.camera.getWorldDirection(n.fwd).normalize();
@@ -1706,6 +3360,67 @@
     this.camera.position.add(n.move);
     this.controls.target.add(n.move);
     this._updateClip();
+  };
+
+  // Per-frame VR thumbstick locomotion. OrbitControls does nothing in VR (head
+  // tracking drives the camera), so without this the player is stuck wherever
+  // they stood when the session started. Moves/turns the `xrDolly` rig the
+  // camera is parented to, not the camera itself.
+  //   left stick  -> move, relative to where the headset is currently facing
+  //   right stick X -> snap-turn (comfort default, in 30° steps)
+  //   right stick Y -> move up / down
+  SpatialViewerApp.prototype._processXRInput = function(dt) {
+    var session = this._xrSession;
+    if (!session || !session.inputSources || !this.xrDolly || !this.camera) return;
+
+    var DEAD = 0.15;
+    var moveX = 0, moveY = 0, turnX = 0, liftY = 0, haveStick = false;
+
+    session.inputSources.forEach(function(src) {
+      var gp = src && src.gamepad;
+      if (!gp || !gp.axes || gp.axes.length < 2) return;
+      // xr-standard mapping puts the thumbstick at axes[2]/[3] when a
+      // touchpad also occupies axes[0]/[1]; fall back to [0]/[1] otherwise.
+      var ax = gp.axes.length >= 4 ? gp.axes[2] : gp.axes[0];
+      var ay = gp.axes.length >= 4 ? gp.axes[3] : gp.axes[1];
+      if (Math.abs(ax) < DEAD) ax = 0;
+      if (Math.abs(ay) < DEAD) ay = 0;
+      if (!ax && !ay) return;
+      haveStick = true;
+
+      if (src.handedness === 'right') { turnX = ax; liftY = -ay; }
+      else { moveX = ax; moveY = ay; } // 'left', or 'none' on a single-controller setup
+    });
+    if (!haveStick) return;
+
+    var n = this._nav;
+
+    // Snap-turn: rotate the dolly around the head's current world position so
+    // turning feels like turning in place rather than orbiting around it.
+    if (Math.abs(turnX) > 0.6) {
+      if (!this._xrTurnArmed) {
+        this._xrTurnArmed = true;
+        var angle = (turnX > 0 ? -1 : 1) * (Math.PI / 6); // 30°
+        this.camera.getWorldPosition(n.xrHead);
+        this.xrDolly.position.sub(n.xrHead).applyAxisAngle(n.worldUp, angle).add(n.xrHead);
+        this.xrDolly.rotateY(angle);
+      }
+    } else if (Math.abs(turnX) < 0.3) {
+      this._xrTurnArmed = false;
+    }
+
+    if (moveX || moveY || liftY) {
+      this.camera.getWorldDirection(n.fwd);
+      n.fwd.y = 0;
+      if (n.fwd.lengthSq() < 1e-6) n.fwd.set(0, 0, -1); else n.fwd.normalize();
+      n.right.crossVectors(n.fwd, n.worldUp).normalize();
+
+      var speed = (this.modelRadius || 10) * 0.8;
+      n.move.set(0, liftY * speed * dt, 0)
+        .addScaledVector(n.fwd, -moveY * speed * dt)
+        .addScaledVector(n.right, moveX * speed * dt);
+      this.xrDolly.position.add(n.move);
+    }
   };
 
   // Build BVH bounds trees for the model meshes (once). Synchronous: a one-time
@@ -1910,9 +3625,11 @@
     this._lastSampleClient = { x: clientX, y: clientY };
 
     this._drawLassoOverlay(path, true);
-    // Live surface highlight, refreshed every few samples.
+    // Live surface highlight, refreshed every few samples (coarse grid — kept
+    // snappy while the pointer is still moving; _finishLasso rebuilds it at
+    // full quality once the stroke ends).
     if ((++this._lassoHlFrame % 4) === 0) {
-      this._showLassoPolygon(this._screenPathToNdc(path), this.activeColor);
+      this._buildLassoFill(path, this.activeColor, false);
     }
   };
 
@@ -1975,49 +3692,100 @@
     if (path.length < 3) { this._clearLassoOverlay(); this.clearTempMarkup(); return; }
 
     this._drawLassoOverlay(path, true);
-    this._showLassoPolygon(this._screenPathToNdc(path), this.activeColor);
+    this._buildLassoFill(path, this.activeColor, true);
 
     // Now (once) turn a down-sampled screen ring into 3D points for storage.
     // The 2D overlay stays on screen as the outline until the form is closed.
-    var ring = this._screenPathToWorldRing(path, 64);
+    // 220 matches the polygon resolution _buildLassoFill itself uses
+    // (downsamplePolyPx's cap) -- it used to be 64, a leftover from the old
+    // GLSL-shader lasso where the ring fed a fixed-size uniform array. That
+    // constraint is gone now that the inside-test runs in plain JS, but the
+    // low cap stayed, so the *stored* ring was a coarser approximation of the
+    // drawn shape than the live fill: re-selecting the surface from it after
+    // save (showAnnotationSurface -> _selectSurfaceInLasso) rebuilt a visibly
+    // different, "cut-corners" polygon -- looked aligned while drawing,
+    // misaligned once saved.
+    var ring = this._screenPathToWorldRing(path, 220);
     if (ring.length < 3) { this._clearLassoOverlay(); this.clearTempMarkup(); return; }
 
     this.currentDrawingPoints = ring;
     console.log('[SpatialViewer] lasso: ' + path.length + ' screen points -> ' + ring.length + ' 3D points');
 
-    this.openAnnotationModal({
+    // `points` (the ring) is kept for legacy-annotation fallback / potential
+    // re-editing; `fill_*` is what actually gets displayed on reload now --
+    // the exact triangulated surface patch the user just saw, stored as real
+    // 3D points so no raycasting or camera-dependent reprojection is needed
+    // to show it correctly again later (see _buildLassoFillFromGrid).
+    var gd = {
       type: 'lasso_selection',
       closed: true,
       points: ring.map(function(p) { return { x: p.x, y: p.y, z: p.z }; })
-    });
-  };
+    };
+    var fg = this._lastLassoGrid;
+    if (fg && fg.grid && fg.rows && fg.cols) {
+      gd.fill_rows = fg.rows;
+      gd.fill_cols = fg.cols;
+      gd.fill_grid = fg.grid.map(function(p) {
+        return p ? [round5(p.x), round5(p.y), round5(p.z)] : null;
+      });
+    }
 
-  SpatialViewerApp.prototype._screenPathToNdc = function(path) {
-    var w = this.viewport.clientWidth || 1, h = this.viewport.clientHeight || 1;
-    return path.map(function(p) { return [(p.x / w) * 2 - 1, -(p.y / h) * 2 + 1]; });
+    this.openAnnotationModal(gd);
   };
 
   // Down-sample the screen ring and project it onto the model; points that miss
   // the mesh fall back to the focal plane so the stored ring always has the
-  // shape that was drawn.
+  // shape that was drawn. Uses the same even (float-stride) spacing as
+  // downsamplePolyPx -- an earlier integer stride (floor(n/maxPoints)) could
+  // stop short of the end of the path whenever maxPoints didn't divide n
+  // evenly (e.g. 1000 points at a stride of floor(1000/220)=4 only reaches
+  // index 876, silently dropping the last ~12% of the drawn stroke and
+  // closing the polygon across the gap instead of the actual shape).
   SpatialViewerApp.prototype._screenPathToWorldRing = function(path, maxPoints) {
     this._ensureBVH();
     var rect = this.canvas.getBoundingClientRect();
     var n = path.length;
-    var stride = Math.max(1, Math.floor(n / maxPoints));
+    if (n === 0) return [];
 
     var planeNormal = this.camera.getWorldDirection(new THREE.Vector3()).negate();
     var plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
       planeNormal, (this.controls ? this.controls.target : new THREE.Vector3()).clone()
     );
 
+    var count = Math.min(maxPoints, n);
+    var stride = n / count;
+    var pts = new Array(count);
+    var planeFallback = new Array(count);
+    var anyHit = false;
+    for (var i = 0; i < count; i++) {
+      var p = path[Math.min(n - 1, Math.floor(i * stride))];
+      var hit = this._raycastAt(rect.left + p.x, rect.top + p.y); // also aims this.raycaster.ray at this pixel
+      if (hit) { pts[i] = this._surfacePoint(hit); anyHit = true; }
+      else { pts[i] = null; planeFallback[i] = this.raycaster.ray.intersectPlane(plane, new THREE.Vector3()); }
+    }
+
+    // Sparse point-cloud/splat layers have real gaps between rendered discs --
+    // a raycast miss there doesn't mean "off the model" the way it would for a
+    // solid mesh. Snapping every miss straight to this camera-facing plane
+    // used to land on the right screen pixel from the exact viewpoint the
+    // lasso was drawn from, but at the wrong real-world depth -- so
+    // reprojecting the saved ring from a different angle/zoom made those
+    // stretches of the outline visibly detach from the actual points.
+    // Borrowing the nearest successful hit along the path instead keeps every
+    // ring vertex glued to real geometry; the plane is now only a last resort,
+    // for the (rare) case where literally nothing in the whole stroke hit
+    // anything.
     var out = [];
-    for (var i = 0; i < n && out.length < maxPoints; i += stride) {
-      var p = path[i];
-      var hit = this._raycastAt(rect.left + p.x, rect.top + p.y);
-      if (hit) { out.push(this._surfacePoint(hit)); continue; }
-      var fallback = this.raycaster.ray.intersectPlane(plane, new THREE.Vector3());
-      if (fallback) out.push(fallback);
+    for (var j = 0; j < count; j++) {
+      if (pts[j]) { out.push(pts[j]); continue; }
+      if (anyHit) {
+        var before = null, after = null;
+        for (var b = j - 1; b >= 0; b--) { if (pts[b]) { before = pts[b]; break; } }
+        for (var a = j + 1; a < count; a++) { if (pts[a]) { after = pts[a]; break; } }
+        if (before || after) out.push((before || after).clone());
+      } else if (planeFallback[j]) {
+        out.push(planeFallback[j]);
+      }
     }
     return out;
   };
@@ -2056,184 +3824,120 @@
     if (objOrNull) g.add(objOrNull);
   };
 
-  // Pack an NDC polygon into the shader uniform: down-sample to LASSO_MAX_PTS-1
-  // points, close it, pad the tail with the last point (degenerate edges).
-  function packLassoPoly(ndc) {
-    var maxRing = LASSO_MAX_PTS - 1;
-    var poly;
-    if (ndc.length <= maxRing) {
-      poly = ndc.slice();
-    } else {
-      poly = [];
-      var stride = ndc.length / maxRing;
-      for (var i = 0; i < maxRing; i++) poly.push(ndc[Math.floor(i * stride)]);
-    }
-    poly.push(poly[0]); // close
-
-    var flat = new Float32Array(LASSO_MAX_PTS * 2);
-    var lastPt = poly[poly.length - 1];
-    for (var k = 0; k < LASSO_MAX_PTS; k++) {
-      var pt = k < poly.length ? poly[k] : lastPt;
-      flat[k * 2] = pt[0]; flat[k * 2 + 1] = pt[1];
-    }
-    return { flat: flat, len: poly.length };
-  }
-
-  // Render the model's depth from `camera` into a reusable target, packed as
-  // RGBA (same encoding three uses for shadow maps). This freezes "what was
-  // visible at selection time" so the highlight stays correct after orbiting.
-  SpatialViewerApp.prototype._renderSelectionDepth = function(camera) {
-    if (!this.renderer || !this.scene) return null;
-    try {
-      var size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
-      var sx = Math.round(size.x) || 1024;
-      var sy = Math.round(size.y) || 1024;
-      // Clamp preserving aspect: an independent clamp would render the scene
-      // into a differently-proportioned target, so the sampled depth (and the
-      // lasso fill built from it) ends up offset from the actual view.
-      var scale = Math.min(1, 2048 / Math.max(sx, sy));
-      var w = Math.max(256, Math.round(sx * scale));
-      var h = Math.max(256, Math.round(sy * scale));
-
-      if (!this._selDepthRT || this._selDepthRT.width !== w || this._selDepthRT.height !== h) {
-        if (this._selDepthRT) this._selDepthRT.dispose();
-        this._selDepthRT = new THREE.WebGLRenderTarget(w, h, {
-          minFilter: THREE.NearestFilter,
-          magFilter: THREE.NearestFilter,
-          format: THREE.RGBAFormat,
-          type: THREE.UnsignedByteType,
-          depthBuffer: true,
-          stencilBuffer: false
-        });
-      }
-      if (!this._depthMat) {
-        this._depthMat = new THREE.MeshDepthMaterial({
-          depthPacking: THREE.RGBADepthPacking,
-          side: THREE.DoubleSide
-        });
-      }
-
-      // Only the model belongs in the depth map — not helpers like the invisible
-      // shadow-catcher plane, which would otherwise occlude the model surface
-      // and eat holes in the lasso fill.
-      var hidden = [];
-      [this.annotationsGroup, this.tempMarkupGroup, this.lassoHighlightGroup,
-       this.gridHelper, this.shadowCatcher]
-        .forEach(function(o) { if (o && o.visible) { o.visible = false; hidden.push(o); } });
-
-      var prevOverride = this.scene.overrideMaterial;
-      var prevTarget = this.renderer.getRenderTarget();
-      var prevClear = this.renderer.getClearColor(new THREE.Color());
-      var prevAlpha = this.renderer.getClearAlpha();
-
-      this.scene.overrideMaterial = this._depthMat;
-      this.renderer.setRenderTarget(this._selDepthRT);
-      this.renderer.setClearColor(0xffffff, 1); // unwritten = far
-      this.renderer.clear(true, true, false);
-      this.renderer.render(this.scene, camera);
-
-      this.renderer.setRenderTarget(prevTarget);
-      this.renderer.setClearColor(prevClear, prevAlpha);
-      this.scene.overrideMaterial = prevOverride;
-      hidden.forEach(function(o) { o.visible = true; });
-
-      return {
-        texture: this._selDepthRT.texture,
-        viewProj: new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
-      };
-    } catch (e) {
-      console.warn('[SpatialViewer] selection depth pass failed:', e);
-      return null;
-    }
+  // World point -> canvas-relative CSS pixel (same convention as _viewportPoint
+  // / this.lassoScreenPath), via the given camera.
+  SpatialViewerApp.prototype._worldToPixel = function(worldPt, camera) {
+    var p = worldPt.clone().project(camera || this.camera);
+    var w = this.viewport.clientWidth || 1, h = this.viewport.clientHeight || 1;
+    return { x: (p.x + 1) / 2 * w, y: (1 - p.y) / 2 * h };
   };
 
-  // Highlight the model surface inside the (NDC) lasso polygon by re-rendering
-  // the model's OWN geometry with the projective tint shader. `camera` is the
-  // camera the polygon was measured in; the tint then stays glued to the
-  // surface when the view is orbited.
-  SpatialViewerApp.prototype._showLassoPolygon = function(ndcPoly, color, camera) {
-    if (!ndcPoly || ndcPoly.length < 3 || !this.modelMeshObjects || !this.modelMeshObjects.length) {
+  // Build the lasso fill by casting a grid of rays (one per sample point
+  // inside the screen-space polygon) at the model and meshing the hits into a
+  // triangle patch. `quality=false` uses a coarser grid for snappy live-drag
+  // updates; `_finishLasso` and replay (`_selectSurfaceInLasso`) ask for the
+  // finer one since they only run once. `screenPathPx` is in the same
+  // canvas-relative CSS-pixel space as `this.lassoScreenPath`.
+  SpatialViewerApp.prototype._buildLassoFill = function(screenPathPx, color, quality) {
+    this._lastLassoGrid = null; // avoid a stale grid surviving an early return below
+    if (!screenPathPx || screenPathPx.length < 3 || !this.modelMeshObjects || !this.modelMeshObjects.length) {
       this._setLassoHighlight(null);
       return;
     }
-    var packed = packLassoPoly(ndcPoly);
-    var col = new THREE.Color(color);
+    this._ensureBVH();
 
-    // Fast path: same selection viewpoint, only the polygon changed (live drag).
-    if (this._lassoHl) {
-      this._lassoHl.traverse(function(n) {
-        if (n.material && n.material.uniforms) {
-          n.material.uniforms.uPoly.value = packed.flat;
-          n.material.uniforms.uPolyLen.value = packed.len;
-          n.material.uniforms.uColor.value.set(col.r, col.g, col.b);
-          n.material.uniformsNeedUpdate = true;
-        }
-      });
-      return;
+    var rect = this.canvas.getBoundingClientRect();
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (var i = 0; i < screenPathPx.length; i++) {
+      var p = screenPathPx[i];
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
     }
+    var bboxW = Math.max(1, maxX - minX), bboxH = Math.max(1, maxY - minY);
 
-    camera = camera || this.camera;
-    camera.updateMatrixWorld();
-    this.scene.updateMatrixWorld(true);
+    var targetSamples = quality ? 2600 : 900;
+    var step = Math.sqrt((bboxW * bboxH) / targetSamples);
+    step = Math.max(quality ? 3 : 5, Math.min(22, step));
 
-    var sel = this._renderSelectionDepth(camera);
-    var selViewProj = sel ? sel.viewProj
-      : new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    var cols = Math.min(90, Math.max(2, Math.ceil(bboxW / step) + 1));
+    var rows = Math.min(90, Math.max(2, Math.ceil(bboxH / step) + 1));
+    var stepX = bboxW / (cols - 1), stepY = bboxH / (rows - 1);
+    var poly = downsamplePolyPx(screenPathPx, 220);
 
-    var radius = this.modelRadius || 10;
-    var group = new THREE.Group();
+    var grid = new Array(cols * rows);
+    var any = false;
+    for (var gy = 0; gy < rows; gy++) {
+      var py = minY + gy * stepY;
+      for (var gx = 0; gx < cols; gx++) {
+        var px = minX + gx * stepX;
+        var idx = gy * cols + gx;
+        if (!pointInPolygon(px, py, poly)) { grid[idx] = null; continue; }
+        var hit = this._raycastAt(rect.left + px, rect.top + py);
+        if (hit) { grid[idx] = hit.point.clone(); any = true; } else { grid[idx] = null; }
+      }
+    }
+    if (!any) { this._setLassoHighlight(null); this._lastLassoGrid = null; return; }
 
-    this.modelMeshObjects.forEach(function(obj) {
-      if (!obj.geometry || !obj.geometry.attributes || !obj.geometry.attributes.position) return;
-      var isPoints = !!obj.isPoints;
-      var mat = new THREE.ShaderMaterial({
-        uniforms: {
-          uColor: { value: new THREE.Vector3(col.r, col.g, col.b) },
-          uOpacity: { value: isPoints ? 0.9 : 0.45 },
-          uPoly: { value: packed.flat },
-          uPolyLen: { value: packed.len },
-          uSize: { value: radius * 0.004 },
-          uSelViewProj: { value: selViewProj },
-          uSelDepth: { value: sel ? sel.texture : null },
-          // MeshDepthMaterial cannot rasterise Points, so skip the occlusion
-          // test for point clouds / gaussian splats.
-          uUseDepth: { value: !!sel && !isPoints },
-          uDepthBias: { value: 0.0006 }
-        },
-        vertexShader: isPoints ? LASSO_POINTS_VS : LASSO_VS,
-        fragmentShader: LASSO_FS,
-        transparent: true,
-        depthTest: true,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-        polygonOffset: !isPoints,
-        polygonOffsetFactor: -1,
-        polygonOffsetUnits: -1
-      });
-      var node = isPoints ? new THREE.Points(obj.geometry, mat) : new THREE.Mesh(obj.geometry, mat);
-      node.applyMatrix4(obj.matrixWorld);
-      node.matrixAutoUpdate = false;
-      node.frustumCulled = false;
-      node.userData._sharedGeometry = true;
-      group.add(node);
-    });
+    // Stashed so _finishLasso can persist this exact grid (see
+    // _buildLassoFillFromGrid) -- the saved annotation then re-displays this
+    // same surface patch forever, with no raycasting or camera-dependent
+    // reprojection involved on reload.
+    this._lastLassoGrid = { grid: grid, rows: rows, cols: cols };
 
-    if (!group.children.length) return;
-    group.renderOrder = 997;
-    this._setLassoHighlight(group);
+    var positions = triangulateLassoGrid(grid, rows, cols);
+    if (!positions.length) { this._setLassoHighlight(null); return; }
+    this._setLassoHighlight(this._lassoMeshGroup(positions, color));
   };
 
-  // Same highlight, driven by a stored 3D ring projected through `camera`.
+  // Shared mesh/material construction for a lasso fill patch, given its
+  // already-triangulated vertex positions (flat [x,y,z,...] array).
+  SpatialViewerApp.prototype._lassoMeshGroup = function(positions, color) {
+    var geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geom.computeVertexNormals();
+
+    var mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({
+      color: new THREE.Color(color), transparent: true, opacity: 0.45,
+      side: THREE.DoubleSide, depthTest: true, depthWrite: false,
+      // Every vertex already sits exactly on the real surface — this just
+      // nudges the depth comparison so the patch wins the z-fight against it.
+      polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2
+    }));
+    mesh.renderOrder = 997;
+    mesh.frustumCulled = false;
+
+    var group = new THREE.Group();
+    group.add(mesh);
+    return group;
+  };
+
+  // Rebuilds a SAVED lasso fill directly from its stored grid of 3D hit
+  // points -- no raycasting, no screen-space reprojection, no dependency on
+  // the current (or restored) camera at all. The patch is the same real
+  // surface geometry that was selected when it was drawn, so it stays
+  // correctly anchored to the surface from any viewing angle, exactly like
+  // the live fill the user saw while drawing it.
+  SpatialViewerApp.prototype._buildLassoFillFromGrid = function(gridData, color) {
+    if (!gridData || !gridData.grid || !gridData.rows || !gridData.cols) return false;
+    var positions = triangulateLassoGrid(gridData.grid, gridData.rows, gridData.cols);
+    if (!positions.length) return false;
+    this._setLassoHighlight(this._lassoMeshGroup(positions, color));
+    return true;
+  };
+
+  // Same fill, driven by a stored 3D ring: project it to screen pixels through
+  // `camera` (the viewer has just flown back to the annotation's saved
+  // viewpoint, so this is effectively the same view the ring was drawn in)
+  // and run the same raycast grid.
   SpatialViewerApp.prototype._selectSurfaceInLasso = function(ring3d, camera, color) {
     if (!ring3d || ring3d.length < 3) return;
     camera = camera || this.camera;
     camera.updateMatrixWorld();
     this.scene.updateMatrixWorld(true);
 
-    var vp = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    var _p = new THREE.Vector3();
-    var ndc = ring3d.map(function(v) { _p.copy(v).applyMatrix4(vp); return [_p.x, _p.y]; });
-    this._showLassoPolygon(ndc, color, camera);
+    var self = this;
+    var pixelPoly = ring3d.map(function(v) { return self._worldToPixel(v, camera); });
+    this._buildLassoFill(pixelPoly, color, true);
   };
 
   SpatialViewerApp.prototype.place3DPin = function(point, normal) {
@@ -2264,6 +3968,23 @@
   SpatialViewerApp.prototype.openAnnotationModal = function(gd) {
     this.pendingGeometry = gd;
     this.pendingThumbnail = this.captureSnapshot();
+    // Captured HERE (geometry-finalization time), not later in
+    // saveAnnotation() -- the create panel stays open (and nothing stops the
+    // user switching to the orbit tool to inspect the model) for as long as
+    // they're filling in the subject/description/etc. before clicking Save.
+    // For a lasso selection specifically, this is what made a save "look
+    // aligned while drawing, misaligned once saved": the stored ring is tied
+    // to the exact viewpoint it was raycast from, but reading the camera
+    // fresh at save time could capture a DIFFERENT viewpoint (if the user
+    // had rotated the view in between) -- flying back to that wrong
+    // viewpoint on reload and reprojecting the (unrelated) ring through it
+    // is pure parallax error. Pin/polyline/measurement annotations have the
+    // same gap, just no reprojection step to make it visible.
+    this.pendingCameraViewpoint = {
+      eye: [this.camera.position.x, this.camera.position.y, this.camera.position.z],
+      target: [this.controls.target.x, this.controls.target.y, this.controls.target.z],
+      up: [this.camera.up.x, this.camera.up.y, this.camera.up.z]
+    };
     this._detailAnnotation = null; // leave any open detail view
 
     var panel = document.getElementById('spatialSidePanel');
@@ -2298,6 +4019,9 @@
     // Reset mode to "new"
     var newRadio = document.querySelector('input[name="caMode"][value="new"]');
     if (newRadio) { newRadio.checked = true; this.updateCreateMode('new'); }
+
+    var typeEl = document.getElementById('caType');
+    this._renderCustomFieldsForType(typeEl ? typeEl.value : null);
 
     this.openSidePanel();
     if (panel) { panel.classList.remove('detailing'); panel.classList.add('creating'); }
@@ -2435,14 +4159,150 @@
     if (eg) eg.style.display = (mode === 'existing') ? 'block' : 'none';
   };
 
-  SpatialViewerApp.prototype.closeAnnotationForm = function() {
+  // A field's current value, serialized the same way whether it's freshly
+  // rendered, prefilled, or edited by the user -- used both to build a
+  // before/after snapshot (see openAnnotationDetail/saveWorkPackageEdits)
+  // and, with cfFieldValueForPayload, to collect what actually gets sent.
+  function cfFieldValueForSnapshot(field) {
+    if (field.dataset.cfFormat === 'bool') return field.checked ? '1' : '0';
+    if (field.dataset.cfMulti) {
+      return Array.prototype.map.call(field.selectedOptions || [], function(o) { return o.value; }).join('\u0000');
+    }
+    return field.value;
+  }
+
+  // One <input>/<select>/<textarea> per custom field enabled for the given
+  // Work Package type (custom fields are enabled per project+type in
+  // OpenProject -- see @custom_fields_by_type / this.customFieldsByType).
+  // Replaces whatever was previously rendered into `hostId`.
+  // data-cf-id/data-cf-format (and data-cf-multi for a multi-value select)
+  // are how saveAnnotation/saveWorkPackageEdits collect the values back out
+  // generically. `prefill`, when given, is a WP's current
+  // `{ custom_field_id: [raw value string, ...] }` (see
+  // SpatialAnnotation#work_package_detail_payload) -- used by the "edit
+  // linked Work Package" panel, omitted for the "create new" one.
+  // Returns a snapshot ({ cfId: serialized value }) of what ended up
+  // rendered, for the caller to diff later edits against.
+  SpatialViewerApp.prototype._renderCustomFieldsForType = function(typeId, hostId, prefill) {
+    var host = document.getElementById(hostId || 'caCustomFields');
+    var snapshot = {};
+    if (!host) return snapshot;
+    host.innerHTML = '';
+
+    var fields = this.customFieldsByType[typeId] || this.customFieldsByType[String(typeId)] || [];
+    if (!fields.length) return snapshot;
+
+    var section = document.createElement('p');
+    section.className = 'create-panel-section';
+    section.textContent = 'Type-specific fields';
+    host.appendChild(section);
+
+    fields.forEach(function(cf) {
+      var group = document.createElement('div');
+      group.className = 'form-group';
+
+      var label = document.createElement('label');
+      label.textContent = cf.name + (cf.required ? ' *' : '');
+      group.appendChild(label);
+
+      var existing = (prefill && prefill[cf.id]) || [];
+      var field;
+      if (cf.format === 'text') {
+        field = document.createElement('textarea');
+        field.className = 'form-textarea';
+        field.rows = 3;
+        field.value = existing[0] || '';
+      } else if (cf.format === 'bool') {
+        // Laid out inline with its own label text instead of the shared
+        // <label> above (a bare checkbox next to a label reads oddly).
+        group.innerHTML = '';
+        var boolLabel = document.createElement('label');
+        boolLabel.className = 'form-check-label';
+        field = document.createElement('input');
+        field.type = 'checkbox';
+        field.checked = existing[0] === '1' || existing[0] === 't';
+        boolLabel.appendChild(field);
+        boolLabel.appendChild(document.createTextNode(' ' + cf.name + (cf.required ? ' *' : '')));
+        group.appendChild(boolLabel);
+      } else if (cf.format === 'list' || cf.format === 'user' || cf.format === 'version') {
+        field = document.createElement('select');
+        field.className = 'form-select';
+        if (cf.multi_value) field.multiple = true;
+        if (!cf.required && !cf.multi_value) {
+          var blank = document.createElement('option');
+          blank.value = '';
+          blank.textContent = (cf.format === 'user') ? 'Unassigned' : 'None';
+          field.appendChild(blank);
+        }
+        (cf.options || []).forEach(function(opt) {
+          // [label, value] or [label, value, groupLabel] (version: project name).
+          var o = document.createElement('option');
+          o.value = opt[1];
+          o.textContent = opt[0];
+          if (existing.indexOf(opt[1]) !== -1) o.selected = true;
+          field.appendChild(o);
+        });
+      } else {
+        field = document.createElement('input');
+        field.type = (cf.format === 'int' || cf.format === 'float') ? 'number' :
+          (cf.format === 'date') ? 'date' : 'text';
+        if (cf.format === 'float') field.step = 'any';
+        field.className = 'form-input';
+        field.value = existing[0] || '';
+      }
+      field.dataset.cfId = cf.id;
+      field.dataset.cfFormat = cf.format;
+      if (cf.multi_value) field.dataset.cfMulti = '1';
+      group.appendChild(field);
+
+      host.appendChild(group);
+      snapshot[cf.id] = cfFieldValueForSnapshot(field);
+    });
+
+    return snapshot;
+  };
+
+  // Reads back every custom field currently rendered in `hostId` (see
+  // _renderCustomFieldsForType), as { cfId: value } ready for the
+  // custom_field_values param -- value is a plain string, or an array for a
+  // multi-value field. When `snapshot` is given, a field whose current
+  // value still matches it is skipped (so an edit only sends what actually
+  // changed); omit it to collect everything unconditionally (the "create
+  // new work package" panel has no prior state to diff against).
+  SpatialViewerApp.prototype._collectCustomFieldValues = function(hostId, snapshot) {
+    var out = {};
+    document.querySelectorAll('#' + hostId + ' [data-cf-id]').forEach(function(field) {
+      var id = field.dataset.cfId;
+      if (snapshot && cfFieldValueForSnapshot(field) === (snapshot[id] || '')) return;
+      if (field.dataset.cfFormat === 'bool') {
+        out[id] = field.checked ? '1' : '0';
+      } else if (field.dataset.cfMulti) {
+        out[id] = Array.prototype.map.call(field.selectedOptions || [], function(o) { return o.value; });
+      } else if (field.value !== '' || snapshot) {
+        // Blank with no snapshot (brand new WP): nothing filled in, skip it.
+        // Blank where a snapshot existed (editing): the field had a value
+        // and the user cleared it -- send the empty string to actually
+        // clear it server-side, rather than silently leaving it unchanged.
+        out[id] = field.value;
+      }
+    });
+    return out;
+  };
+
+  // keepLassoHighlight: true right after a successful save, so the fill the
+  // user already saw while drawing (verified correct) is left exactly as is
+  // instead of being torn down and rebuilt from the stored ring -- see
+  // saveAnnotation.
+  SpatialViewerApp.prototype.closeAnnotationForm = function(keepLassoHighlight) {
     var panel = document.getElementById('spatialSidePanel');
     if (panel) panel.classList.remove('creating');
     this.clearTempMarkup();
     this._clearLassoOverlay();
-    this._setLassoHighlight(null);
+    if (!keepLassoHighlight) this._setLassoHighlight(null);
     this.lassoScreenPath = null;
     this.pendingGeometry = null;
+    this.pendingCameraViewpoint = null;
+    this._lastLassoGrid = null;
   };
 
   SpatialViewerApp.prototype.saveAnnotation = function() {
@@ -2462,6 +4322,10 @@
     if (mode === 'existing' && !existingWpId) { alert('Select a Work Package to link.'); return; }
     if (mode === 'new' && !subject) { alert('Enter a subject for the Work Package.'); return; }
 
+    // Every custom field rendered for the currently-selected type -- no
+    // prior state to diff against for a brand new work package.
+    var customFieldValues = this._collectCustomFieldValues('caCustomFields', null);
+
     var payload = {
       spatial_annotation: {
         title: (mode === 'new' ? subject : (subject || 'Annotation')),
@@ -2470,11 +4334,9 @@
         color: this.activeColor,
         work_package_id: (mode === 'existing') ? existingWpId : null,
         thumbnail_base64: this.pendingThumbnail,
-        camera_viewpoint: {
-          eye: [this.camera.position.x, this.camera.position.y, this.camera.position.z],
-          target: [this.controls.target.x, this.controls.target.y, this.controls.target.z],
-          up: [this.camera.up.x, this.camera.up.y, this.camera.up.z]
-        },
+        // Captured back in openAnnotationModal (geometry-finalization time),
+        // not read fresh here -- see that function's comment.
+        camera_viewpoint: this.pendingCameraViewpoint,
         geometry_data: gd
       },
       create_work_package: (mode === 'new') ? 'true' : 'false',
@@ -2490,7 +4352,8 @@
       wp_parent_id: val('caParent'),
       wp_start_date: val('caStartDate'),
       wp_due_date: val('caDueDate'),
-      wp_estimated_hours: val('caEstimatedHours')
+      wp_estimated_hours: val('caEstimatedHours'),
+      wp_custom_field_values: customFieldValues
     };
 
     var saveBtn = document.getElementById('caSaveBtn');
@@ -2505,14 +4368,17 @@
     .then(function(result) {
       if (saveBtn) { saveBtn.disabled = false; saveBtn.innerText = 'Create'; }
       if (result.success) {
-        self.closeAnnotationForm();
+        // For a freshly-created lasso, the fill already on screen is the one
+        // the user just saw while drawing -- keep that exact mesh instead of
+        // tearing it down and rebuilding it from the stored (re-sampled)
+        // ring via showAnnotationSurface, which only needs to run when an
+        // OLDER annotation is reopened from a different camera angle.
+        var keepLiveFill = gd.type === 'lasso_selection';
+        self.closeAnnotationForm(keepLiveFill);
         self.projectData.annotations.unshift(result.annotation);
         self.renderAnnotationsList(self.projectData.annotations);
         self.renderExisting3DAnnotations();
-        // Keep the filled surface highlight on the annotation that was just
-        // created, rebuilt from its stored ring (the camera has not moved, so
-        // it matches exactly what was drawn).
-        self.showAnnotationSurface(result.annotation);
+        if (!keepLiveFill) self.showAnnotationSurface(result.annotation);
         var c = document.getElementById('annotationCountHeader');
         if (c) c.innerText = self.projectData.annotations.length;
         var annTab = document.querySelector('.tab-btn[data-tab="annotationsTab"]');
@@ -2575,7 +4441,23 @@
     this._setLassoHighlight(null);
     if (!a || a.annotation_type !== 'lasso_selection') return;
     var gd = a.geometry_data;
-    if (!gd || !gd.points || gd.points.length < 3) return;
+    if (!gd) return;
+
+    // Preferred path: the exact surface patch stored at save time, replayed
+    // directly with no raycasting or camera-dependent reprojection -- always
+    // anchored to the real geometry, from any viewing angle.
+    if (gd.fill_grid && gd.fill_rows && gd.fill_cols) {
+      var grid = gd.fill_grid.map(function(p) { return p ? { x: p[0], y: p[1], z: p[2] } : null; });
+      if (this._buildLassoFillFromGrid({ grid: grid, rows: gd.fill_rows, cols: gd.fill_cols }, a.color || '#3b82f6')) {
+        return;
+      }
+    }
+
+    // Fallback for annotations saved before fill_grid existed: reprojects
+    // the stored ring through the current camera and re-raycasts -- only as
+    // correct as the camera's reproduction of the original viewpoint (see
+    // _selectSurfaceInLasso).
+    if (!gd.points || gd.points.length < 3) return;
     var ring = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
     this._selectSurfaceInLasso(ring, this.camera, a.color || '#3b82f6');
   };
@@ -2727,6 +4609,10 @@
         var el = document.getElementById(id);
         snapF._detailWpSnapshot[id] = el ? el.value : '';
       });
+      // Prefilled from the WP's current values; the returned snapshot is
+      // what saveWorkPackageEdits diffs later edits against.
+      this._detailWpCustomSnapshot =
+        this._renderCustomFieldsForType(wp.type_id, 'adWpCustomFields', wp.custom_field_values);
     }
 
     var panel = document.getElementById('spatialSidePanel');
@@ -2810,15 +4696,20 @@
       if (!el) return;
       if (el.value !== (snap[id] || '')) wpPayload[fields[id]] = el.value;
     });
+    var customFieldValues = this._collectCustomFieldValues('adWpCustomFields', this._detailWpCustomSnapshot || {});
+    if (Object.keys(customFieldValues).length) wpPayload.custom_field_values = customFieldValues;
     if (!Object.keys(wpPayload).length) { this.showTooltip('No work package changes to save.'); return; }
 
     var self = this;
     this._sendAnnotation('PATCH', { work_package: wpPayload }, document.getElementById('adSaveWpBtn'), function(res) {
       self._applyUpdatedAnnotation(res.annotation, true);
-      // The fields on screen are now the saved truth — re-baseline the snapshot.
+      // The fields on screen are now the saved truth — re-baseline both snapshots.
       Object.keys(fields).forEach(function(id) {
         var el = document.getElementById(id);
         self._detailWpSnapshot[id] = el ? el.value : '';
+      });
+      document.querySelectorAll('#adWpCustomFields [data-cf-id]').forEach(function(field) {
+        self._detailWpCustomSnapshot[field.dataset.cfId] = cfFieldValueForSnapshot(field);
       });
       self.showTooltip('Work package saved.');
     });
@@ -2850,6 +4741,15 @@
     bind('adSaveAnnBtn', function() { self.saveAnnotationEdits(); });
     bind('adSaveWpBtn', function() { self.saveWorkPackageEdits(); });
     bind('adDeleteBtn', function() { self.deleteAnnotationFromDetail(); });
+    var adWpType = document.getElementById('adWpType');
+    if (adWpType) {
+      adWpType.addEventListener('change', function() {
+        // Switching type changes which custom fields are even available (per
+        // project+type, see customFieldsByType) -- start that section fresh
+        // rather than prefilling with values from the WP's PREVIOUS type.
+        self._detailWpCustomSnapshot = self._renderCustomFieldsForType(adWpType.value, 'adWpCustomFields', null);
+      });
+    }
     document.querySelectorAll('#adColorGroup .color-dot').forEach(function(dot) {
       dot.addEventListener('click', function() {
         document.querySelectorAll('#adColorGroup .color-dot').forEach(function(d) { d.classList.remove('active'); });
@@ -2921,6 +4821,25 @@
       });
     }
 
+    var navMenuBtn = document.getElementById('btnNavMenu');
+    var navMenu = document.getElementById('navDropdownMenu');
+    if (navMenuBtn && navMenu) {
+      navMenuBtn.addEventListener('click', function(e) { e.stopPropagation(); navMenu.classList.toggle('show'); });
+      document.addEventListener('click', function(e) { if (!navMenuBtn.contains(e.target)) navMenu.classList.remove('show'); });
+    }
+    var setStartBtn = document.getElementById('btnSetStartView');
+    if (setStartBtn) setStartBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      if (navMenu) navMenu.classList.remove('show');
+      self._setCurrentViewAsStart();
+    });
+    var clearStartBtn = document.getElementById('btnClearStartView');
+    if (clearStartBtn) clearStartBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      if (navMenu) navMenu.classList.remove('show');
+      self._clearStartView();
+    });
+
     var clearBtn = document.getElementById('toolClear');
     if (clearBtn) clearBtn.addEventListener('click', function() {
       self.clearTempMarkup();
@@ -2934,6 +4853,19 @@
     var closeSliceBtn = document.getElementById('closeSliceBtn');
     if (sliceBtn && slicePanel) sliceBtn.addEventListener('click', function() { slicePanel.style.display = slicePanel.style.display === 'none' ? 'block' : 'none'; });
     if (closeSliceBtn && slicePanel) closeSliceBtn.addEventListener('click', function() { slicePanel.style.display = 'none'; });
+
+    var layersBtn = document.getElementById('btnLayers');
+    var layersPanel = document.getElementById('layerPanel');
+    var closeLayersBtn = document.getElementById('closeLayerBtn');
+    if (layersBtn && layersPanel) layersBtn.addEventListener('click', function() {
+      var open = layersPanel.style.display === 'none' || !layersPanel.style.display;
+      layersPanel.style.display = open ? 'block' : 'none';
+      layersBtn.classList.toggle('active', open);
+    });
+    if (closeLayersBtn && layersPanel) closeLayersBtn.addEventListener('click', function() {
+      layersPanel.style.display = 'none';
+      if (layersBtn) layersBtn.classList.remove('active');
+    });
 
     this._initRenderPanel();
 
@@ -2972,6 +4904,9 @@
       r.addEventListener('change', function() { self.updateCreateMode(r.value); });
     });
 
+    var caType = document.getElementById('caType');
+    if (caType) caType.addEventListener('change', function() { self._renderCustomFieldsForType(caType.value); });
+
     document.querySelectorAll('.color-dot').forEach(function(dot) {
       dot.addEventListener('click', function() {
         document.querySelectorAll('.color-dot').forEach(function(d) { d.classList.remove('active'); });
@@ -2998,11 +4933,13 @@
     btn.disabled = true;
     btn.title = 'Checking VR support...';
 
+    var ENTER_TITLE = 'Enter VR — left stick: move, right stick: turn (snap) / up-down';
+
     navigator.xr.isSessionSupported('immersive-vr').then(function(supported) {
       if (!supported) { btn.style.display = 'none'; return; }
       btn.style.display = '';
       btn.disabled = false;
-      btn.title = 'Enter VR';
+      btn.title = ENTER_TITLE;
     }).catch(function() { btn.style.display = 'none'; });
 
     function endVR() {
@@ -3012,10 +4949,12 @@
     function onSessionEnded() {
       if (self._xrSession) self._xrSession.removeEventListener('end', onSessionEnded);
       self._xrSession = null;
+      self._xrTurnArmed = false;
       self.xrDolly.position.set(0, 0, 0);
+      self.xrDolly.rotation.set(0, 0, 0);
       btn.disabled = false;
       btn.classList.remove('active');
-      btn.title = 'Enter VR';
+      btn.title = ENTER_TITLE;
     }
 
     btn.addEventListener('click', function() {
@@ -3032,6 +4971,8 @@
         // point so the model is in front of them on entry.
         var t = self.controls ? self.controls.target : new THREE.Vector3();
         self.xrDolly.position.set(t.x, t.y - 1.6, t.z + 3);
+        self.xrDolly.rotation.set(0, 0, 0);
+        self._xrTurnArmed = false;
 
         try { self.renderer.xr.setReferenceSpaceType('local-floor'); } catch (ignore) {}
         return self.renderer.xr.setSession(session).then(function() {
@@ -3044,9 +4985,10 @@
         if (self._xrSession) { try { self._xrSession.end(); } catch (ignore) {} }
         self._xrSession = null;
         self.xrDolly.position.set(0, 0, 0);
+        self.xrDolly.rotation.set(0, 0, 0);
         btn.disabled = false;
         btn.classList.remove('active');
-        btn.title = 'Enter VR';
+        btn.title = ENTER_TITLE;
         alert('Could not start VR: ' + (err.message || err));
       });
     });

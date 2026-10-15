@@ -4,7 +4,8 @@
      data-api-url="<%= api_data_project_spatial_model_path(@project, @spatial_model) %>"
      data-csrf-token="<%= form_authenticity_token %>"
      data-max-model-mb="250"
-     data-heavy-model-mb="40">
+     data-heavy-model-mb="40"
+     data-custom-fields-by-type="<%= @custom_fields_by_type.to_json %>">
 
   <div class="spatial-toolbar">
     <div class="toolbar-section toolbar-title-group">
@@ -36,9 +37,20 @@
     </div>
 
     <div class="toolbar-section toolbar-tools-group">
-      <button type="button" class="toolbar-btn tool-btn" id="toolOrbit" title="Navigate — drag to orbit, scroll to zoom to cursor, W/A/S/D to move, R/F for up/down (Shift = faster)" data-tool="orbit">
-        <i class="icon-cursor-move"></i> Navigate
-      </button>
+      <div class="toolbar-dropdown" id="navToolGroup" style="display:inline-flex;align-items:center;gap:4px;">
+        <button type="button" class="toolbar-btn tool-btn" id="toolOrbit" title="Navigate — drag to orbit, scroll to zoom to cursor, W/A/S/D to move, R/F for up/down (Shift = faster)" data-tool="orbit">
+          <i class="icon-cursor-move"></i> Navigate
+        </button>
+        <% if @can_set_start_view %>
+          <button type="button" class="toolbar-btn" id="btnNavMenu" title="Set the view the model opens with">
+            <i class="icon-arrow-down1"></i>
+          </button>
+          <div class="toolbar-dropdown-menu" id="navDropdownMenu">
+            <a href="#" id="btnSetStartView"><i class="icon-milestone"></i> Set as start view</a>
+            <a href="#" id="btnClearStartView"><i class="icon-delete"></i> Clear start view</a>
+          </div>
+        <% end %>
+      </div>
       <button type="button" class="toolbar-btn tool-btn" id="toolPin" title="Place 3D Pin on Surface" data-tool="pin">
         <i class="icon-milestone"></i> 3D Pin
       </button>
@@ -66,6 +78,9 @@
       <button type="button" class="toolbar-btn" id="btnRender" title="Render quality: lighting, shadows, environment">
         <i class="icon-settings2"></i> Render
       </button>
+      <button type="button" class="toolbar-btn" id="btnLayers" title="Show / hide model layers" style="display: none;">
+        <i class="icon-copy"></i> Layers
+      </button>
       <button type="button" class="toolbar-btn" id="btnVR" title="Enter VR" style="display: none;">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true" focusable="false">
           <path d="M21 6H3a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h5.2a2 2 0 0 0 1.7-.9l1.3-2c.3-.45.95-.45 1.25 0l1.3 2a2 2 0 0 0 1.7.9H21a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zM7.5 14A2.5 2.5 0 1 1 10 11.5 2.5 2.5 0 0 1 7.5 14zm9 0a2.5 2.5 0 1 1 2.5-2.5 2.5 2.5 0 0 1-2.5 2.5z"/>
@@ -75,6 +90,11 @@
       <button type="button" class="toolbar-btn" id="btnSidePanelToggle" title="Toggle Side Panel">
         <i class="icon-task"></i> Tickets & Annotations (<span id="annotationCountHeader"><%= @annotations.count %></span>)
       </button>
+      <% if @unity_player_available %>
+        <a href="<%= download_exe_project_spatial_model_path(@project, @spatial_model) %>" class="toolbar-btn" title="Download a standalone Windows app (Unity) with this model">
+          <i class="icon-download"></i> Download as .exe
+        </a>
+      <% end %>
     </div>
   </div>
 
@@ -83,6 +103,14 @@
       <div class="viewer-loader" id="viewerLoader">
         <div class="spinner"></div>
         <div class="loader-text" id="loaderText">Loading 3D model...</div>
+      </div>
+
+      <div class="render-panel" id="layerPanel" style="display: none; right: auto; left: 16px;">
+        <div class="slicing-header">
+          <span>Layers</span>
+          <button type="button" class="close-btn" id="closeLayerBtn">&times;</button>
+        </div>
+        <div class="slicing-body" id="layerList"></div>
       </div>
 
       <div class="slicing-panel" id="slicingPanel" style="display: none;">
@@ -207,6 +235,11 @@
                 </select>
               </div>
             </div>
+
+            <!-- Populated/replaced by JS on Type change -- see
+                 _renderCustomFieldsForType in viewer_engine.js. -->
+            <div id="caCustomFields"></div>
+
             <div class="form-group">
               <label>Description</label>
               <textarea id="caDesc" class="form-textarea" rows="4" placeholder="Description / notes"></textarea>
@@ -385,6 +418,11 @@
                 </select>
               </div>
             </div>
+
+            <!-- Populated/replaced by JS on Type change -- see
+                 _renderCustomFieldsForType in viewer_engine.js. -->
+            <div id="adWpCustomFields"></div>
+
             <div class="form-group">
               <label>Description</label>
               <textarea id="adWpDesc" class="form-textarea" rows="3"></textarea>

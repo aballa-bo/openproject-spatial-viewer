@@ -14,13 +14,15 @@ module OpenProject
 
         project_module :spatial_viewer do
           permission :view_spatial_models,
-                     { spatial_models: %i[index show api_data model_file],
+                     { spatial_models: %i[index show api_data model_file download_exe],
+                       spatial_layers: %i[file],
                        spatial_annotations: %i[index snapshot] },
                      permissible_on: :project,
                      public: true
 
           permission :manage_spatial_models,
-                     { spatial_models: %i[new create edit update destroy] },
+                     { spatial_models: %i[new create edit update destroy set_start_view],
+                       spatial_layers: %i[create update destroy] },
                      permissible_on: :project,
                      require: :member
 

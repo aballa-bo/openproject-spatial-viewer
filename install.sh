@@ -17,7 +17,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo "[1/7] Cleaning old modules and copying to $DEST_DIR..."
+echo "[1/8] Cleaning old modules and copying to $DEST_DIR..."
 rm -rf "$OP_DIR/modules/openproject-3d_viewer" "$OP_DIR/modules/openproject-spatial_viewer" "$DEST_DIR"
 
 # Clean any previous entries from Gemfile.modules
@@ -27,20 +27,20 @@ sed -i "/openproject-spatial_viewer/d" "$OP_DIR/Gemfile.modules" 2>/dev/null || 
 cp -r "$PLUGIN_SRC" "$DEST_DIR"
 chown -R openproject:openproject "$DEST_DIR"
 
-echo "[2/7] Configuring Gemfile.modules..."
+echo "[2/8] Configuring Gemfile.modules..."
 if ! grep -q "openproject-spatial_viewer" "$OP_DIR/Gemfile.modules"; then
   sed -i "/group :opf_plugins do/a\\  gem '$PLUGIN_NAME', path: 'modules/$MODULE_DIR_NAME'" "$OP_DIR/Gemfile.modules"
   echo "[+] $PLUGIN_NAME entry added to group :opf_plugins."
 fi
 
-echo "[3/7] Installing Ruby dependencies (bundle install)..."
+echo "[3/8] Installing Ruby dependencies (bundle install)..."
 openproject run bundle config set frozen false
 openproject run bundle install
 
-echo "[4/7] Running database migrations..."
+echo "[4/8] Running database migrations..."
 openproject run rake db:migrate
 
-echo "[5/7] Deploying static assets for the 3D viewer..."
+echo "[5/8] Deploying static assets for the 3D viewer..."
 ASSET_DIR="$OP_DIR/public/assets/openproject_spatial_viewer"
 mkdir -p "$ASSET_DIR/vendor"
 
@@ -51,7 +51,7 @@ cp -r "$PLUGIN_SRC/app/assets/javascripts/openproject_spatial_viewer/vendor/"* "
 
 chown -R openproject:openproject "$ASSET_DIR"
 
-echo "[6/7] Clearing cache & checking IFC conversion toolchain..."
+echo "[6/8] Clearing cache & checking IFC conversion toolchain..."
 openproject run rake tmp:cache:clear
 
 if [ -x "$OP_DIR/bin/IfcConvert" ] || command -v IfcConvert >/dev/null 2>&1; then
@@ -63,10 +63,30 @@ else
 fi
 
 # Cache directory for converted models (IFC -> GLB)
-CONV_DIR="$(openproject run bundle exec rails runner 'print OpenProject::Configuration.attachments_storage_path' 2>/dev/null)/spatial_viewer"
+STORAGE_ROOT="$(openproject run bundle exec rails runner 'print OpenProject::Configuration.attachments_storage_path' 2>/dev/null)"
+CONV_DIR="$STORAGE_ROOT/spatial_viewer"
 mkdir -p "$CONV_DIR" 2>/dev/null && chown -R openproject:openproject "$CONV_DIR" 2>/dev/null || true
 
-echo "[7/7] Restarting OpenProject services..."
+echo "[7/8] Deploying the Unity standalone player (for \"Download as .exe\")..."
+# The player itself is never built here -- this server has no Unity Editor,
+# no Windows build tools, no GPU. It is built once, out of band, by a
+# developer with Unity Editor from the project under unity/SpatialViewerPlayer/
+# (see README.md), then its build output is dropped at
+# $PLUGIN_SRC/unity/SpatialViewerPlayer/dist/ before running this script.
+UNITY_PLAYER_SRC="$PLUGIN_SRC/unity/SpatialViewerPlayer/dist"
+UNITY_PLAYER_DEST="${SPATIAL_VIEWER_UNITY_PLAYER_DIR:-$STORAGE_ROOT/unity_player}"
+if [ -d "$UNITY_PLAYER_SRC" ] && [ -n "$(ls -A "$UNITY_PLAYER_SRC" 2>/dev/null)" ]; then
+  mkdir -p "$UNITY_PLAYER_DEST"
+  rsync -a --delete "$UNITY_PLAYER_SRC/" "$UNITY_PLAYER_DEST/"
+  chown -R openproject:openproject "$UNITY_PLAYER_DEST"
+  echo "[+] Unity player deployed to $UNITY_PLAYER_DEST -- \"Download as .exe\" is enabled."
+else
+  echo "[!] No Unity player build found at $UNITY_PLAYER_SRC."
+  echo "    \"Download as .exe\" stays hidden in the viewer until it's deployed."
+  echo "    See README.md for the one-time Unity Editor build + deploy step."
+fi
+
+echo "[8/8] Restarting OpenProject services..."
 systemctl restart openproject-web-1 openproject-worker-1 2>/dev/null || openproject restart
 
 echo "========================================================="

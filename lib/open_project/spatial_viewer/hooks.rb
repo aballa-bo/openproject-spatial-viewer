@@ -19,22 +19,25 @@ module OpenProject
         '/assets/openproject_spatial_viewer/viewer.css'            => "#{CSS_DIR}/viewer.css",
         '/assets/openproject_spatial_viewer/vendor.bundle.js'      => "#{JS_DIR}/vendor.bundle.js",
         '/assets/openproject_spatial_viewer/vendor/mesh-bvh.js'    => "#{JS_DIR}/vendor/mesh-bvh.js",
-        '/assets/openproject_spatial_viewer/viewer_engine.js'      => "#{JS_DIR}/viewer_engine.js"
+        '/assets/openproject_spatial_viewer/viewer_engine.js'      => "#{JS_DIR}/viewer_engine.js",
+        '/assets/openproject_spatial_viewer/layer_manager.js'      => "#{JS_DIR}/layer_manager.js"
       }.freeze
 
       def view_layouts_base_html_head(context = {})
         controller = context[:controller]
         return '' unless controller
         return '' unless controller.is_a?(::SpatialModelsController) ||
-                         controller.is_a?(::SpatialAnnotationsController)
+                         controller.is_a?(::SpatialAnnotationsController) ||
+                         controller.is_a?(::SpatialLayersController)
 
         vc = controller.view_context
         stylesheet = vc.stylesheet_link_tag(bust('/assets/openproject_spatial_viewer/viewer.css'))
         vendor_js = vc.nonced_javascript_include_tag(bust('/assets/openproject_spatial_viewer/vendor.bundle.js'), skip_pipeline: true)
         bvh_js = vc.nonced_javascript_include_tag(bust('/assets/openproject_spatial_viewer/vendor/mesh-bvh.js'), skip_pipeline: true)
         engine_js = vc.nonced_javascript_include_tag(bust('/assets/openproject_spatial_viewer/viewer_engine.js'), skip_pipeline: true)
+        layer_js = vc.nonced_javascript_include_tag(bust('/assets/openproject_spatial_viewer/layer_manager.js'), skip_pipeline: true)
 
-        "#{stylesheet}\n#{vendor_js}\n#{bvh_js}\n#{engine_js}".html_safe
+        "#{stylesheet}\n#{vendor_js}\n#{bvh_js}\n#{engine_js}\n#{layer_js}".html_safe
       end
 
       private

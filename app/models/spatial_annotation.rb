@@ -161,7 +161,13 @@ class SpatialAnnotation < ApplicationRecord
       parent_id: wp.parent_id,
       start_date: wp.start_date,
       due_date: wp.due_date,
-      estimated_hours: wp.estimated_hours
+      estimated_hours: wp.estimated_hours,
+      # { custom_field_id => [raw value string, ...] } -- always an array
+      # (even for a single-value field) so the client doesn't need to know
+      # the field's multi-value-ness just to read this back; see
+      # _renderCustomFieldsForType's `values` parameter.
+      custom_field_values: wp.custom_field_values.group_by(&:custom_field_id)
+                             .transform_values { |cvs| cvs.map(&:value) }
     }
   end
 

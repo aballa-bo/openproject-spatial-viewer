@@ -136,6 +136,20 @@ class SpatialAnnotationsController < ApplicationController
       attributes[attr] = params[param] if params[param].present?
     end
 
+    # Custom fields are type/project-specific (see SpatialModelsController#show,
+    # @custom_fields_by_type) -- the client only ever renders/sends the ones
+    # actually enabled for the selected type, so this is passed straight
+    # through to the same custom_field_values= setter the native work
+    # package form uses (ActsAsCustomizable; accepts either a scalar or an
+    # array per custom field id, covering single- and multi-value fields).
+    cfv = params[:wp_custom_field_values]
+    # ActionController::Parameters has no #any? (only #empty?/#keys/#include?
+    # etc. are delegated to the underlying hash) -- calling it raised
+    # NoMethodError, a 500 with an HTML body, which is why this failed with
+    # "Unexpected token '<' ... is not valid JSON" on the client instead of
+    # a normal JSON error response.
+    attributes[:custom_field_values] = cfv.to_unsafe_h if cfv.is_a?(ActionController::Parameters) && !cfv.empty?
+
     call = ::WorkPackages::CreateService.new(user: User.current).call(**attributes)
 
     if call.success?
@@ -158,6 +172,21 @@ class SpatialAnnotationsController < ApplicationController
     )
     # Blank string means "clear this field"; drop keys the client did not send.
     attrs = permitted.to_h.symbolize_keys.transform_values { |v| v == "" ? nil : v }
+
+    # Custom fields are a dynamic, type-specific set (see
+    # SpatialModelsController#show, @custom_fields_by_type) -- read directly
+    # rather than through the fixed `permit` list above, same as
+    # create_work_package's wp_custom_field_values. Passed straight through
+    # to the custom_field_values= setter the native work package form uses
+    # (ActsAsCustomizable); "" still means "clear this field" here too, same
+    # as every other attribute, and an empty array for a multi-value field
+    # already means that on its own (Array(nil) == Array("") == []).
+    cfv = params.dig(:work_package, :custom_field_values)
+    # ActionController::Parameters has no #any? -- see create_work_package's
+    # matching comment.
+    if cfv.is_a?(ActionController::Parameters) && !cfv.empty?
+      attrs[:custom_field_values] = cfv.to_unsafe_h.transform_values { |v| v == "" ? nil : v }
+    end
     return nil if attrs.empty?
 
     call = ::WorkPackages::UpdateService.new(user: User.current, model: wp).call(**attrs)

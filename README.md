@@ -7,9 +7,11 @@ Supported formats:
 
 | Format | Status |
 |---|---|
-| glTF / GLB | working (`THREE.GLTFLoader`) |
+| glTF / GLB (mesh) | working (`THREE.GLTFLoader`) |
+| glTF / GLB — Khronos `KHR_gaussian_splatting` | working as true per-splat rendering, decoded client-side (see *glTF Gaussian Splatting* below) |
+| PLY / Gaussian Splatting (`.ply`, `.splat`, `.ksplat`) | 3DGS-trained files render as true per-splat Gaussians; a plain colored `.ply` falls back to a point cloud |
+| Gaussian Splatting — PlayCanvas SOG (`.sog`) | working as true per-splat rendering, decoded client-side (see *SOG* below) |
 | OBJ / Wavefront | working (`THREE.OBJLoader`) |
-| PLY / Gaussian Splatting (`.ply`, `.splat`, `.ksplat`) | working as a point cloud |
 | IFC (BIM) | server-side `IfcConvert` → GLB, then rendered as GLB — see *IFC* |
 
 Tested on OpenProject 16.6.
@@ -21,28 +23,28 @@ Tested on OpenProject 16.6.
 - 3D markup tools: surface pin, polyline (points land exactly on the model
   surface), lasso, distance measurement. Sampling is screen-space and uses
   coalesced pointer events, so density is dense and scale-independent.
-- **The lasso is a screen-space gesture — it casts no rays while drawing.** The
-  path is collected in canvas pixels (interpolated to ~2 px) and stroked on a 2D
-  overlay canvas with `closePath()`, so it is dense, visibly closed *during* the
-  drag, and identical on a 10-triangle box or a 2-million-triangle scan.
-- The highlight is a **projective decal**. It re-renders the model's own
-  geometry with `LASSO_FS`, which re-projects every fragment through the camera
-  that made the selection (`uSelViewProj`) and tests it against the polygon in
-  *that* camera's NDC — so the tint is glued to the surface and **rotates with
-  the model**. Visibility is frozen at selection time by a depth map rendered
-  from the same camera (`_renderSelectionDepth`, RGBA-packed like three's shadow
-  maps): fragments that were occluded then stay excluded, so only the front
-  surface is ever highlighted. Pixel-exact boundary, no offset, no speckle,
-  identical for glb / ifc / gaussian-splat (the depth test is skipped for point
-  clouds, which `MeshDepthMaterial` cannot rasterise).
-- It updates live while drawing (uniform refresh only — same viewpoint), stays
-  on the annotation that was just created, and is rebuilt by
-  `showAnnotationSurface()` when a saved annotation is opened from the list.
-- `onModelLoaded` fits `camera.near`/`far` to the model so the selection depth
-  map has usable precision.
-- Only at pointer-up is the screen ring down-sampled to ≤64 points and
-  projected to 3D for storage (rays that miss the mesh fall back to the focal
-  plane, so the stored ring always has the drawn shape).
+- **The lasso outline is a screen-space gesture while dragging** — the path is
+  collected in canvas pixels and stroked on a 2D overlay canvas with
+  `closePath()`, so it is dense and visibly closed *during* the drag.
+- **The fill is built by raycasting, not by a shader.** `_buildLassoFill` lays
+  a grid of sample points over the lasso polygon's screen-space bounding box
+  (`pointInPolygon` keeps only the ones inside the drawn shape), casts one ray
+  per sample at the model (BVH-accelerated), and triangulates the hit points
+  into a real `THREE.Mesh` sitting exactly on the surface. Because every
+  vertex IS a literal ray-surface hit, the fill cannot drift out of alignment
+  the way a frozen-camera/depth-texture projection could — it is rebuilt fresh
+  from whatever `this.camera` and `this.modelMeshObjects` are at call time, so
+  it naturally spans every visible layer (mesh, IFC, point cloud) uniformly.
+- It updates live while drawing (coarser grid, for snappy drag updates), gets
+  one finer-quality rebuild at pointer-up, and is rebuilt again by
+  `showAnnotationSurface()` -> `_selectSurfaceInLasso()` whenever a saved
+  annotation is reopened (re-projecting its stored 3D ring through the
+  current camera, then re-running the same raycast-grid fill).
+- At pointer-up the screen ring is down-sampled to ≤220 points and projected
+  to 3D for storage (`_screenPathToWorldRing`; rays that miss the mesh fall
+  back to the focal plane) — 220 matches the resolution `_buildLassoFill`
+  itself uses for the live fill, so the replayed selection matches the shape
+  that was actually drawn instead of a coarser approximation of it.
 - The free-hand polyline tool still raycasts per point, but with a hard budget
   of 8 rays per pointer event so a heavy mesh cannot stall the UI.
 - `vendor/mesh-bvh.js` (three-mesh-bvh 0.5.23) accelerates those raycasts;
@@ -110,6 +112,111 @@ sudo systemctl restart openproject-web-1 openproject-worker-1
 
 Then hard-reload the browser (Ctrl+Shift+R) so the new `viewer_engine.js` is
 fetched instead of the cached copy.
+
+## "Download as .exe" (standalone Unity viewer)
+
+The viewer toolbar has a "Download as .exe" button that packages a model
+into a standalone Windows app: a **generic Unity player, built once** plus
+that model's layer files and a manifest. The server never builds Unity
+itself (this box has no Unity Editor, no Windows build tools, no GPU) — it
+only zips together a player that's already built and this model's data.
+
+- `app/services/spatial_viewer/unity_export_builder.rb` builds the zip:
+  the player tree, `data/manifest.json` (mirrors `api_data`'s shape with
+  local paths instead of URLs), the model's already-converted layer files,
+  and a `config.json` whose `api_key` is **always blank** — the desktop app
+  asks the end user for their own OpenProject personal API key on first run
+  and keeps it only in local app data; it is never embedded in the download.
+  All live sync from the desktop app (viewing/editing annotations and Work
+  Packages) reuses this plugin's existing JSON endpoints over HTTP Basic
+  auth (`apikey:<personal API key>`), the same mechanism OpenProject's own
+  API v3 docs describe — no separate sync API exists.
+- The Unity project source lives under `unity/SpatialViewerPlayer/` in this
+  repo (not picked up by the gemspec, so it never bloats the packaged gem).
+  Build it once in Unity Editor **on a machine that has Unity installed**
+  (this server does not), producing output under
+  `unity/SpatialViewerPlayer/dist/`.
+- Run `sudo bash install.sh` again after that build — step 7/8 deploys
+  `dist/` to `$ATTACHMENTS_STORAGE_PATH/unity_player/` (override with the
+  `SPATIAL_VIEWER_UNITY_PLAYER_DIR` environment variable). Until a build is
+  deployed there, the "Download as .exe" button stays hidden.
+- This is the first of several planned milestones: full core rendering
+  parity (point clouds, sections, render-quality panel), live annotation /
+  Work Package sync, creating annotations from inside Unity, VR locomotion,
+  and true Gaussian Splat rendering are not implemented yet.
+
+## SOG (Gaussian Splatting)
+
+`.sog` is PlayCanvas's "Spatially Ordered Gaussians" container — a zip of
+`meta.json` plus a handful of lossless WebP textures, each pixel holding one
+Gaussian's quantized data. Spec:
+<https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/sog/>.
+
+- Decoded entirely client-side in `parseSOG`/`decodeWebpToImageData`
+  (`viewer_engine.js`), reusing the same hand-rolled `unzipBuffer` already
+  used for OBJ/MTL/glTF bundle uploads, plus the browser's native WebP
+  decoder (`createImageBitmap` → canvas → `getImageData`).
+- Position (`means_l`/`means_u`), scale + rotation (`scales`/`quats`), DC
+  color + opacity (`sh0`) and, when present, degree-1/2 view-dependent color
+  (`shN`, first 8 of up to 15 coefficients/channel) are all decoded and
+  rendered as true per-splat elliptical Gaussians (`SplatRenderer`) — 3D→2D
+  covariance projection with back-to-front depth sorting, not a colored
+  point-cloud approximation. `.ply`/`.splat`/`.ksplat` 3DGS-trained files
+  (detected via `scale_*`/`rot_*`/`f_dc_*`/`opacity` properties) go through
+  the same renderer; a plain colored `.ply` with no Gaussian training data
+  falls back to the point-cloud approximation used for LAS.
+- `format === 'sog'` is checked before the generic zip-bundle sniff in
+  `_parseModel`, since a `.sog` file is itself a zip and would otherwise be
+  mistaken for an OBJ/glTF archive.
+- Registered as its own format end-to-end: `SpatialLayer::FORMATS`/
+  `KIND_BY_FORMAT` (auto-detected from the `.sog` extension for layers), the
+  `model_format` dropdown option (for the legacy single-file model slot),
+  and the `MODEL_CONTENT_TYPES`/`LAYER_CONTENT_TYPES` maps (served as
+  `application/octet-stream`, same as the other binary formats). No
+  server-side conversion step is involved — same as `.ply`/`.splat`.
+
+## glTF Gaussian Splatting (`KHR_gaussian_splatting`)
+
+A ratified Khronos glTF extension for storing 3D Gaussian splats directly in
+a `.glb`/`.gltf` mesh primitive (a `POINTS`-mode primitive with `POSITION`
+plus `KHR_gaussian_splatting:ROTATION`/`SCALE`/`OPACITY`/`SH_DEGREE_*`
+attribute semantics). Spec:
+<https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_gaussian_splatting>.
+
+- `THREE.GLTFLoader` (vendored here) has no idea this extension exists — it
+  logs an "Unknown extension" warning and drops whatever that primitive
+  described, which for a file that stores *all* its geometry this way means
+  "parsed fine" but an empty, mesh-less scene. `_parseGltf` detects the
+  extension up front (via `_gltfUsedExtensions`, reading the glTF JSON
+  directly rather than trusting GLTFLoader to report it) and routes those
+  files to `_parseGltfGaussianSplatting` instead, bypassing GLTFLoader
+  entirely for them.
+- Reads the glTF JSON + binary buffer (the GLB `BIN` chunk, or a `data:` URI
+  for a self-contained plain `.gltf`) directly: resolves accessors
+  (including interleaved ones via `byteStride`, and every documented
+  component type — `float32`/`snorm8`/`snorm16`/`uint8`/`unorm8`/`uint16`/
+  `unorm16` with correct normalization) without going through GLTFLoader's
+  own parsing, then builds true per-splat Gaussians the same way as `.sog`/
+  3DGS-`.ply` (`SplatRenderer`). Degree-1/2 spherical harmonics are decoded
+  when present (same cap as `.sog`/`.ply`, see `SplatRenderer`); degree 3 is
+  not read.
+- Unlike `.sog`/`.ply`, no axis-flip/chirality correction is applied: the
+  glTF coordinate system already matches three.js's.
+- The containing glTF node's world transform (walked from the scene's node
+  hierarchy, supporting both `matrix` and `translation`/`rotation`/`scale`
+  node properties) is applied via the resulting mesh's own
+  `position`/`quaternion`/`scale` — not baked into the splat data — so the
+  existing shader's `modelMatrix`-based covariance/lighting math (already
+  correct for every other mesh type in this viewer) handles it unchanged.
+- A primitive declaring `colorSpace: "lin_rec709_display"` (linear-light,
+  rather than the default/common `"srgb_rec709_display"`) gets a standard
+  sRGB OETF applied in the fragment shader before output, since this
+  viewer's custom `ShaderMaterial` bypasses three.js's own output-encoding
+  pipeline.
+- If `_parseGltfGaussianSplatting` finds the extension declared but can't
+  actually decode any primitive (missing/unreadable accessors), it falls
+  back to the normal GLTFLoader mesh path as a last resort rather than
+  giving up outright.
 
 ## Annotations & BCF
 

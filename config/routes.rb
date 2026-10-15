@@ -6,6 +6,13 @@ OpenProject::Application.routes.draw do
       member do
         get :api_data
         get :model_file
+        patch :set_start_view
+        get :download_exe
+      end
+      resources :spatial_layers, controller: 'spatial_layers', only: [:create, :update, :destroy] do
+        member do
+          get :file
+        end
       end
       resources :spatial_annotations, controller: 'spatial_annotations', only: [:index, :create, :update, :destroy] do
         member do

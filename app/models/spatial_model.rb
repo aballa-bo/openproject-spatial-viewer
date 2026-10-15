@@ -8,11 +8,12 @@ class SpatialModel < ApplicationRecord
   belongs_to :project
   belongs_to :uploader, class_name: "User"
   has_many :spatial_annotations, dependent: :destroy
+  has_many :spatial_layers, -> { ordered }, dependent: :destroy, inverse_of: :spatial_model
 
   validates :title, presence: true
   validates :project, presence: true
   validates :uploader, presence: true
-  validates :model_format, inclusion: { in: %w[gltf glb obj gaussian_splat ply splat ksplat ifc] }
+  validates :model_format, inclusion: { in: %w[gltf glb obj gaussian_splat ply splat ksplat sog ifc] }
 
   scope :defaults, -> { where(is_default: true) }
 
@@ -76,6 +77,24 @@ class SpatialModel < ApplicationRecord
     (settings || {}).fetch("conversion", {}) || {}
   end
 
+  # Camera position + orbit target the viewer opens with, set via the
+  # "Navigate" menu's "Set as start view" action. nil means "auto fit to view".
+  def start_view
+    (settings || {})["start_view"]
+  end
+
+  def set_start_view(position:, target:)
+    merged = (settings || {}).merge(
+      "start_view" => { "position" => vec3_attrs(position), "target" => vec3_attrs(target) }
+    )
+    update_column(:settings, merged) # rubocop:disable Rails/SkipsModelValidations
+  end
+
+  def clear_start_view
+    merged = (settings || {}).except("start_view")
+    update_column(:settings, merged) # rubocop:disable Rails/SkipsModelValidations
+  end
+
   def converted_file_ready?
     return false unless needs_conversion? && model_attachment.present?
 
@@ -127,5 +146,9 @@ class SpatialModel < ApplicationRecord
     FileUtils.rm_rf(conversion_dir.to_s) if id.present?
   rescue StandardError => e
     Rails.logger.warn("[SpatialViewer] Could not remove converted files for ##{id}: #{e.message}")
+  end
+
+  def vec3_attrs(h)
+    { "x" => h[:x].to_f, "y" => h[:y].to_f, "z" => h[:z].to_f }
   end
 end

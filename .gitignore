@@ -20,3 +20,17 @@ Thumbs.db
 
 # Node (only if a JS build is ever added)
 node_modules/
+
+# Unity (unity/SpatialViewerPlayer/) -- Editor-generated, never hand-authored;
+# the built player output (dist/) is deployed to the server by install.sh,
+# not committed -- it can be large and is reproducible from Assets/ + Packages/.
+unity/SpatialViewerPlayer/Library/
+unity/SpatialViewerPlayer/Temp/
+unity/SpatialViewerPlayer/Logs/
+unity/SpatialViewerPlayer/obj/
+unity/SpatialViewerPlayer/Build/
+unity/SpatialViewerPlayer/UserSettings/
+unity/SpatialViewerPlayer/.vs/
+unity/SpatialViewerPlayer/*.csproj
+unity/SpatialViewerPlayer/*.sln
+unity/SpatialViewerPlayer/dist/

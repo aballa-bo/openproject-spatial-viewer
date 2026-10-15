@@ -81,7 +81,12 @@ module SpatialViewer
               "IfcConvert not found. Install IfcOpenShell or set the IFCCONVERT_BIN environment variable."
       end
 
-      cmd = [bin, "-q", "-y", "--no-progress", "--center-model", input, output]
+      # NB: no --center-model. Layers of a model must stay in the coordinate
+      # system they were uploaded in so an IFC lines up with the mesh / point
+      # cloud layers. Set SPATIAL_VIEWER_IFC_CENTER=1 for standalone IFC use.
+      cmd = [bin, "-q", "-y", "--no-progress"]
+      cmd << "--center-model" if ENV["SPATIAL_VIEWER_IFC_CENTER"].to_s == "1"
+      cmd += [input, output]
       stdout = stderr = ""
       status = nil
 
