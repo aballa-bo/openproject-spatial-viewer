@@ -43,6 +43,23 @@
     return inside;
   }
 
+  // The pin cone is modeled base-at-origin, tip hanging down along local -Y
+  // (see place3DPin/renderExisting3DAnnotations) -- i.e. local +Y is its
+  // "away from the surface" direction. Previously the mesh was just left at
+  // the identity rotation, which only looks right when the surface normal
+  // happens to be world +Y (a floor); on a wall or ceiling the tip pointed
+  // straight down instead of into the surface, giving no visual cue of
+  // exactly where the pin actually sits. Rotating local +Y onto the real hit
+  // normal makes the tip touch the surface (pointing into it, opposite the
+  // normal) and the body stick out along the normal, on any surface.
+  function pinQuaternionFromNormal(normal) {
+    var n = (normal && isFinite(normal.x) && isFinite(normal.y) && isFinite(normal.z))
+      ? new THREE.Vector3(normal.x, normal.y, normal.z) : new THREE.Vector3(0, 1, 0);
+    if (n.lengthSq() < 1e-10) n.set(0, 1, 0);
+    n.normalize();
+    return new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), n);
+  }
+
   // Cap the polygon used for hit-testing so a long freehand stroke (up to
   // 4000 points) never makes the per-sample inside-test expensive.
   function downsamplePolyPx(path, maxPts) {
@@ -875,6 +892,13 @@
       g.add(obj);
       this.layersRoot.add(g);
       this.layerGroups[id] = g;
+      // A live reference (not a snapshot flag) to this layer's group, so
+      // _raycastAt can tell a hidden layer's surface apart from a visible
+      // one's without needing to invalidate anything when visibility is
+      // later toggled -- see that function for why this matters (THREE's
+      // Raycaster.intersectObjects does NOT check .visible on the objects
+      // it's handed directly, only during normal rendering).
+      (this._lastLayerMeshes || []).forEach(function(m) { m.userData.layerVisibilityGroup = g; });
       this._allLayerMeshes = (this._allLayerMeshes || []).concat(this._lastLayerMeshes || []);
       this.modelMeshObjects = this._allLayerMeshes;
       if (meta.visible !== false) this._fadeLayer(id, true, 320);
@@ -3289,7 +3313,7 @@
     this.raycaster.setFromCamera(this.mouse, this.camera);
 
     var pivot = null;
-    var meshes = this.modelMeshObjects || [];
+    var meshes = this._visibleRaycastTargets();
     if (meshes.length) {
       this._ensureBVH(); // keep the per-wheel raycast cheap on big meshes
       var hit = this.raycaster.intersectObjects(meshes, true)[0];
@@ -3450,13 +3474,54 @@
     console.log('[SpatialViewer] BVH: ' + todo.length + ' tree(s) in ' + Math.round(t1 - t0) + ' ms');
   };
 
+  // Only raycasts against layers that are actually visible right now.
+  // THREE.Raycaster.intersectObjects does not check an object's own (or its
+  // ancestors') .visible flag -- that's purely a rendering-time concern --
+  // so without this, hiding a layer in the panel only stopped it from being
+  // drawn, not from being hit: a pin/lasso/measurement click (or, via
+  // _onWheel, a scroll-zoom pivot) could silently land on a hidden layer's
+  // surface, which is wrong whenever two layers cover different areas of
+  // the same scene (common -- e.g. a point cloud and a mesh rarely have
+  // identical coverage). Shared by every raycast call site in this file --
+  // see _onWheel for the other one; _raycastAt was previously the only one
+  // filtered, which is why a wheel-zoom near a hidden layer could still
+  // pivot on it even after that fix.
+  SpatialViewerApp.prototype._visibleRaycastTargets = function() {
+    return (this.modelMeshObjects || []).filter(function(m) {
+      var lg = m.userData && m.userData.layerVisibilityGroup;
+      return !lg || lg.visible !== false;
+    });
+  };
+
   SpatialViewerApp.prototype._raycastAt = function(clientX, clientY) {
     var rect = this.canvas.getBoundingClientRect();
     this.mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
     this.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.mouse, this.camera);
-    var intersects = this.raycaster.intersectObjects(this.modelMeshObjects, true);
-    return intersects.length > 0 ? intersects[0] : null;
+    var intersects = this.raycaster.intersectObjects(this._visibleRaycastTargets(), true);
+    if (!intersects.length) return null;
+
+    // Prefer the nearest FRONT-facing hit over the raw nearest one.
+    // Real-world scanned/photogrammetric meshes routinely have noisy,
+    // near-duplicate or interior geometry (thin double surfaces, stitching
+    // artifacts); when the material renders double-sided, a stray
+    // back-facing triangle from one of those artifacts can end up slightly
+    // closer to the camera than the true outer surface at some pixels but
+    // not others. The raw nearest hit then intermittently lands on that
+    // artifact instead of the real surface -- a GENUINE ray-mesh
+    // intersection, so it looks correct from the exact angle it was picked
+    // at, but visibly detached from the surface from any other angle. This
+    // doesn't fully fix noisy mesh data (nothing in a raycaster can), but it
+    // removes the most common, well-understood cause of it.
+    var rayDir = this.raycaster.ray.direction;
+    for (var i = 0; i < intersects.length; i++) {
+      var hit = intersects[i];
+      if (!hit.face) return hit; // no face info (e.g. a Points object) -- nothing to prefer
+      var worldNormal = hit.face.normal.clone()
+        .applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld)).normalize();
+      if (worldNormal.dot(rayDir) < 0) return hit; // front-facing: normal points back toward the ray origin
+    }
+    return intersects[0]; // nothing front-facing (e.g. camera inside the mesh) -- fall back to nearest
   };
 
   SpatialViewerApp.prototype.getIntersection = function(e) {
@@ -3945,6 +4010,7 @@
     g.translate(0, 0.3, 0); g.rotateX(Math.PI);
     var mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: new THREE.Color(this.activeColor), roughness: 0.2 }));
     mesh.position.copy(point);
+    mesh.quaternion.copy(pinQuaternionFromNormal(normal));
     this.tempMarkupGroup.add(mesh);
     this.openAnnotationModal({ type: 'pin', points: [{x:point.x,y:point.y,z:point.z}], normal: {x:normal.x,y:normal.y,z:normal.z} });
   };
@@ -4407,6 +4473,7 @@
         g.translate(0, 0.35, 0); g.rotateX(Math.PI);
         var cone = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: col, roughness: 0.3 }));
         cone.position.set(pt.x, pt.y, pt.z);
+        cone.quaternion.copy(pinQuaternionFromNormal(gd.normal));
         cone.userData = { annotation: a };
         self.annotationsGroup.add(cone);
       } else if (a.annotation_type === 'lasso_selection' && gd.points && gd.points.length >= 3) {
