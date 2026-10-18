@@ -32,7 +32,14 @@ class SpatialModelsController < ApplicationController
     # Keyed by type id so the client can swap the rendered fields on change.
     @custom_fields_by_type = @wp_types.each_with_object({}) do |type, hash|
       wp = WorkPackage.new(project: @project, type:)
-      hash[type.id] = WorkPackage.available_custom_fields(wp).map do |cf|
+      # The "Area (m²)" field (see AddAreaCustomFieldForAnnotations) is
+      # system-synced from the linked lasso selection's geometry -- excluded
+      # from this plugin's own inline WP forms (both "create" and the
+      # annotation detail's "edit linked WP") so there's no second, editable
+      # copy that a save here would just overwrite. It still shows normally
+      # on the Work Package's own native OpenProject page.
+      available = WorkPackage.available_custom_fields(wp).reject { |cf| cf.name == SpatialAnnotation::AREA_CUSTOM_FIELD_NAME }
+      hash[type.id] = available.map do |cf|
         {
           id: cf.id,
           name: cf.name,

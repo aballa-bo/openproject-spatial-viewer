@@ -17,6 +17,9 @@ class SpatialAnnotation < ApplicationRecord
                      delete_permission: :create_spatial_annotations
 
   SNAPSHOT_DESCRIPTION = "snapshot"
+  # Must match the migration that creates this field
+  # (AddAreaCustomFieldForAnnotations::CUSTOM_FIELD_NAME).
+  AREA_CUSTOM_FIELD_NAME = "Area (m²)"
 
   belongs_to :spatial_model
   belongs_to :work_package
@@ -27,9 +30,11 @@ class SpatialAnnotation < ApplicationRecord
 
   before_validation :assign_viewpoint_uuid, on: :create
   before_save :assign_json_viewpoint
+  before_save :compute_lasso_area
   after_save :persist_pending_snapshot
   after_commit :sync_to_bcf, on: %i[create update]
   after_commit :remove_bcf_viewpoint, on: :destroy
+  after_commit :sync_work_package_area_custom_field, on: %i[create update destroy]
 
   validates :title, presence: true
   validates :spatial_model, :author, :work_package, presence: true
@@ -126,6 +131,7 @@ class SpatialAnnotation < ApplicationRecord
       description:,
       annotation_type:,
       color:,
+      area:,
       camera_viewpoint:,
       geometry_data:,
       json_viewpoint:,
@@ -134,6 +140,7 @@ class SpatialAnnotation < ApplicationRecord
       work_package_url:,
       work_package_subject: work_package&.subject,
       work_package_status: work_package&.status&.name,
+      work_package_type: work_package&.type&.name,
       work_package: work_package_detail_payload,
       bcf_issue_uuid: bcf_issue&.uuid,
       author_name: author&.name,
@@ -211,6 +218,84 @@ class SpatialAnnotation < ApplicationRecord
     ::SpatialViewer::AnnotationBcfSync.new(self).destroy_viewpoint
   rescue StandardError => e
     Rails.logger.warn("[SpatialViewer] BCF viewpoint cleanup failed for annotation ##{id}: #{e.message}")
+  end
+
+  # Mirrors this annotation's area onto the linked Work Package's "Area (m²)"
+  # custom field (see the AddAreaCustomFieldForAnnotations migration) -- but
+  # ONLY when that Work Package has exactly one linked lasso_selection
+  # annotation. A Work Package can have several annotations/viewpoints
+  # (same as a BCF issue can have several viewpoints), so with 0 or 2+ lasso
+  # selections there is no single unambiguous area to show; the field is
+  # left blank in that case rather than guessing (e.g. picking "the last one
+  # saved").
+  #
+  # Runs after_commit (not after_save) so the count query below sees this
+  # annotation's own just-committed row (or, on destroy, its absence).
+  def sync_work_package_area_custom_field
+    wp_id = work_package_id
+    return unless wp_id
+
+    field = WorkPackageCustomField.find_by(name: AREA_CUSTOM_FIELD_NAME)
+    return unless field
+
+    wp = WorkPackage.find_by(id: wp_id)
+    return unless wp
+
+    lassos = self.class.where(work_package_id: wp_id, annotation_type: "lasso_selection").to_a
+    value = lassos.first.area if lassos.size == 1
+
+    wp.custom_field_values = { field.id => value }
+    wp.save(validate: false)
+  rescue StandardError => e
+    Rails.logger.warn("[SpatialViewer] Could not sync area custom field for WP ##{wp_id}: #{e.message}")
+  end
+
+  # The area column is always derived, never client-supplied (not permitted
+  # in SpatialAnnotationsController#annotation_params) -- recomputed on every
+  # save, so any future change to geometry_data (e.g. redrawing the lasso)
+  # automatically keeps it current without the client needing to send it.
+  def compute_lasso_area
+    self.area = annotation_type == "lasso_selection" ? calculate_fill_area : nil
+  end
+
+  # Mirrors the client's triangulateLassoGrid (viewer_engine.js) exactly --
+  # same quad-to-2-triangles split, same "skip the triangle if any of its 3
+  # grid points is a null (no-surface-hit) cell" rule -- so the computed area
+  # matches what the user actually sees filled in on the model.
+  def calculate_fill_area
+    gd = (geometry_data || {}).with_indifferent_access
+    grid = gd[:fill_grid]
+    rows = gd[:fill_rows].to_i
+    cols = gd[:fill_cols].to_i
+    return nil unless grid.is_a?(Array) && rows > 1 && cols > 1 && grid.length >= rows * cols
+
+    total = 0.0
+    (0...(rows - 1)).each do |j|
+      (0...(cols - 1)).each do |k|
+        a = grid[(j * cols) + k]
+        b = grid[(j * cols) + k + 1]
+        c = grid[((j + 1) * cols) + k]
+        d = grid[((j + 1) * cols) + k + 1]
+        total += triangle_area(a, b, c) if a && b && c
+        total += triangle_area(b, d, c) if b && d && c
+      end
+    end
+    total.round(4)
+  rescue StandardError => e
+    Rails.logger.warn("[SpatialViewer] Could not compute fill area for annotation ##{id}: #{e.message}")
+    nil
+  end
+
+  def triangle_area(a, b, c)
+    ax, ay, az = a[0].to_f, a[1].to_f, a[2].to_f
+    bx, by, bz = b[0].to_f, b[1].to_f, b[2].to_f
+    cx, cy, cz = c[0].to_f, c[1].to_f, c[2].to_f
+    ux, uy, uz = bx - ax, by - ay, bz - az
+    vx, vy, vz = cx - ax, cy - ay, cz - az
+    nx = (uy * vz) - (uz * vy)
+    ny = (uz * vx) - (ux * vz)
+    nz = (ux * vy) - (uy * vx)
+    0.5 * Math.sqrt((nx**2) + (ny**2) + (nz**2))
   end
 
   # ---- geometry helpers --------------------------------------------------

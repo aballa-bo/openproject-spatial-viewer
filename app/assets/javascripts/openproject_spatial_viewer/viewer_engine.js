@@ -101,6 +101,9 @@
         if (app._animFrameId) cancelAnimationFrame(app._animFrameId);
         if (app._conversionPoll) clearTimeout(app._conversionPoll);
         if (app._gltfWorker) { try { app._gltfWorker.terminate(); } catch (ignore3) {} }
+        if (app._splatRenderers) {
+          app._splatRenderers.forEach(function(s) { try { if (s._worker) s._worker.terminate(); } catch (e) {} });
+        }
         if (typeof app._revokeBundleUrls === 'function') { try { app._revokeBundleUrls(); } catch (e) {} }
         app._modelBlob = null;
         if (app.modelMeshObjects) {
@@ -458,6 +461,10 @@
 
     this.annotationsGroup = new THREE.Group();
     this.scene.add(this.annotationsGroup);
+    // Per-frame billboard state for lasso label cards built in
+    // renderExisting3DAnnotations -- see _updateAnnotationLabels.
+    this._annotationLabels = [];
+    this._labelsVisible = true; // toggled by the toolbar's Labels button
 
     this.tempMarkupGroup = new THREE.Group();
     this.scene.add(this.tempMarkupGroup);
@@ -491,10 +498,30 @@
       if (self._layerFades) self._tickLayerFades();
       if (self._splatRenderers && self._splatRenderers.length) {
         var vw = self.viewport.clientWidth || 1, vh = self.viewport.clientHeight || 1;
+        var projCam = self.camera;
+        // In VR, self.camera's own projection is the flat/mono one -- neither
+        // eye actually renders through it. Each eye has its own asymmetric
+        // projection matrix and its own framebuffer resolution (can differ
+        // from the flat canvas entirely), both needed to size/place splats
+        // correctly on screen. Both eyes share effectively the same focal
+        // length and resolution in practice (only the asymmetric horizontal
+        // offset differs, which this shader doesn't model), so reading just
+        // eye 0 and reusing it for both eyes' draws is correct.
+        if (presenting && self.renderer.xr && self.renderer.xr.getCamera) {
+          var xrCam = self.renderer.xr.getCamera();
+          var eye0 = xrCam && xrCam.cameras && xrCam.cameras[0];
+          if (eye0 && eye0.viewport && eye0.viewport.z && eye0.viewport.w) {
+            vw = eye0.viewport.z;
+            vh = eye0.viewport.w;
+            projCam = eye0;
+          }
+        }
         for (var si = 0; si < self._splatRenderers.length; si++) {
-          self._splatRenderers[si].updateFrame(self.camera, vw, vh);
+          self._splatRenderers[si].updateFrame(self.camera, vw, vh, projCam);
         }
       }
+
+      if (self._annotationLabels && self._annotationLabels.length) self._updateAnnotationLabels();
 
       if (self.controls && !presenting) self.controls.update();
       // Frame-rate-driven sampling of the drawing stroke: guarantees a dense
@@ -811,6 +838,10 @@
     this.layerGroups = {};
     this.layerMeta = {};
     this.layerError = {};
+    // Each true-splat layer may own a background sort worker (see
+    // SplatRenderer) -- terminate them before dropping the references, or
+    // reloading layers repeatedly leaks one Worker thread per previous load.
+    (this._splatRenderers || []).forEach(function(s) { if (s._worker) s._worker.terminate(); });
     this._splatRenderers = [];
     this._allLayerMeshes = [];
     this.modelMeshObjects = [];
@@ -1306,7 +1337,7 @@
   // -- the caller falls back to the plain colored-point-cloud path, since
   // .ply/.splat/.ksplat are also used in this plugin for ordinary point
   // clouds with no Gaussian training data at all.
-  function parseSplatPLY(buffer) {
+  function parseSplatPLY(buffer, maxPoints) {
     var bytes = new Uint8Array(buffer);
     var headerEnd = -1;
     var ascii = '';
@@ -1373,7 +1404,8 @@
     }
 
     var dv = new DataView(buffer);
-    var step = count > TRUE_SPLAT_MAX_POINTS ? Math.ceil(count / TRUE_SPLAT_MAX_POINTS) : 1;
+    var cap = maxPoints || TRUE_SPLAT_MAX_POINTS;
+    var step = count > cap ? Math.ceil(count / cap) : 1;
     // Each dropped splat was itself covering part of the surface; thinning
     // the set to 1-in-`step` without compensation leaves visible gaps
     // between the survivors (reported as "big, separated dots" instead of a
@@ -1570,7 +1602,7 @@
   // term (shN, first 3 of its coefficients per channel only -- see
   // SplatRenderer for why degree is capped there) -- everything
   // SplatRenderer needs for true elliptical splat shading.
-  function parseSOG(buffer) {
+  function parseSOG(buffer, maxPoints) {
     return unzipBuffer(buffer).then(function(files) {
       var names = Object.keys(files);
       var metaName = names.filter(function(n) { return /(^|\/)meta\.json$/i.test(n); })[0];
@@ -1649,12 +1681,15 @@
         // reasonably representative of the whole scene rather than just its
         // first chunk.
         //
-        // Capped against TRUE_SPLAT_MAX_POINTS (not the point-cloud
-        // approximation's higher SPLAT_MAX_POINTS) -- SOG always has
-        // scale/quat data and always goes through the true-splat renderer
-        // (_buildTrueSplats), never the plain-point fallback, so it must
-        // respect that renderer's (lower) performance budget.
-        var step = count > TRUE_SPLAT_MAX_POINTS ? Math.ceil(count / TRUE_SPLAT_MAX_POINTS) : 1;
+        // Capped against the caller-supplied budget (see _parseModel --
+        // higher when the texture-indexed SplatRendererTex will actually be
+        // used, since it no longer pays per-splat-payload resort cost) or
+        // TRUE_SPLAT_MAX_POINTS as a default. SOG always has scale/quat data
+        // and always goes through the true-splat renderer (_buildTrueSplats),
+        // never the plain-point fallback, so it must respect one budget or
+        // the other.
+        var cap = maxPoints || TRUE_SPLAT_MAX_POINTS;
+        var step = count > cap ? Math.ceil(count / cap) : 1;
         // See parseSplatPLY's matching comment: compensate thinned-out
         // splats' scale so survivors still cover the gaps left by their
         // discarded neighbours, instead of reading as separated dots.
@@ -1957,8 +1992,23 @@
     '  float lambda2 = max(mid - rad, 0.01);',
     '  vec2 eig1 = (abs(b) > 1e-4) ? normalize(vec2(b, lambda1 - a)) : (a >= c ? vec2(1.0, 0.0) : vec2(0.0, 1.0));',
     '  vec2 eig2 = vec2(-eig1.y, eig1.x);',
-    '  float r1 = min(sqrt(lambda1) * 3.0, 2048.0);', // 3 sigma, clamped against pathological scales
-    '  float r2 = min(sqrt(lambda2) * 3.0, 2048.0);',
+    // 3 sigma, clamped against pathological scales -- PROPORTIONAL to the
+    // actual viewport, not a large fixed constant: a genuinely huge/needle
+    // Gaussian (common in real trained scenes -- poorly-constrained
+    // background/sparse-coverage regions routinely produce a few splats
+    // with scale far beyond the rest of the model) would otherwise balloon
+    // into a quad several times WIDER than the whole canvas on a modest
+    // viewport, dominating the screen and barely changing size as the
+    // camera moves (since it is pinned at the same oversized clamp across a
+    // wide range of distances) -- exactly the "stuck, wrong-looking area"
+    // symptom this fixes. Ported from PlayCanvas's own splat shader
+    // (verified by reading their bundled source, not guessed): same
+    // "1024, or the viewport if smaller" cap, applied to our own already-
+    // verified 3-sigma value rather than adopting their differently-scaled
+    // one, to change only what needed fixing.
+    '  float maxR = min(min(viewport.x, viewport.y), 1024.0);',
+    '  float r1 = min(sqrt(lambda1) * 3.0, maxR);',
+    '  float r2 = min(sqrt(lambda2) * 3.0, maxR);',
     '  vec2 screenOffsetPx = corner.x * eig1 * r1 + corner.y * eig2 * r2;',
     '  vec4 clip = projectionMatrix * mvPosition;',
     '  clip.xy += screenOffsetPx * (2.0 / viewport) * clip.w;',
@@ -2145,12 +2195,57 @@
     this._BUCKETS = 65536;
     this._counts = new Uint32Array(this._BUCKETS + 1);
     this._tmpMatrix = new THREE.Matrix4();
+    this._tmpDir = new THREE.Vector3();
     this._lastSeenPos = null;
     this._lastSeenQuat = null;
     this._idleSince = -Infinity; // forces a sort on the very first updateFrame, even with zero camera movement
     this._idleDelayMs = 140;
     this._dirty = true;
     this._moveEpsSq = 1e-6;
+
+    // Off-main-thread sort: the worker only ever computes and returns a
+    // reorder of splat INDICES (never touches the splat data itself, which
+    // stays untouched in srcInterleaved) -- see maybeResort for how this
+    // lets it run continuously in the background *while the camera moves*,
+    // without ever blocking the main thread, so the order for wherever the
+    // camera ends up is usually already computed by the time it actually
+    // settles. Ported from PlayCanvas's own GSplatSorter/SortWorker (verified
+    // by reading their actual bundled source, not guessed) -- same adaptive
+    // chunked pre-binning, see splat_sort_worker.js. Falls back to the
+    // original synchronous resort()/maybeResort() below when a Worker can't
+    // be created at all (very old/locked-down browsers).
+    this._worker = null;
+    this._workerBusy = false;
+    this._pendingOrder = null; // stashed here, only applied once idle -- see maybeResort
+    if (window.Worker) {
+      try {
+        this._worker = new Worker('/assets/openproject_spatial_viewer/splat_sort_worker.js');
+        var self = this;
+        this._worker.onmessage = function(ev) {
+          self._workerBusy = false;
+          // Kept as a Uint32Array view over the transferred buffer (not
+          // copied) until maybeResort actually consumes it below -- the
+          // buffer is handed back to the worker's pool right after that, so
+          // steady-state navigation never forces the worker to allocate a
+          // fresh multi-megabyte order array per resort (see
+          // splat_sort_worker.js's 'release' message).
+          if (ev.data && ev.data.type === 'order') self._pendingOrder = new Uint32Array(ev.data.order);
+        };
+        this._worker.onerror = function(err) {
+          console.warn('[SpatialViewer] splat sort worker failed, falling back to main-thread sort:', err && err.message);
+          self._worker = null;
+        };
+        // A fresh copy, sized exactly to the logical (possibly subarray'd)
+        // view -- transferring positions.buffer directly would hand the
+        // worker whatever backing allocation it happens to share, which can
+        // be larger than the n*3 floats actually in use.
+        var centersCopy = new Float32Array(positions);
+        this._worker.postMessage({ type: 'init', centers: centersCopy.buffer }, [centersCopy.buffer]);
+      } catch (err) {
+        console.warn('[SpatialViewer] could not create splat sort worker, falling back to main-thread sort:', err);
+        this._worker = null;
+      }
+    }
 
     this._applyOrder(this._order); // initial fill, unsorted (still correct, just not depth-ordered until the first resort)
   }
@@ -2212,16 +2307,61 @@
     this._applyOrder(order);
   };
 
-  // Resorts on IDLE, not on movement: a full resort reorders every splat's
-  // attributes (measured ~70-150ms at this renderer's point budget, mostly
-  // the attribute copy, not the O(n) bucket sort itself -- far too slow to
-  // run on every frame a moving camera would otherwise demand). Sorting
-  // *while* the camera is actively moving would mean a multi-frame stall
-  // repeating throughout the whole gesture; instead this waits for the
-  // camera to stop changing for _idleDelayMs before sorting once. The
-  // visible cost is a slightly stale blend order *during* motion (far less
-  // noticeable than a stutter) and a single settle-time hitch when the user
-  // stops to look, not a recurring one while they're actively navigating.
+  // The direction (in the splat data's own local space) along which depth is
+  // measured for sorting: row 2 of camera.matrixWorldInverse * mesh.matrixWorld,
+  // normalized. Folds in the mesh's own transform (non-identity for a
+  // glTF-embedded KHR_gaussian_splatting primitive, see
+  // _parseGltfGaussianSplatting), same vector resort() has always used for
+  // this -- just factored out so the worker path (below) and the fallback
+  // path can share it.
+  SplatRenderer.prototype._sortDirection = function(camera) {
+    var mv = this._tmpMatrix.multiplyMatrices(camera.matrixWorldInverse, this.mesh.matrixWorld);
+    var e = mv.elements;
+    return this._tmpDir.set(e[2], e[6], e[10]).normalize();
+  };
+
+  // Asks the worker to compute a fresh order for the current camera state.
+  // Never touches srcInterleaved/dataBuffer itself -- see onmessage in the
+  // constructor, which only stashes the result in _pendingOrder. Applying it
+  // (the actual expensive part, _applyOrder's copy) is a separate, later
+  // step -- see maybeResort below for why.
+  SplatRenderer.prototype._requestWorkerSort = function(camera) {
+    this._workerBusy = true;
+    var dir = this._sortDirection(camera);
+    var p = camera.position;
+    // Remembered so maybeResort can tell, once the reply lands, whether it
+    // was actually computed for where the camera ended up or for a slightly
+    // earlier position passed through while the worker was still busy with
+    // this very request -- see maybeResort's post-apply check.
+    this._requestedPos = (this._requestedPos || new THREE.Vector3()).copy(p);
+    this._requestedDir = (this._requestedDir || new THREE.Vector3()).copy(dir);
+    this._worker.postMessage({
+      type: 'camera',
+      position: { x: p.x, y: p.y, z: p.z },
+      direction: { x: dir.x, y: dir.y, z: dir.z }
+    });
+  };
+
+  // Still resorts on IDLE, not on movement -- a tempting first instinct with
+  // a worker available is "just apply every order as soon as it arrives,
+  // since the sort math is off-thread now." That doesn't actually help:
+  // _applyOrder's interleaved-buffer COPY (not the O(n) bucket sort the
+  // worker now does) is the expensive part (measured ~70-150ms at this
+  // renderer's point budget -- see _applyOrder/the constructor), and that
+  // copy still has to happen on the main thread regardless of where the sort
+  // itself runs. Applying every reply while the camera is still moving would
+  // mean a multi-frame stall *repeating throughout the whole gesture* --
+  // worse than before, not better.
+  //
+  // What the worker DOES change: while the camera is moving, this keeps
+  // asking it to compute a fresh order in the background (cheap -- just a
+  // postMessage, no main-thread blocking) via _pendingOrder, instead of doing
+  // nothing until the camera stops. By the time the camera has been idle for
+  // _idleDelayMs, the worker has very likely already finished computing the
+  // order for that final resting view during the motion/debounce window, so
+  // applying it only pays the copy cost, not copy+sort-compute. Same number
+  // of (still real) hitches as before -- one per idle-settle -- just a
+  // smaller one each time.
   SplatRenderer.prototype.maybeResort = function(camera) {
     var now = (window.performance && performance.now) ? performance.now() : Date.now();
     var p = camera.position, q = camera.quaternion;
@@ -2234,20 +2374,388 @@
       this._lastSeenQuat = (this._lastSeenQuat || new THREE.Quaternion()).copy(q);
       this._idleSince = now;
       this._dirty = true;
+      if (this._worker && !this._workerBusy) this._requestWorkerSort(camera);
       return;
     }
     if (!this._dirty) return; // already sorted for this resting view
     if (now - this._idleSince < this._idleDelayMs) return; // still inside the debounce window
 
+    if (this._worker) {
+      if (this._pendingOrder) {
+        var appliedBuf = this._pendingOrder.buffer;
+        this._applyOrder(this._pendingOrder);
+        this._pendingOrder = null;
+        // Hand the buffer back to the worker's pool now that its contents
+        // have been fully read -- see splat_sort_worker.js's 'release'
+        // handler. Keeps steady-state memory churn bounded during long
+        // navigation sessions instead of a fresh allocation per resort.
+        this._worker.postMessage({ type: 'release', buffer: appliedBuf }, [appliedBuf]);
+        // The order just applied was computed for whatever position/
+        // direction _requestWorkerSort last sent -- if the worker was still
+        // busy with that request while the camera kept drifting a little
+        // more before actually settling (routine while continuously
+        // orbiting: requests are only sent when the worker is free, so the
+        // last couple of moved-frames right before stopping can be skipped),
+        // what we just applied is for a slightly stale viewpoint, not the
+        // true final one. Silently calling that "done" (clearing _dirty)
+        // is exactly how a depth-sensitive region could end up stuck on a
+        // not-quite-right order after the camera visibly stops -- catch up
+        // with one more request instead, and leave _dirty set so this is
+        // re-checked once THAT reply lands too.
+        var dirNow = this._sortDirection(camera);
+        var stale = !this._requestedPos ||
+          this._requestedPos.distanceToSquared(p) > this._moveEpsSq ||
+          (1 - Math.abs(this._requestedDir.dot(dirNow))) > 1e-6;
+        if (stale && !this._workerBusy) {
+          this._requestWorkerSort(camera);
+        } else {
+          this._dirty = false;
+        }
+      } else if (!this._workerBusy) {
+        // Nothing computed yet for this view (e.g. the very first frame) --
+        // ask once; re-checked next tick once the reply lands.
+        this._requestWorkerSort(camera);
+      }
+      return;
+    }
+
     this.resort(camera);
     this._dirty = false;
   };
 
-  SplatRenderer.prototype.updateFrame = function(camera, viewportW, viewportH) {
+  // projCamera (optional) supplies the projection matrix used for the
+  // focal/viewport uniforms -- normally the same as camera, but during a
+  // WebXR session the caller passes one eye's sub-camera here instead (see
+  // initThree's render loop), since the flat `camera`'s own symmetric
+  // projection doesn't match either eye's actual asymmetric one. `camera`
+  // itself is still used for the depth-sort direction regardless -- three.js
+  // keeps its matrixWorld synced to the head's averaged pose in XR, so it
+  // stays correct for that purpose either way.
+  SplatRenderer.prototype.updateFrame = function(camera, viewportW, viewportH, projCamera) {
+    var pc = projCamera || camera;
     var u = this.mesh.material.uniforms;
     u.focal.value.set(
-      camera.projectionMatrix.elements[0] * viewportW * 0.5,
-      camera.projectionMatrix.elements[5] * viewportH * 0.5
+      pc.projectionMatrix.elements[0] * viewportW * 0.5,
+      pc.projectionMatrix.elements[5] * viewportH * 0.5
+    );
+    u.viewport.value.set(viewportW, viewportH);
+    this.maybeResort(camera);
+  };
+
+  // ---- True Gaussian-splat rendering, texture-indexed data (WebGL2) ------
+  // The non-texture SplatRenderer above reorders every splat's full 37-float
+  // record on every resort, which is the dominant cost of a resort (not the
+  // O(n) bucket sort -- see its own comments). PlayCanvas's own splat
+  // renderer (the actual production code behind the reference viewer the
+  // user compared this against -- read directly, not guessed) avoids that
+  // cost entirely a different way: splat data lives in textures, indexed by
+  // each splat's ORIGINAL id and never touched again after upload; the only
+  // thing a resort reorders is a tiny per-instance index telling each GPU
+  // instance which texel to read. Ported here using plain GLSL ES 1.00
+  // `texture2D` (not GLSL3 `texelFetch` + integer textures, which is what
+  // PlayCanvas's WebGL2 path actually uses) sampled at an exact texel-center
+  // UV -- a much older, lower-risk technique (predates GLSL3 entirely, long
+  // used for exactly this "treat a texture as a lookup array" purpose) that
+  // still gets the same result: the reordered-per-resort data shrinks from
+  // 37 floats/splat to 1.
+  //
+  // Requires WebGL2 (floating-point textures and vertex texture fetch are
+  // both guaranteed there, neither is on plain WebGL1) and a Worker (see
+  // _buildTrueSplats) -- SplatRenderer above remains the automatic fallback
+  // when either is unavailable, untouched.
+  function splatTexLayout(n) {
+    var w = Math.max(1, Math.ceil(Math.sqrt(n)));
+    var h = Math.max(1, Math.ceil(n / w));
+    return { width: w, height: h };
+  }
+
+  function makeSplatDataTexture(data, width, height) {
+    var tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.flipY = false; // plain row-major lookup table, not an image
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  // Same math as SPLAT_VERTEX_SHADER (copied verbatim from "vec4 mvPosition ="
+  // onward -- see that shader for how/why it's verified) -- the only
+  // difference is how center/covA/covB/colorOpacity/sh1-8 are obtained: a
+  // texture2D lookup per splat instead of a per-instance attribute.
+  var SPLAT_VERTEX_SHADER_TEX = [
+    'precision highp float;',
+    'attribute vec2 corner;',
+    'attribute float sourceIndex;', // the ONLY thing a resort ever rewrites here
+    'uniform vec2 texSize;',
+    'uniform sampler2D texCenter;',        // xyz = position
+    'uniform sampler2D texCovA;',          // xyz = Sxx, Sxy, Sxz
+    'uniform sampler2D texCovB;',          // xyz = Syy, Syz, Szz
+    'uniform sampler2D texColorOpacity;',  // rgb = RAW DC coefficient, a = opacity
+    'uniform sampler2D texSH1;',
+    'uniform sampler2D texSH2;',
+    'uniform sampler2D texSH3;',
+    'uniform sampler2D texSH4;',
+    'uniform sampler2D texSH5;',
+    'uniform sampler2D texSH6;',
+    'uniform sampler2D texSH7;',
+    'uniform sampler2D texSH8;',
+    'uniform vec2 focal;',    // fx, fy in pixels
+    'uniform vec2 viewport;', // drawing-buffer size in pixels
+    'varying vec4 vColor;',
+    'varying vec2 vPos;',
+    // Exact texel-center UV for a row-major, index = row*texSize.x + col
+    // layout -- texture2D at an exact texel center with NEAREST filtering
+    // reliably returns that one texel, independent of texture size.
+    'vec2 splatTexUV(float index) {',
+    '  float col = mod(index, texSize.x);',
+    '  float row = floor(index / texSize.x);',
+    '  return (vec2(col, row) + 0.5) / texSize;',
+    '}',
+    'void main() {',
+    '  vec2 suv = splatTexUV(sourceIndex);',
+    '  vec3 center = texture2D(texCenter, suv).xyz;',
+    '  vec3 covA = texture2D(texCovA, suv).xyz;',
+    '  vec3 covB = texture2D(texCovB, suv).xyz;',
+    '  vec4 colorOpacity = texture2D(texColorOpacity, suv);',
+    '  vec3 sh1 = texture2D(texSH1, suv).xyz;',
+    '  vec3 sh2 = texture2D(texSH2, suv).xyz;',
+    '  vec3 sh3 = texture2D(texSH3, suv).xyz;',
+    '  vec3 sh4 = texture2D(texSH4, suv).xyz;',
+    '  vec3 sh5 = texture2D(texSH5, suv).xyz;',
+    '  vec3 sh6 = texture2D(texSH6, suv).xyz;',
+    '  vec3 sh7 = texture2D(texSH7, suv).xyz;',
+    '  vec3 sh8 = texture2D(texSH8, suv).xyz;',
+    '  vec4 mvPosition = modelViewMatrix * vec4(center, 1.0);',
+    '  float zc = mvPosition.z;',
+    '  if (zc > -0.05) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }',
+    '  mat3 Vrk = mat3(',
+    '    covA.x, covA.y, covA.z,',
+    '    covA.y, covB.x, covB.y,',
+    '    covA.z, covB.y, covB.z',
+    '  );',
+    '  mat3 W = mat3(modelViewMatrix);',
+    '  mat3 J = mat3(',
+    '    focal.x / -zc, 0.0, 0.0,',
+    '    0.0, focal.y / -zc, 0.0,',
+    '    (focal.x * mvPosition.x) / (zc * zc), (focal.y * mvPosition.y) / (zc * zc), 0.0',
+    '  );',
+    '  mat3 T = J * W;',
+    '  mat3 cov2d = T * Vrk * transpose(T);',
+    '  float a = cov2d[0][0] + 0.25;',
+    '  float b = cov2d[0][1];',
+    '  float c = cov2d[1][1] + 0.25;',
+    '  float mid = 0.5 * (a + c);',
+    '  float diff = 0.5 * (a - c);',
+    '  float rad = sqrt(max(0.0, diff * diff + b * b));',
+    '  float lambda1 = mid + rad;',
+    '  float lambda2 = max(mid - rad, 0.01);',
+    '  vec2 eig1 = (abs(b) > 1e-4) ? normalize(vec2(b, lambda1 - a)) : (a >= c ? vec2(1.0, 0.0) : vec2(0.0, 1.0));',
+    '  vec2 eig2 = vec2(-eig1.y, eig1.x);',
+    // See SPLAT_VERTEX_SHADER's matching comment -- same viewport-proportional
+    // clamp, not a large fixed constant.
+    '  float maxR = min(min(viewport.x, viewport.y), 1024.0);',
+    '  float r1 = min(sqrt(lambda1) * 3.0, maxR);',
+    '  float r2 = min(sqrt(lambda2) * 3.0, maxR);',
+    '  vec2 screenOffsetPx = corner.x * eig1 * r1 + corner.y * eig2 * r2;',
+    '  vec4 clip = projectionMatrix * mvPosition;',
+    '  clip.xy += screenOffsetPx * (2.0 / viewport) * clip.w;',
+    '  gl_Position = clip;',
+    '  vec3 worldCenter = (modelMatrix * vec4(center, 1.0)).xyz;',
+    '  vec3 dir = normalize(worldCenter - cameraPosition);',
+    '  float dx = dir.x, dy = dir.y, dz = dir.z;',
+    '  float dxx = dx * dx, dyy = dy * dy, dzz = dz * dz;',
+    '  float dxy = dx * dy, dyz = dy * dz, dxz = dx * dz;',
+    '  vec3 col = 0.28209479177387814 * colorOpacity.rgb',
+    '    + 0.4886025119029199 * (-dy * sh1 + dz * sh2 - dx * sh3)',
+    '    + 1.0925484305920792 * dxy * sh4',
+    '    - 1.0925484305920792 * dyz * sh5',
+    '    + 0.31539156525252005 * (2.0 * dzz - dxx - dyy) * sh6',
+    '    - 1.0925484305920792 * dxz * sh7',
+    '    + 0.5462742152960396 * (dxx - dyy) * sh8',
+    '    + 0.5;',
+    '  vColor = vec4(clamp(col, 0.0, 1.0), colorOpacity.a);',
+    '  vPos = corner * 3.0;',
+    '}'
+  ].join('\n');
+
+  function SplatRendererTex(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear) {
+    var n = positions.length / 3;
+    this.count = n;
+    var layout = splatTexLayout(n);
+    var W = layout.width, H = layout.height, texN = W * H;
+    this._texW = W;
+
+    function buildTex(filler) {
+      var data = new Float32Array(texN * 4);
+      for (var i = 0; i < n; i++) filler(data, i);
+      return makeSplatDataTexture(data, W, H);
+    }
+
+    var texCenter = buildTex(function(d, i) {
+      var o = i * 4; d[o] = positions[i * 3]; d[o + 1] = positions[i * 3 + 1]; d[o + 2] = positions[i * 3 + 2];
+    });
+    var texCovA = buildTex(function(d, i) {
+      var o = i * 4; d[o] = cov6[i * 6]; d[o + 1] = cov6[i * 6 + 1]; d[o + 2] = cov6[i * 6 + 2];
+    });
+    var texCovB = buildTex(function(d, i) {
+      var o = i * 4; d[o] = cov6[i * 6 + 3]; d[o + 1] = cov6[i * 6 + 4]; d[o + 2] = cov6[i * 6 + 5];
+    });
+    var texColorOpacity = buildTex(function(d, i) {
+      var o = i * 4; d[o] = colors[i * 4]; d[o + 1] = colors[i * 4 + 1]; d[o + 2] = colors[i * 4 + 2]; d[o + 3] = colors[i * 4 + 3];
+    });
+    var shAll = [sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8];
+    var shTextures = shAll.map(function(sh) {
+      return buildTex(function(d, i) { var o = i * 4; d[o] = sh[i * 3]; d[o + 1] = sh[i * 3 + 1]; d[o + 2] = sh[i * 3 + 2]; });
+    });
+
+    var geom = new THREE.InstancedBufferGeometry();
+    geom.instanceCount = n;
+    geom.setAttribute('corner', new THREE.BufferAttribute(new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), 2));
+    geom.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 2, 1, 3]), 1));
+
+    // The only per-instance data a resort ever touches -- see the comment
+    // block above. Float, not an integer attribute type: GLSL ES 1.00 (no
+    // GLSL3 needed here, see above) has no integer vertex attributes, and a
+    // highp float exactly represents every integer up to 2^24, far above
+    // any splat count this viewer will ever see.
+    this._orderArray = new Float32Array(n);
+    for (var oi = 0; oi < n; oi++) this._orderArray[oi] = oi;
+    this._orderAttr = new THREE.InstancedBufferAttribute(this._orderArray, 1);
+    this._orderAttr.setUsage(THREE.DynamicDrawUsage);
+    geom.setAttribute('sourceIndex', this._orderAttr);
+
+    // Same reasoning as SplatRenderer's constructor: this geometry has no
+    // attribute named "position" either (the quad corner is "corner", real
+    // per-splat positions only exist in the data texture), so both of these
+    // must be set explicitly from the real splat positions.
+    var minX = Infinity, minY = Infinity, minZ = Infinity;
+    var maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (var i = 0; i < n; i++) {
+      var px = positions[i * 3], py = positions[i * 3 + 1], pz = positions[i * 3 + 2];
+      if (px < minX) minX = px; if (px > maxX) maxX = px;
+      if (py < minY) minY = py; if (py > maxY) maxY = py;
+      if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
+    }
+    geom.boundingBox = new THREE.Box3(new THREE.Vector3(minX, minY, minZ), new THREE.Vector3(maxX, maxY, maxZ));
+    geom.boundingSphere = new THREE.Sphere();
+    geom.boundingBox.getBoundingSphere(geom.boundingSphere);
+    geom.boundingSphere.radius *= 1.15;
+
+    var mat = new THREE.ShaderMaterial({
+      uniforms: {
+        focal: { value: new THREE.Vector2(1000, 1000) },
+        viewport: { value: new THREE.Vector2(1000, 1000) },
+        opacity: { value: 1.0 },
+        linearColor: { value: colorSpaceLinear ? 1.0 : 0.0 },
+        texSize: { value: new THREE.Vector2(W, H) },
+        texCenter: { value: texCenter },
+        texCovA: { value: texCovA },
+        texCovB: { value: texCovB },
+        texColorOpacity: { value: texColorOpacity },
+        texSH1: { value: shTextures[0] }, texSH2: { value: shTextures[1] },
+        texSH3: { value: shTextures[2] }, texSH4: { value: shTextures[3] },
+        texSH5: { value: shTextures[4] }, texSH6: { value: shTextures[5] },
+        texSH7: { value: shTextures[6] }, texSH8: { value: shTextures[7] }
+      },
+      vertexShader: SPLAT_VERTEX_SHADER_TEX,
+      fragmentShader: SPLAT_FRAGMENT_SHADER,
+      transparent: true,
+      blending: THREE.NormalBlending,
+      depthWrite: false,
+      depthTest: true
+    });
+
+    this.mesh = new THREE.Mesh(geom, mat);
+    this.mesh.raycast = function() {};
+    this.mesh.frustumCulled = true;
+
+    this._lastSeenPos = null;
+    this._lastSeenQuat = null;
+    this._moveEpsSq = 1e-6;
+    this._tmpMatrix = new THREE.Matrix4();
+    this._tmpDir = new THREE.Vector3();
+    this._workerBusy = false;
+
+    // Reordering is now 1 float/splat instead of 37 -- cheap enough to apply
+    // on every reply as it arrives, no idle-debounce needed. This is the
+    // actual point of this renderer; see SplatRenderer.maybeResort for why
+    // the non-texture version still has to debounce even with the same
+    // worker doing the sort math.
+    var self = this;
+    this._worker = new Worker('/assets/openproject_spatial_viewer/splat_sort_worker.js');
+    this._worker.onmessage = function(ev) {
+      self._workerBusy = false;
+      if (ev.data && ev.data.type === 'order') {
+        var buf = ev.data.order;
+        self._applyOrder(new Uint32Array(buf));
+        // Return the buffer to the worker's pool right after reading it --
+        // see splat_sort_worker.js's 'release' handler and the comment on
+        // SplatRenderer's onmessage above for why this matters during long
+        // navigation sessions.
+        self._worker.postMessage({ type: 'release', buffer: buf }, [buf]);
+      }
+    };
+    this._worker.onerror = function(err) {
+      console.warn('[SpatialViewer] splat sort worker failed:', err && err.message);
+    };
+    var centersCopy = new Float32Array(positions);
+    this._worker.postMessage({ type: 'init', centers: centersCopy.buffer }, [centersCopy.buffer]);
+  }
+
+  SplatRendererTex.prototype._applyOrder = function(order) {
+    var arr = this._orderArray;
+    for (var i = 0; i < order.length; i++) arr[i] = order[i];
+    this._orderAttr.needsUpdate = true;
+  };
+
+  SplatRendererTex.prototype._sortDirection = function(camera) {
+    var mv = this._tmpMatrix.multiplyMatrices(camera.matrixWorldInverse, this.mesh.matrixWorld);
+    var e = mv.elements;
+    return this._tmpDir.set(e[2], e[6], e[10]).normalize();
+  };
+
+  // Minimum time between resort requests while the camera keeps moving. A
+  // resort being one frame (<16ms) stale during continuous motion is
+  // visually imperceptible (same reasoning as the epsilon above), but
+  // requesting one on literally every moved frame means every single frame
+  // of a long drag/orbit gesture round-trips a postMessage and runs a full
+  // bucket sort over every splat in the worker -- at several million splats,
+  // sustained over a long navigation session, that adds up to real CPU and
+  // allocation churn for no visible benefit. Throttling to ~12/sec keeps
+  // depth order visually current while cutting that load by 4-5x.
+  SplatRendererTex.prototype._RESORT_MIN_INTERVAL_MS = 80;
+
+  SplatRendererTex.prototype.maybeResort = function(camera) {
+    if (this._workerBusy) return;
+    var now = (window.performance && performance.now) ? performance.now() : Date.now();
+    if (this._lastResortRequestAt && (now - this._lastResortRequestAt) < this._RESORT_MIN_INTERVAL_MS) return;
+    var p = camera.position, q = camera.quaternion;
+    var moved = !this._lastSeenPos ||
+      this._lastSeenPos.distanceToSquared(p) > this._moveEpsSq ||
+      (1 - Math.abs(this._lastSeenQuat.dot(q))) > 1e-6;
+    if (!moved) return;
+    this._lastSeenPos = (this._lastSeenPos || new THREE.Vector3()).copy(p);
+    this._lastSeenQuat = (this._lastSeenQuat || new THREE.Quaternion()).copy(q);
+    this._lastResortRequestAt = now;
+    this._workerBusy = true;
+    var dir = this._sortDirection(camera);
+    this._worker.postMessage({
+      type: 'camera',
+      position: { x: p.x, y: p.y, z: p.z },
+      direction: { x: dir.x, y: dir.y, z: dir.z }
+    });
+  };
+
+  // See SplatRenderer.prototype.updateFrame's comment for projCamera.
+  SplatRendererTex.prototype.updateFrame = function(camera, viewportW, viewportH, projCamera) {
+    var pc = projCamera || camera;
+    var u = this.mesh.material.uniforms;
+    u.focal.value.set(
+      pc.projectionMatrix.elements[0] * viewportW * 0.5,
+      pc.projectionMatrix.elements[5] * viewportH * 0.5
     );
     u.viewport.value.set(viewportW, viewportH);
     this.maybeResort(camera);
@@ -2256,11 +2764,47 @@
   // Builds the renderer, registers it for the per-frame focal/sort updates
   // (see the render loop in initThree), and returns the THREE.Mesh to add
   // to the scene -- same call shape as _buildSplatPoints/_buildPointCloud.
+  // Prefers the texture-indexed renderer (SplatRendererTex) -- WebGL2 and a
+  // Worker are both required for a real benefit from it (floating-point
+  // vertex-texture-fetch needs WebGL2; without a worker there's no
+  // background resort to feed it), falling back to the original
+  // SplatRenderer (which has its own, separate WebGL1-safe worker-or-not
+  // fallback already) when either is missing.
   SpatialViewerApp.prototype._buildTrueSplats = function(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear) {
-    var splat = new SplatRenderer(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear);
+    var splat;
+    var canUseTex = !!(window.Worker && this.renderer && this.renderer.capabilities && this.renderer.capabilities.isWebGL2);
+    if (canUseTex) {
+      try {
+        splat = new SplatRendererTex(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear);
+      } catch (err) {
+        console.warn('[SpatialViewer] texture-indexed splat renderer failed, falling back:', err);
+        splat = null;
+      }
+    }
+    if (!splat) {
+      splat = new SplatRenderer(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear);
+    }
     this._splatRenderers = this._splatRenderers || [];
     this._splatRenderers.push(splat);
     return splat.mesh;
+  };
+
+  // The decimation cap passed to parseSOG/parseSplatPLY/
+  // _parseGltfGaussianSplatting. SplatRendererTex no longer pays resort cost
+  // proportional to per-splat payload (see its own comments), so the point
+  // count that was previously capped specifically to bound THAT cost can be
+  // much higher when it's actually going to be used; same check
+  // _buildTrueSplats itself uses to choose between the two renderers.
+  // Keeping the original (lower) TRUE_SPLAT_MAX_POINTS for the SplatRenderer
+  // fallback matters: that renderer still reorders the full per-splat record
+  // on every resort, so a higher cap there would make its settle-hitch worse,
+  // not better.
+  SpatialViewerApp.prototype._splatPointCap = function() {
+    var canUseTex = !!(window.Worker && this.renderer && this.renderer.capabilities && this.renderer.capabilities.isWebGL2);
+    // 4,000,000 matches the existing LAS point-cloud cap (parseLAS) --
+    // already an accepted, working budget in this viewer for a
+    // per-point/per-splat GPU workload of this general shape.
+    return canUseTex ? 4000000 : TRUE_SPLAT_MAX_POINTS;
   };
 
   SpatialViewerApp.prototype._parseModel = function(buffer, format) {
@@ -2273,7 +2817,7 @@
     if (format === 'sog') {
       // Scale + rotation are required core fields in the SOG spec (unlike
       // shN), so a conformant .sog always has what true-splat rendering needs.
-      parseSOG(buffer).then(function(data) {
+      parseSOG(buffer, self._splatPointCap()).then(function(data) {
         self.onModelLoaded(self._buildTrueSplats(data.positions, data.cov6, data.colors,
           data.sh1, data.sh2, data.sh3, data.sh4, data.sh5, data.sh6, data.sh7, data.sh8));
       }).catch(function(err) {
@@ -2293,7 +2837,7 @@
       // with no Gaussian training data -- fall back to the point-cloud
       // approximation for that case, same as before.
       var splatData = null;
-      try { splatData = parseSplatPLY(buffer); }
+      try { splatData = parseSplatPLY(buffer, self._splatPointCap()); }
       catch (e) { console.warn('[SpatialViewer] 3DGS .ply parse failed, falling back to point cloud:', e); }
 
       if (splatData) {
@@ -2613,7 +3157,7 @@
   // scale. Returns null (not an error) when the file doesn't actually use
   // the extension, or no primitive could be decoded, so _parseGltf can fall
   // back to the normal GLTFLoader mesh path unchanged.
-  SpatialViewerApp.prototype._parseGltfGaussianSplatting = function(buffer) {
+  SpatialViewerApp.prototype._parseGltfGaussianSplatting = function(buffer, maxPoints) {
     var dv = new DataView(buffer);
     var json, binChunk = null;
     if (buffer.byteLength >= 12 && dv.getUint32(0, true) === 0x46546C67) {
@@ -2676,7 +3220,8 @@
         // Same decimation + scale-compensation as parseSOG/parseSplatPLY
         // (see their comments): thinning without growing the survivors
         // leaves visible gaps.
-        var step = n > TRUE_SPLAT_MAX_POINTS ? Math.ceil(n / TRUE_SPLAT_MAX_POINTS) : 1;
+        var cap = maxPoints || TRUE_SPLAT_MAX_POINTS;
+        var step = n > cap ? Math.ceil(n / cap) : 1;
         var scaleComp = step > 1 ? Math.cbrt(step) : 1;
         var outN = Math.floor((n + step - 1) / step);
 
@@ -2756,7 +3301,7 @@
 
     if (usedExt.indexOf('KHR_gaussian_splatting') !== -1) {
       var splats = null;
-      try { splats = self._parseGltfGaussianSplatting(buffer); }
+      try { splats = self._parseGltfGaussianSplatting(buffer, self._splatPointCap()); }
       catch (err) {
         console.warn('[SpatialViewer] KHR_gaussian_splatting parse failed, falling back to the normal glTF path:', err);
       }
@@ -3605,6 +4150,10 @@
   };
 
   SpatialViewerApp.prototype.onPointerDown = function(e) {
+    // Recorded unconditionally (even in orbit mode, which returns right
+    // below) so onPointerUp can tell a plain click on a label card from the
+    // end of an orbit drag -- see the label-click check there.
+    this._pdownClient = { x: e.clientX, y: e.clientY };
     if (this.currentTool === 'orbit' || e.button !== 0) return;
 
     var isLasso = this.currentTool === 'lasso';
@@ -3728,7 +4277,20 @@
     return true;
   };
 
-  SpatialViewerApp.prototype.onPointerUp = function() {
+  SpatialViewerApp.prototype.onPointerUp = function(e) {
+    // Clicking a lasso's label card (in orbit/navigate mode, i.e. no drawing
+    // tool active) opens the same annotation detail view as clicking its
+    // entry in the side panel's list -- same behavior, two entry points.
+    // Gated on "didn't drag" (a small pixel threshold since the pointer
+    // down) so releasing an orbit drag on top of a card doesn't trigger it.
+    if (this.currentTool === 'orbit' && e && !this.isDrawing) {
+      var moved = this._pdownClient &&
+        (Math.abs(e.clientX - this._pdownClient.x) > 5 || Math.abs(e.clientY - this._pdownClient.y) > 5);
+      if (!moved) {
+        var hitAnnotation = this._raycastAnnotationLabels(e.clientX, e.clientY);
+        if (hitAnnotation) { this.openAnnotationDetail(hitAnnotation); return; }
+      }
+    }
     if (!this.isDrawing) return;
     this.isDrawing = false;
     // Restore orbiting only if the orbit tool is active — leaving it enabled
@@ -4026,6 +4588,17 @@
   };
 
   SpatialViewerApp.prototype.captureSnapshot = function() {
+    // Every call site adds the new annotation's geometry (pin cone, outline,
+    // lasso fill) to the scene and calls this SYNCHRONOUSLY right after, in
+    // the same pointerup handler -- before the browser's next vsync, i.e.
+    // before setAnimationLoop gets to render a frame that actually contains
+    // it. Without forcing a render here first, toDataURL() reads back
+    // whatever the PREVIOUS frame already had in the buffer, which is from
+    // before this annotation's geometry existed -- the thumbnail then shows
+    // the model without the very thing it's supposed to be a preview of.
+    if (this.renderer && this.scene && this.camera) {
+      this.renderer.render(this.scene, this.camera);
+    }
     return this.renderer.domElement.toDataURL('image/png');
   };
 
@@ -4459,8 +5032,127 @@
     });
   };
 
+  // ---- Lasso annotation label cards ---------------------------------------
+  // A small always-camera-facing, semi-transparent card shown beside each
+  // saved lasso selection (title / linked WP type / description), connected
+  // to the selection's ring centroid by a line, colored from the
+  // annotation's own color. Built once per renderExisting3DAnnotations call
+  // (as a CanvasTexture, the same dependency-free "draw on a 2D canvas,
+  // upload as a texture" technique already used for the lasso's screen-space
+  // drag overlay); billboard orientation and distance-based scale are then
+  // updated every frame in _updateAnnotationLabels, never rebuilt.
+
+  // Greedy word-wrap against actual measured text width (ctx.font must
+  // already be set to the font this will be drawn with by the caller -- this
+  // sets it too, so a caller can rely on ctx.font being correct afterward).
+  // Truncates with an ellipsis if the text doesn't fit in maxLines.
+  function wrapCanvasTextLines(ctx, text, font, maxWidth, maxLines) {
+    ctx.font = font;
+    var words = String(text || '').split(/\s+/).filter(Boolean);
+    var lines = [];
+    var cur = '';
+    for (var i = 0; i < words.length && lines.length < maxLines; i++) {
+      var word = words[i];
+      // A single word wider than the box on its own (long URL, long compound
+      // word) can never be split onto a new line -- hard-truncate just that
+      // word so it can't overflow the card's edges.
+      while (word.length > 1 && ctx.measureText(word).width > maxWidth) word = word.slice(0, -1);
+      var test = cur ? cur + ' ' + word : word;
+      if (cur && ctx.measureText(test).width > maxWidth) {
+        lines.push(cur);
+        cur = word;
+      } else {
+        cur = test;
+      }
+    }
+    if (cur && lines.length < maxLines) lines.push(cur);
+    var consumedAllWords = lines.join(' ').split(/\s+/).length >= words.length;
+    if (!consumedAllWords && lines.length) {
+      var last = lines[lines.length - 1];
+      while (last.length > 1 && ctx.measureText(last + '…').width > maxWidth) {
+        last = last.slice(0, -1);
+      }
+      lines[lines.length - 1] = last + '…';
+    }
+    return lines;
+  }
+
+  // Renders the card's content (rounded semi-transparent rect in the
+  // annotation's own color, title/type/description with a dark text halo so
+  // it stays legible over any fill color) onto a fixed-size canvas.
+  function buildAnnotationLabelCanvas(a, colorHex) {
+    var W = 512, H = 300, pad = 32;
+    var canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    var ctx = canvas.getContext('2d');
+
+    var c = new THREE.Color(colorHex);
+    var rgb = Math.round(c.r * 255) + ',' + Math.round(c.g * 255) + ',' + Math.round(c.b * 255);
+
+    ctx.beginPath();
+    var x = 6, y = 6, w = W - 12, h = H - 12, r = 22;
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(' + rgb + ',0.72)';
+    ctx.fill();
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.stroke();
+
+    function drawTextHalo(text, tx, ty) {
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+      ctx.strokeText(text, tx, ty);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(text, tx, ty);
+    }
+
+    ctx.textBaseline = 'alphabetic';
+    var cy = pad + 28;
+
+    var titleLines = wrapCanvasTextLines(ctx, a.title || '(untitled)', 'bold 32px sans-serif', W - pad * 2, 2);
+    titleLines.forEach(function(line) { drawTextHalo(line, pad, cy); cy += 38; });
+
+    if (a.work_package_type) {
+      cy += 4;
+      ctx.font = '600 22px sans-serif';
+      drawTextHalo(String(a.work_package_type).toUpperCase(), pad, cy);
+      cy += 32;
+    }
+
+    if (a.description) {
+      cy += 6;
+      var maxDescLines = Math.max(1, Math.floor((H - pad - cy) / 28));
+      var descLines = wrapCanvasTextLines(ctx, a.description, '24px sans-serif', W - pad * 2, maxDescLines);
+      descLines.forEach(function(line) { drawTextHalo(line, pad, cy); cy += 28; });
+    }
+
+    return canvas;
+  }
+
   SpatialViewerApp.prototype.renderExisting3DAnnotations = function() {
-    while (this.annotationsGroup.children.length > 0) this.annotationsGroup.remove(this.annotationsGroup.children[0]);
+    // Dispose the previous build's GPU resources (geometry/material/canvas
+    // textures) before discarding them -- plain .remove() leaves them
+    // referenced by the renderer's internal WeakMap-keyed state until the
+    // object itself is GC'd, and this runs on every save/reload, not just
+    // once (see _setLassoHighlight for the same pattern already used for the
+    // lasso fill highlight).
+    while (this.annotationsGroup.children.length > 0) {
+      var oldChild = this.annotationsGroup.children[0];
+      oldChild.traverse(function(n) {
+        if (n.geometry) n.geometry.dispose();
+        if (n.material) {
+          if (n.material.map) n.material.map.dispose();
+          if (n.material.dispose) n.material.dispose();
+        }
+      });
+      this.annotationsGroup.remove(oldChild);
+    }
+    this._annotationLabels = [];
     if (!this.projectData || !this.projectData.annotations) return;
     var self = this;
     this.projectData.annotations.forEach(function(a) {
@@ -4488,6 +5180,46 @@
         // The translucent surface highlight is rebuilt on demand (flyToAnnotation)
         // from the annotation's stored viewpoint — recomputing it for every
         // annotation on load would be too costly on large models.
+
+        // Label card: title/type/description, billboarded every frame by
+        // _updateAnnotationLabels (fixed real-world size -- see
+        // ANNOTATION_LABEL_WIDTH_M there), connected to the ring's centroid
+        // by a line updated the same way.
+        var centroid = new THREE.Vector3();
+        ring.forEach(function(p) { centroid.add(p); });
+        centroid.divideScalar(ring.length);
+        var ringRadius = 0;
+        ring.forEach(function(p) { ringRadius = Math.max(ringRadius, p.distanceTo(centroid)); });
+
+        var labelCanvas = buildAnnotationLabelCanvas(a, a.color || '#3b82f6');
+        var tex = new THREE.CanvasTexture(labelCanvas);
+        tex.minFilter = THREE.LinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        var aspect = labelCanvas.width / labelCanvas.height;
+        // Geometry is built 1 world unit WIDE at scale 1, so group.scale (set
+        // uniformly in _updateAnnotationLabels) directly IS the card's real
+        // width in meters -- see ANNOTATION_LABEL_WIDTH_M there.
+        var plane = new THREE.Mesh(
+          new THREE.PlaneGeometry(1, 1 / aspect),
+          new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, side: THREE.DoubleSide })
+        );
+        plane.renderOrder = 1000;
+        var labelGroup = new THREE.Group();
+        labelGroup.add(plane);
+        labelGroup.userData = { annotation: a };
+        labelGroup.visible = self._labelsVisible !== false;
+        self.annotationsGroup.add(labelGroup);
+
+        var connLine = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([centroid.clone(), centroid.clone()]),
+          new THREE.LineBasicMaterial({ color: col, depthTest: false, transparent: true, opacity: 0.85 })
+        );
+        connLine.renderOrder = 998;
+        connLine.userData = { annotation: a };
+        connLine.visible = self._labelsVisible !== false;
+        self.annotationsGroup.add(connLine);
+
+        self._annotationLabels.push({ group: labelGroup, line: connLine, plane: plane, centroid: centroid, ringRadius: ringRadius, annotation: a });
       } else if (a.annotation_type === 'draw_polyline' && gd.points) {
         var pts = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
         var line = new THREE.Line(
@@ -4499,6 +5231,63 @@
         self.annotationsGroup.add(line);
       }
     });
+  };
+
+  // Fixed real-world width (meters) of every label card -- it is a physical
+  // object placed in the scene, not a screen-space UI overlay, so its
+  // on-screen size shrinks with distance purely through normal perspective
+  // projection (same as the pin cone's fixed 0.25 radius elsewhere in this
+  // file). Deliberately NOT distance-scaled: an earlier version scaled world
+  // size up with distance to keep apparent screen size constant, with a
+  // floor (MIN_SIZE) to stop text from vanishing -- but that floor meant the
+  // card visibly stopped shrinking past a certain distance instead of
+  // receding like everything else in the scene, which is what was reported
+  // as a bug.
+  var ANNOTATION_LABEL_WIDTH_M = 0.6;
+
+  // Billboards every live lasso label card to face the camera and keeps its
+  // connecting line anchored to the (fixed) ring centroid and the (moving)
+  // label position. Called every frame from the render loop -- cheap even
+  // for many annotations, since it only updates existing transforms/
+  // attributes, never rebuilds geometry or the canvas texture.
+  SpatialViewerApp.prototype._updateAnnotationLabels = function() {
+    var labels = this._annotationLabels;
+    if (!labels || !labels.length) return;
+    var camera = this.camera;
+    if (!camera) return;
+    var camRight = (this._annLabelTmpRight || (this._annLabelTmpRight = new THREE.Vector3()));
+    camRight.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+    var labelPos = (this._annLabelTmpPos || (this._annLabelTmpPos = new THREE.Vector3()));
+    var size = ANNOTATION_LABEL_WIDTH_M;
+    var offset0 = size * 0.75;
+    for (var i = 0; i < labels.length; i++) {
+      var L = labels[i];
+      labelPos.copy(L.centroid).addScaledVector(camRight, L.ringRadius + offset0);
+
+      L.group.position.copy(labelPos);
+      L.group.quaternion.copy(camera.quaternion);
+      L.group.scale.set(size, size, size);
+
+      var arr = L.line.geometry.attributes.position.array;
+      arr[0] = L.centroid.x; arr[1] = L.centroid.y; arr[2] = L.centroid.z;
+      arr[3] = labelPos.x; arr[4] = labelPos.y; arr[5] = labelPos.z;
+      L.line.geometry.attributes.position.needsUpdate = true;
+    }
+  };
+
+  // Hit-tests a click against every live label card's plane (not the model
+  // mesh -- see _raycastAt/_visibleRaycastTargets for that, a separate,
+  // unrelated target list). Returns the matching annotation, or null.
+  SpatialViewerApp.prototype._raycastAnnotationLabels = function(clientX, clientY) {
+    var labels = this._annotationLabels;
+    if (!labels || !labels.length || this._labelsVisible === false) return null;
+    var rect = this.canvas.getBoundingClientRect();
+    this.mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.mouse, this.camera);
+    var planes = labels.map(function(L) { return L.plane; });
+    var hits = this.raycaster.intersectObjects(planes, false);
+    return hits.length ? hits[0].object.parent.userData.annotation : null;
   };
 
   // Re-project a saved lasso annotation's 3D ring through the current camera
@@ -4578,6 +5367,7 @@
             esc(String(a.annotation_type || '').toUpperCase()) + '</span>' +
         '</div>' +
         (a.description ? '<div class="annotation-desc">' + esc(a.description) + '</div>' : '') +
+        (a.area != null ? '<div class="text-muted small">Area: ' + esc(a.area.toFixed(2)) + ' m²</div>' : '') +
         (a.work_package_id
           ? '<a class="annotation-wp-link" href="' + esc(a.work_package_url || ('/work_packages/' + a.work_package_id)) +
               '" target="_blank" rel="noopener" title="' + esc(a.work_package_subject || '') + '">' +
@@ -4626,6 +5416,12 @@
 
     setv('adTitle', a.title);
     setv('adDesc', a.description);
+    var areaGroup = $('adAreaGroup');
+    if (areaGroup) {
+      var hasArea = a.area != null;
+      areaGroup.style.display = hasArea ? '' : 'none';
+      if (hasArea) setv('adArea', a.area.toFixed(2) + ' m²');
+    }
     this._adColor = a.color || '#3b82f6';
     document.querySelectorAll('#adColorGroup .color-dot').forEach(function(d) {
       d.classList.toggle('active', (d.dataset.color || '').toLowerCase() === self._adColor.toLowerCase());
@@ -4933,6 +5729,19 @@
       layersPanel.style.display = 'none';
       if (layersBtn) layersBtn.classList.remove('active');
     });
+
+    var labelsBtn = document.getElementById('btnAnnotationLabels');
+    if (labelsBtn) {
+      labelsBtn.classList.toggle('active', this._labelsVisible);
+      labelsBtn.addEventListener('click', function() {
+        self._labelsVisible = !self._labelsVisible;
+        labelsBtn.classList.toggle('active', self._labelsVisible);
+        (self._annotationLabels || []).forEach(function(L) {
+          L.group.visible = self._labelsVisible;
+          L.line.visible = self._labelsVisible;
+        });
+      });
+    }
 
     this._initRenderPanel();
 
