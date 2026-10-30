@@ -21,6 +21,11 @@ Thumbs.db
 # Node (only if a JS build is ever added)
 node_modules/
 
+# viewer_engine.js is generated from app/assets/javascripts/openproject_spatial_viewer/engine/*.js
+# by bin/build-viewer-engine.sh (run automatically by install.sh) -- the
+# fragments are the source of truth, this is a build artifact.
+app/assets/javascripts/openproject_spatial_viewer/viewer_engine.js
+
 # Unity (unity/SpatialViewerPlayer/) -- Editor-generated, never hand-authored;
 # the built player output (dist/) is deployed to the server by install.sh,
 # not committed -- it can be large and is reproducible from Assets/ + Packages/.

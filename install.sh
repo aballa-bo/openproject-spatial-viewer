@@ -17,7 +17,10 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo "[1/8] Cleaning old modules and copying to $DEST_DIR..."
+echo "[1/9] Building viewer_engine.js from source fragments..."
+bash "$PLUGIN_SRC/bin/build-viewer-engine.sh"
+
+echo "[2/9] Cleaning old modules and copying to $DEST_DIR..."
 rm -rf "$OP_DIR/modules/openproject-3d_viewer" "$OP_DIR/modules/openproject-spatial_viewer" "$DEST_DIR"
 
 # Clean any previous entries from Gemfile.modules
@@ -27,20 +30,20 @@ sed -i "/openproject-spatial_viewer/d" "$OP_DIR/Gemfile.modules" 2>/dev/null || 
 cp -r "$PLUGIN_SRC" "$DEST_DIR"
 chown -R openproject:openproject "$DEST_DIR"
 
-echo "[2/8] Configuring Gemfile.modules..."
+echo "[3/9] Configuring Gemfile.modules..."
 if ! grep -q "openproject-spatial_viewer" "$OP_DIR/Gemfile.modules"; then
   sed -i "/group :opf_plugins do/a\\  gem '$PLUGIN_NAME', path: 'modules/$MODULE_DIR_NAME'" "$OP_DIR/Gemfile.modules"
   echo "[+] $PLUGIN_NAME entry added to group :opf_plugins."
 fi
 
-echo "[3/8] Installing Ruby dependencies (bundle install)..."
+echo "[4/9] Installing Ruby dependencies (bundle install)..."
 openproject run bundle config set frozen false
 openproject run bundle install
 
-echo "[4/8] Running database migrations..."
+echo "[5/9] Running database migrations..."
 openproject run rake db:migrate
 
-echo "[5/8] Deploying static assets for the 3D viewer..."
+echo "[6/9] Deploying static assets for the 3D viewer..."
 ASSET_DIR="$OP_DIR/public/assets/openproject_spatial_viewer"
 mkdir -p "$ASSET_DIR/vendor"
 
@@ -81,7 +84,7 @@ fi
 
 chown -R openproject:openproject "$ASSET_DIR"
 
-echo "[6/8] Clearing cache & checking IFC conversion toolchain..."
+echo "[7/9] Clearing cache & checking IFC conversion toolchain..."
 openproject run rake tmp:cache:clear
 
 if [ -x "$OP_DIR/bin/IfcConvert" ] || command -v IfcConvert >/dev/null 2>&1; then
@@ -97,7 +100,7 @@ STORAGE_ROOT="$(openproject run bundle exec rails runner 'print OpenProject::Con
 CONV_DIR="$STORAGE_ROOT/spatial_viewer"
 mkdir -p "$CONV_DIR" 2>/dev/null && chown -R openproject:openproject "$CONV_DIR" 2>/dev/null || true
 
-echo "[7/8] Deploying the Unity standalone player (for \"Download as .exe\")..."
+echo "[8/9] Deploying the Unity standalone player (for \"Download as .exe\")..."
 # The player itself is never built here -- this server has no Unity Editor,
 # no Windows build tools, no GPU. It is built once, out of band, by a
 # developer with Unity Editor from the project under unity/SpatialViewerPlayer/
@@ -116,7 +119,7 @@ else
   echo "    See README.md for the one-time Unity Editor build + deploy step."
 fi
 
-echo "[8/8] Restarting OpenProject services..."
+echo "[9/9] Restarting OpenProject services..."
 systemctl restart openproject-web-1 openproject-worker-1 2>/dev/null || openproject restart
 
 echo "========================================================="
