@@ -178,39 +178,14 @@
   // per frame while navigating.
   var TRUE_SPLAT_MAX_POINTS = 1000000;
 
-  var SPLAT_VERTEX_SHADER = [
-    'precision highp float;',
-    'attribute vec2 corner;',
-    'attribute vec3 center;',
-    'attribute vec3 covA;', // Sxx, Sxy, Sxz
-    'attribute vec3 covB;', // Syy, Syz, Szz
-    'attribute vec4 colorOpacity;', // rgb = RAW DC coefficient (not yet scaled/offset), a = opacity
-    // Spherical harmonics coefficients, degree 1 (sh1-3) and 2 (sh4-8),
-    // rgb per coefficient, zero when the source has no (or less) view-
-    // dependent data than this. Indices/signs match the reference 3DGS
-    // computeColorFromSH: sh[1]=y-term, sh[2]=z-term, sh[3]=x-term (degree
-    // 1); sh[4..8] per the degree-2 term below.
-    'attribute vec3 sh1;',
-    'attribute vec3 sh2;',
-    'attribute vec3 sh3;',
-    'attribute vec3 sh4;',
-    'attribute vec3 sh5;',
-    'attribute vec3 sh6;',
-    'attribute vec3 sh7;',
-    'attribute vec3 sh8;',
-    'uniform vec2 focal;',    // fx, fy in pixels
-    'uniform vec2 viewport;', // drawing-buffer size in pixels
-    // Selection highlight (see _updateSelectionSpotlight): splat color is
-    // baked-in SH, never relit by a real THREE.Light, so the spotlight's
-    // own falloff is approximated here by hand instead -- same center/
-    // radius/margin, computed once per splat in world space.
-    'uniform vec3 uSelCenter;',
-    'uniform float uSelRadius;',
-    'uniform float uSelFalloff;',
-    'uniform float uSelActive;',
-    'varying vec4 vColor;',
-    'varying vec2 vPos;',
-    'void main() {',
+  // Shared by SPLAT_VERTEX_SHADER and SPLAT_VERTEX_SHADER_TEX: once each has
+  // its own center/covA/covB/colorOpacity/sh1-8 in scope (as per-instance
+  // attributes there, as a texture2D lookup here), the rest -- covariance
+  // projection into a 2D screen-space ellipse, the SH view-dependent color
+  // evaluation, and the selection-highlight dimming -- is identical, so it
+  // lives here once instead of being kept in sync by hand across two
+  // 70-line copies.
+  var SPLAT_VERTEX_MAIN_BODY = [
     '  vec4 mvPosition = modelViewMatrix * vec4(center, 1.0);',
     '  float zc = mvPosition.z;',
     '  if (zc > -0.05) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }', // behind/at the camera: clip it
@@ -276,6 +251,10 @@
     '    - 1.0925484305920792 * dxz * sh7',
     '    + 0.5462742152960396 * (dxx - dyy) * sh8',
     '    + 0.5;',
+    // Selection highlight (see _updateSelectionSpotlight): splat color is
+    // baked-in SH, never relit by a real THREE.Light, so the spotlight's
+    // own falloff is approximated here by hand instead -- same center/
+    // radius/margin, computed once per splat in world space.
     '  float selFactor = 1.0;',
     '  if (uSelActive > 0.5) {',
     '    float selD = distance(worldCenter, uSelCenter);',
@@ -286,7 +265,38 @@
     '  vColor = vec4(clamp(col, 0.0, 1.0), colorOpacity.a);',
     '  vPos = corner * 3.0;', // corner in {-1..1} along each ellipse axis -> *3 = "how many sigma", since r1/r2 above already encode the 3-sigma extent
     '}'
-  ].join('\n');
+  ];
+
+  var SPLAT_VERTEX_SHADER = [
+    'precision highp float;',
+    'attribute vec2 corner;',
+    'attribute vec3 center;',
+    'attribute vec3 covA;', // Sxx, Sxy, Sxz
+    'attribute vec3 covB;', // Syy, Syz, Szz
+    'attribute vec4 colorOpacity;', // rgb = RAW DC coefficient (not yet scaled/offset), a = opacity
+    // Spherical harmonics coefficients, degree 1 (sh1-3) and 2 (sh4-8),
+    // rgb per coefficient, zero when the source has no (or less) view-
+    // dependent data than this. Indices/signs match the reference 3DGS
+    // computeColorFromSH: sh[1]=y-term, sh[2]=z-term, sh[3]=x-term (degree
+    // 1); sh[4..8] per the degree-2 term below.
+    'attribute vec3 sh1;',
+    'attribute vec3 sh2;',
+    'attribute vec3 sh3;',
+    'attribute vec3 sh4;',
+    'attribute vec3 sh5;',
+    'attribute vec3 sh6;',
+    'attribute vec3 sh7;',
+    'attribute vec3 sh8;',
+    'uniform vec2 focal;',    // fx, fy in pixels
+    'uniform vec2 viewport;', // drawing-buffer size in pixels
+    'uniform vec3 uSelCenter;',
+    'uniform float uSelRadius;',
+    'uniform float uSelFalloff;',
+    'uniform float uSelActive;',
+    'varying vec4 vColor;',
+    'varying vec2 vPos;',
+    'void main() {'
+  ].concat(SPLAT_VERTEX_MAIN_BODY).join('\n');
 
   var SPLAT_FRAGMENT_SHADER = [
     'precision highp float;',
@@ -750,10 +760,10 @@
     return tex;
   }
 
-  // Same math as SPLAT_VERTEX_SHADER (copied verbatim from "vec4 mvPosition ="
-  // onward -- see that shader for how/why it's verified) -- the only
-  // difference is how center/covA/covB/colorOpacity/sh1-8 are obtained: a
-  // texture2D lookup per splat instead of a per-instance attribute.
+  // Shares SPLAT_VERTEX_MAIN_BODY with SPLAT_VERTEX_SHADER (see its own
+  // comment) -- the only difference between the two is how
+  // center/covA/covB/colorOpacity/sh1-8 are obtained: a texture2D lookup
+  // per splat here instead of a per-instance attribute there.
   var SPLAT_VERTEX_SHADER_TEX = [
     'precision highp float;',
     'attribute vec2 corner;',
@@ -802,66 +812,8 @@
     '  vec3 sh5 = texture2D(texSH5, suv).xyz;',
     '  vec3 sh6 = texture2D(texSH6, suv).xyz;',
     '  vec3 sh7 = texture2D(texSH7, suv).xyz;',
-    '  vec3 sh8 = texture2D(texSH8, suv).xyz;',
-    '  vec4 mvPosition = modelViewMatrix * vec4(center, 1.0);',
-    '  float zc = mvPosition.z;',
-    '  if (zc > -0.05) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }',
-    '  mat3 Vrk = mat3(',
-    '    covA.x, covA.y, covA.z,',
-    '    covA.y, covB.x, covB.y,',
-    '    covA.z, covB.y, covB.z',
-    '  );',
-    '  mat3 W = mat3(modelViewMatrix);',
-    '  mat3 J = mat3(',
-    '    focal.x / -zc, 0.0, 0.0,',
-    '    0.0, focal.y / -zc, 0.0,',
-    '    (focal.x * mvPosition.x) / (zc * zc), (focal.y * mvPosition.y) / (zc * zc), 0.0',
-    '  );',
-    '  mat3 T = J * W;',
-    '  mat3 cov2d = T * Vrk * transpose(T);',
-    '  float a = cov2d[0][0] + 0.25;',
-    '  float b = cov2d[0][1];',
-    '  float c = cov2d[1][1] + 0.25;',
-    '  float mid = 0.5 * (a + c);',
-    '  float diff = 0.5 * (a - c);',
-    '  float rad = sqrt(max(0.0, diff * diff + b * b));',
-    '  float lambda1 = mid + rad;',
-    '  float lambda2 = max(mid - rad, 0.01);',
-    '  vec2 eig1 = (abs(b) > 1e-4) ? normalize(vec2(b, lambda1 - a)) : (a >= c ? vec2(1.0, 0.0) : vec2(0.0, 1.0));',
-    '  vec2 eig2 = vec2(-eig1.y, eig1.x);',
-    // See SPLAT_VERTEX_SHADER's matching comment -- same viewport-proportional
-    // clamp, not a large fixed constant.
-    '  float maxR = min(min(viewport.x, viewport.y), 1024.0);',
-    '  float r1 = min(sqrt(lambda1) * 3.0, maxR);',
-    '  float r2 = min(sqrt(lambda2) * 3.0, maxR);',
-    '  vec2 screenOffsetPx = corner.x * eig1 * r1 + corner.y * eig2 * r2;',
-    '  vec4 clip = projectionMatrix * mvPosition;',
-    '  clip.xy += screenOffsetPx * (2.0 / viewport) * clip.w;',
-    '  gl_Position = clip;',
-    '  vec3 worldCenter = (modelMatrix * vec4(center, 1.0)).xyz;',
-    '  vec3 dir = normalize(worldCenter - cameraPosition);',
-    '  float dx = dir.x, dy = dir.y, dz = dir.z;',
-    '  float dxx = dx * dx, dyy = dy * dy, dzz = dz * dz;',
-    '  float dxy = dx * dy, dyz = dy * dz, dxz = dx * dz;',
-    '  vec3 col = 0.28209479177387814 * colorOpacity.rgb',
-    '    + 0.4886025119029199 * (-dy * sh1 + dz * sh2 - dx * sh3)',
-    '    + 1.0925484305920792 * dxy * sh4',
-    '    - 1.0925484305920792 * dyz * sh5',
-    '    + 0.31539156525252005 * (2.0 * dzz - dxx - dyy) * sh6',
-    '    - 1.0925484305920792 * dxz * sh7',
-    '    + 0.5462742152960396 * (dxx - dyy) * sh8',
-    '    + 0.5;',
-    '  float selFactor = 1.0;',
-    '  if (uSelActive > 0.5) {',
-    '    float selD = distance(worldCenter, uSelCenter);',
-    '    float selT = clamp((selD - uSelRadius) / max(uSelFalloff, 0.001), 0.0, 1.0);',
-    '    selFactor = mix(1.0, 0.12, selT);',
-    '  }',
-    '  col *= selFactor;',
-    '  vColor = vec4(clamp(col, 0.0, 1.0), colorOpacity.a);',
-    '  vPos = corner * 3.0;',
-    '}'
-  ].join('\n');
+    '  vec3 sh8 = texture2D(texSH8, suv).xyz;'
+  ].concat(SPLAT_VERTEX_MAIN_BODY).join('\n');
 
   function SplatRendererTex(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear) {
     var n = positions.length / 3;
