@@ -100,19 +100,37 @@ order to produce `viewer_engine.js`; `install.sh` always runs it first.
 
 ```
 engine/
-  00_prelude.js            IIFE open, registration guard, canvas/HUD drawing
-                            helpers (annotation label cards, hover glow),
-                            lasso math helpers, DOM-ready bootstrap
-  10_core.js                SpatialViewerApp constructor, Three.js init,
+  00_prelude.js            File header comment, IIFE open, registration guard
+  05_geometry_utils.js     Small pure helpers with no DOM/scene dependency
+                            (esc, point-in-polygon, pin orientation, lasso
+                            grid triangulation)
+  10_core.js               SpatialViewerApp constructor, Three.js init,
                             render loop, render settings, view fit/home
-  20_model_loading.js      loadProjectData, per-format parsers (glTF/OBJ/
-                            bundle/IFC/splats), layer loading
+  20_layers.js             Multi-layer model loading orchestration: fetch
+                            sequencing, fade in/out, the layer panel
+  21_point_cloud_formats.js  load3DModel/_downloadModel (generic entry
+                            point for every format) + raw binary parsing
+                            for point-cloud/splat SOURCE formats (zip/PLY/
+                            LAS/.sog)
+  22_splat_rendering.js    Turns parsed point-cloud/splat data into THREE
+                            objects: plain point clouds, and the true
+                            Gaussian-splat renderers (SplatRenderer/
+                            SplatRendererTex) -- this plugin's namesake
+                            feature
+  23_parsers.js            _parseModel (the format dispatcher) + mesh-
+                            format parsing: zipped OBJ/glTF bundles, plain
+                            glTF/GLB, IFC
+  24_finalize.js           Post-load finalization (geometry sanitizing,
+                            onModelLoaded) and the demo model
   30_interaction_lasso.js  pointer/keyboard/XR input, raycasting, lasso
-                            drawing + fill + the 2D selection vignette
+                            drawing + fill, and the selection highlight (a
+                            real 3D spotlight -- see _updateSelectionSpotlight)
   40_annotations.js        pin/measurement/snapshot creation, annotation
                             modal, side panel, save/update/delete, labels
   50_ui_vr_ar.js           toolbar wiring, VR, AR (calibration, pin/lasso
-                            creation on site), tooltip/modal utils, IIFE close
+                            creation on site), tooltip/modal utils
+  60_bootstrap.js          app lifecycle: boot/teardown, the Turbo Drive
+                            navigation listeners, IIFE close
 ```
 
 To regenerate `viewer_engine.js` locally (e.g. to run `node --check` on it

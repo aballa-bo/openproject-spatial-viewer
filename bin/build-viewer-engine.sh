@@ -19,11 +19,17 @@ OUT="$JS_DIR/viewer_engine.js"
 
 FRAGMENTS="
 00_prelude.js
+05_geometry_utils.js
 10_core.js
-20_model_loading.js
+20_layers.js
+21_point_cloud_formats.js
+22_splat_rendering.js
+23_parsers.js
+24_finalize.js
 30_interaction_lasso.js
 40_annotations.js
 50_ui_vr_ar.js
+60_bootstrap.js
 "
 
 tmp="$OUT.build.tmp"

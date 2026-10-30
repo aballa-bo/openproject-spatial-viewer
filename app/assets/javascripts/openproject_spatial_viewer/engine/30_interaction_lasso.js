@@ -595,16 +595,16 @@
     // the drawn shape than the live fill saw. Kept high regardless, since a
     // coarser ring is still used for re-editing and for the fill_grid-based
     // Area computation server-side, even though the on-reload selection
-    // highlight (_updateSelectionVignette) only needs the ring's bounding
-    // box and wouldn't itself care about the resolution.
+    // highlight (_updateSelectionSpotlight) only needs the ring's centroid
+    // and radius and wouldn't itself care about the resolution.
     var ring = this._screenPathToWorldRing(path, 220);
     if (ring.length < 3) { this._clearLassoOverlay(); this.clearTempMarkup(); return; }
 
     this.currentDrawingPoints = ring;
     console.log('[SpatialViewer] lasso: ' + path.length + ' screen points -> ' + ring.length + ' 3D points');
 
-    // `points` (the ring) is what drives the selection vignette on reload
-    // (see _updateSelectionVignette) and stays available for potential
+    // `points` (the ring) is what drives the selection spotlight on reload
+    // (see _updateSelectionSpotlight) and stays available for potential
     // re-editing;
     // `fill_*` is the exact triangulated surface patch the user just saw,
     // stored as real 3D points purely for the Area custom field computation
@@ -769,8 +769,8 @@
     // Stashed so _finishLasso can persist this exact grid -- kept purely for
     // the Area custom field computation server-side (see
     // SpatialAnnotation#calculate_grid_fill_area); the saved annotation's
-    // on-reload highlight is the 2D selection vignette instead (see
-    // _updateSelectionVignette), not this grid.
+    // on-reload highlight is the 3D selection spotlight instead (see
+    // _updateSelectionSpotlight), not this grid.
     this._lastLassoGrid = { grid: grid, rows: rows, cols: cols };
 
     var positions = triangulateLassoGrid(grid, rows, cols);
@@ -800,239 +800,113 @@
     return group;
   };
 
-  // World point -> viewport-relative CSS pixel (same convention as
-  // _viewportPoint / this.lassoScreenPath), via the given camera. Used by
-  // the selection vignette (see _updateSelectionVignette) to find where a
-  // saved annotation's ring and label card land on screen each frame.
-  SpatialViewerApp.prototype._worldToPixel = function(worldPt, camera) {
-    var p = worldPt.clone().project(camera || this.camera);
-    var w = this.viewport.clientWidth || 1, h = this.viewport.clientHeight || 1;
-    return { x: (p.x + 1) / 2 * w, y: (1 - p.y) / 2 * h };
-  };
+  // Replaces the old 2D screen-space vignette (projecting the lasso ring to
+  // pixels and painting dark bands around it) with a real 3D light: a
+  // spotlight from the camera's own position, aimed at the selection, plus
+  // dimming the normal scene lights. Three.js places and orients it in
+  // world space every frame using the SAME transforms it already uses to
+  // render everything else -- there is no separate screen-projection path
+  // to drift out of sync with what's actually on screen, which is exactly
+  // where the vignette kept getting the position wrong.
+  var SELECTION_DIM_FACTOR = 0.22;
+  var SELECTION_SPOTLIGHT_COLOR = 0xfff2da;
+  var SELECTION_SPOTLIGHT_INTENSITY = 3.2;
+  // How far past the selection's own radius (in world units) the spotlight
+  // cone reaches -- a multiplier, not a fixed distance, so it scales with
+  // the selection's actual real-world size.
+  var SELECTION_SPOTLIGHT_CONE_MARGIN = 1.6;
+  // Splats/point clouds can't be relit by a THREE.Light at all -- their own
+  // dim floor (0.12) is hardcoded directly into the GLSL in
+  // SPLAT_VERTEX_SHADER/SPLAT_VERTEX_SHADER_TEX and _buildSplatPoints (see
+  // _updateSplatSelectionUniforms), since a JS-side constant here would be
+  // concatenated into those shader source strings before this file (which
+  // defines it) has even run.
 
-  // Draws the dark vignette into the 2D lasso overlay canvas (same element
-  // _drawLassoOverlay uses while actively drawing -- the two are never
-  // needed at once, so sharing it avoids a second always-present canvas
-  // layered over the viewport). `data` is null to just clear it.
-  //
-  // Not an ellipse, and not a flat near-zone either: the whole canvas starts
-  // at the "far" opacity, then `data.rings` -- concentric copies of the
-  // lasso's own screen-space shape (see _updateSelectionVignette), ordered
-  // OUTERMOST FIRST -- are each redrawn at their own exact opacity, biggest/
-  // highest-opacity ring first so every smaller ring drawn after it
-  // overwrites the center of its area with a lower value. The innermost
-  // ring (at the ~5cm margin) is opacity 0, so everything from the lasso's
-  // own boundary out to that margin stays fully, exactly transparent --
-  // never touched by any ring at all. `data.cardRect`, if given, is cut to
-  // fully transparent last, on top of everything -- the callout stays
-  // completely unaffected by the overlay, wherever it floats.
-  var VIGNETTE_MARGIN_OPACITY = 0.7;
-  var VIGNETTE_FAR_OPACITY = 0.8;
-
-  SpatialViewerApp.prototype._drawSelectionVignette = function(data) {
-    var c = this._ensureLassoOverlay();
-    var dpr = Math.min(window.devicePixelRatio || 1, 2);
-    var w = this.viewport.clientWidth, h = this.viewport.clientHeight;
-    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
-      c.width = Math.round(w * dpr);
-      c.height = Math.round(h * dpr);
-    }
-    var ctx = c.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-    if (!data || !data.rings || !data.rings.length) return;
-
-    ctx.fillStyle = 'rgba(4,6,9,' + VIGNETTE_FAR_OPACITY + ')';
-    ctx.fillRect(0, 0, w, h);
-
-    function fillPoly(pts) {
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-      ctx.closePath();
-      ctx.fill();
-    }
-
-    // Each ring: first erase whatever is already there in its shape (so the
-    // next fill sets an EXACT resulting opacity, not a blend on top of
-    // whatever the previous, larger ring left behind), then fill it flat at
-    // its own target opacity. Outermost-to-innermost order means every
-    // pixel's final value is set by the SMALLEST ring that contains it --
-    // i.e. the correct, closest-to-the-lasso value for that pixel.
-    for (var i = 0; i < data.rings.length; i++) {
-      var ring = data.rings[i];
-      ctx.save();
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.fillStyle = 'rgba(0,0,0,1)';
-      fillPoly(ring.points);
-      ctx.restore();
-
-      ctx.save();
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.fillStyle = 'rgba(4,6,9,' + ring.opacity + ')';
-      fillPoly(ring.points);
-      ctx.restore();
-    }
-
-    // The callout card: cut to fully transparent on top of everything --
-    // it's a crisp rectangle, not a blobby selection shape, and it must
-    // never be dimmed at all, right up to its own edge.
-    if (data.cardRect) {
-      ctx.save();
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.fillStyle = 'rgba(0,0,0,1)';
-      ctx.fillRect(data.cardRect.minX, data.cardRect.minY,
-        data.cardRect.maxX - data.cardRect.minX, data.cardRect.maxY - data.cardRect.minY);
-      ctx.restore();
-    }
-  };
-
-  // Recomputes and redraws the selection vignette every frame (screen-space,
-  // so it has to track the ring's (and label card's) projected position as
-  // the camera orbits) -- see this.showAnnotationSurface, which sets/clears
-  // this._selectedLassoAnnotation, and closeAnnotationDetail, which clears
-  // it. Cheap no-op (one flag check) whenever nothing is selected.
-  //
-  // Algorithm (as specified): project the lasso's ring to its 2D shape on
-  // screen (NOT its bounding ellipse -- see _drawSelectionVignette). Inside
-  // the ring, and out to a margin of ~5cm beyond it, stays fully
-  // transparent -- untouched by any opacity at all. From that margin
-  // outward, opacity ramps up smoothly, reaching its maximum exactly at the
-  // viewport's own edges. The label card is handled completely separately
-  // (its own cardRect, cut fully transparent) rather than folded into the
-  // same shape, so it's never darkened regardless of where it floats
-  // relative to the ring.
-  //
-  // camera.updateMatrixWorld() is forced here (not left to the renderer)
-  // because this runs mid-frame, before OrbitControls' own update/render
-  // pass refreshes the camera's cached world matrix -- without it, every
-  // projection below would read the PREVIOUS frame's camera transform, one
-  // step behind, which is what made the vignette look like it wasn't
-  // tracking camera movement at all.
-  var SELECTION_VIGNETTE_MARGIN_M = 0.05;
-
-  SpatialViewerApp.prototype._updateSelectionVignette = function() {
+  // Recomputes the selection highlight every frame -- see
+  // this.showAnnotationSurface, which sets/clears this._selectedLassoAnnotation,
+  // and closeAnnotationDetail, which clears it. Cheap no-op (one flag check)
+  // whenever nothing is selected.
+  SpatialViewerApp.prototype._updateSelectionSpotlight = function() {
     var a = this._selectedLassoAnnotation;
-    if (!a) {
-      if (this._vignetteActive) { this._clearLassoOverlay(); this._vignetteActive = false; }
-      return;
-    }
-    var gd = a.geometry_data;
-    if (!gd || !gd.points || gd.points.length < 3) {
-      this._clearLassoOverlay();
-      this._vignetteActive = false;
+    var gd = a && a.geometry_data;
+    if (!a || !gd || !gd.points || gd.points.length < 3) {
+      if (this._selectionLit) this._clearSelectionSpotlight();
       return;
     }
 
-    var self = this;
     var camera = this.camera;
     if (!camera) return;
-    camera.updateMatrixWorld();
 
     var ring = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
-    var centroid3d = new THREE.Vector3();
-    ring.forEach(function(p) { centroid3d.add(p); });
-    centroid3d.divideScalar(ring.length);
+    var centroid = new THREE.Vector3();
+    ring.forEach(function(p) { centroid.add(p); });
+    centroid.divideScalar(ring.length);
+    var radius = 0.05;
+    ring.forEach(function(p) { radius = Math.max(radius, p.distanceTo(centroid)); });
 
-    // Pixels-per-5cm at the ring's own depth: project the centroid and a
-    // point 5cm to one side of it (along the camera's own right axis, so
-    // it's measured across the screen, not into it) and measure the pixel
-    // distance between the two -- perspective-correct, unlike a flat pixel
-    // constant that would look right at one zoom level and wrong at every
-    // other.
-    var camRight = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0).normalize();
-    var centroidPx = this._worldToPixel(centroid3d, camera);
-    var marginPx = this._worldToPixel(centroid3d.clone().addScaledVector(camRight, SELECTION_VIGNETTE_MARGIN_M), camera);
-    var margin = Math.max(8, Math.abs(marginPx.x - centroidPx.x));
+    this._selectionLit = true;
+    this._applySelectionDim(true);
 
-    // Project the ring to its actual 2D screen shape, then build many
-    // concentric copies of it, each vertex pushed outward from the shape's
-    // own 2D centroid -- this keeps every band the lasso's own silhouette
-    // (just bigger), not an unrelated ellipse around its bounding box. The
-    // offset/opacity pairing for each band comes from the keypoints below
-    // (0% at the boundary itself, VIGNETTE_MARGIN_OPACITY at the ~5cm
-    // margin, VIGNETTE_FAR_OPACITY at the farthest viewport corner) -- see
-    // _drawSelectionVignette for how the bands are composited into a smooth
-    // ramp.
-    var screenRing = ring.map(function(p) { return self._worldToPixel(p, camera); });
-    var c2 = { x: 0, y: 0 };
-    screenRing.forEach(function(p) { c2.x += p.x; c2.y += p.y; });
-    c2.x /= screenRing.length; c2.y /= screenRing.length;
+    var spot = this.selectionSpotlight;
+    var camPos = camera.position;
+    var distToCam = Math.max(0.1, camPos.distanceTo(centroid));
+    spot.position.copy(camPos);
+    spot.target.position.copy(centroid);
+    spot.target.updateMatrixWorld();
+    // Half-angle derived from the selection's real-world radius and the
+    // ACTUAL camera distance -- the cone always frames the same real-world
+    // area regardless of zoom, rather than a fixed angle that would look
+    // right at one distance and wrong at every other.
+    spot.angle = Math.min(Math.PI / 2.1, Math.max(0.05, Math.atan2(radius * SELECTION_SPOTLIGHT_CONE_MARGIN, distToCam)));
+    spot.distance = distToCam + radius * 6;
+    spot.intensity = SELECTION_SPOTLIGHT_INTENSITY;
 
-    function offsetRingBy(amount) {
-      return screenRing.map(function(p) {
-        var dx = p.x - c2.x, dy = p.y - c2.y;
-        var len = Math.sqrt(dx * dx + dy * dy);
-        if (len < 1e-6) return { x: p.x, y: p.y };
-        var k = (len + amount) / len;
-        return { x: c2.x + dx * k, y: c2.y + dy * k };
-      });
-    }
+    this._updateSplatSelectionUniforms(centroid, radius, radius * SELECTION_SPOTLIGHT_CONE_MARGIN, true);
+  };
 
-    var vw = this.viewport.clientWidth, vh = this.viewport.clientHeight;
-    var maxCornerDist = 0;
-    [[0, 0], [vw, 0], [0, vh], [vw, vh]].forEach(function(pt) {
-      var d = Math.hypot(pt[0] - c2.x, pt[1] - c2.y);
-      if (d > maxCornerDist) maxCornerDist = d;
+  SpatialViewerApp.prototype._clearSelectionSpotlight = function() {
+    this._selectionLit = false;
+    if (this.selectionSpotlight) this.selectionSpotlight.intensity = 0;
+    this._applySelectionDim(false);
+    this._updateSplatSelectionUniforms(null, 0, 1, false);
+  };
+
+  // Dims (or restores) the normal scene lights. Reuses _baseLightIntensities
+  // (the same per-light formula _applyRenderSettingsUnsafe itself uses) so
+  // this always dims relative to whatever the render-settings sliders are
+  // currently set to, rather than a remembered value that could go stale if
+  // those sliders change while a selection is active.
+  SpatialViewerApp.prototype._applySelectionDim = function(active) {
+    var base = this._baseLightIntensities();
+    var k = active ? SELECTION_DIM_FACTOR : 1;
+    if (this.ambientLight) this.ambientLight.intensity = base.ambient * k;
+    if (this.keyLight) this.keyLight.intensity = base.key * k;
+    if (this.fillLight) this.fillLight.intensity = base.fill * k;
+    if (this.hemiLight) this.hemiLight.intensity = base.hemi * k;
+  };
+
+  // Pushes the selection's world-space center/radius into every
+  // material that can't be relit by a THREE.Light at all (true splats'
+  // own ShaderMaterial, and the plain point-cloud fallback's
+  // onBeforeCompile-injected uniforms -- see _buildSplatPoints and
+  // _buildTrueSplats) so they dim/brighten in step with the real spotlight
+  // instead of staying flat regardless of selection.
+  SpatialViewerApp.prototype._updateSplatSelectionUniforms = function(center, radius, falloff, active) {
+    (this._splatRenderers || []).forEach(function(sr) {
+      var u = sr && sr.mesh && sr.mesh.material && sr.mesh.material.uniforms;
+      if (!u || !u.uSelCenter) return;
+      if (active) u.uSelCenter.value.copy(center);
+      u.uSelRadius.value = radius;
+      u.uSelFalloff.value = falloff;
+      u.uSelActive.value = active ? 1 : 0;
     });
-    // Generous overshoot: the radial-from-centroid offset isn't a true
-    // uniform (Minkowski) outward offset, so an irregular ring can reach a
-    // given corner slower in some directions than others -- doubling the
-    // raw corner distance keeps the outermost band safely past every
-    // corner regardless of the ring's own shape.
-    var maxReach = margin + 2 * Math.max(40, maxCornerDist - margin);
-
-    // Three checkpoints, piecewise-linear between them: 0% right at the
-    // lasso's own boundary, 70% at the ~5cm margin, 80% at the viewport
-    // edge. Built as flat (offset, opacity) samples across both segments,
-    // then sorted outermost-first -- see _drawSelectionVignette for why
-    // that order matters.
-    var keypoints = [
-      { offset: 0, opacity: 0 },
-      { offset: margin, opacity: VIGNETTE_MARGIN_OPACITY },
-      { offset: maxReach, opacity: VIGNETTE_FAR_OPACITY }
-    ];
-    var SUBSTEPS = 6;
-    var samples = [];
-    for (var seg = 0; seg < keypoints.length - 1; seg++) {
-      var kp0 = keypoints[seg], kp1 = keypoints[seg + 1];
-      for (var s = 0; s <= SUBSTEPS; s++) {
-        var t = s / SUBSTEPS;
-        samples.push({
-          offset: kp0.offset + t * (kp1.offset - kp0.offset),
-          opacity: kp0.opacity + t * (kp1.opacity - kp0.opacity)
-        });
-      }
-    }
-    samples.sort(function(p, q) { return q.offset - p.offset; });
-    var rings = samples.map(function(s) { return { points: offsetRingBy(s.offset), opacity: s.opacity }; });
-
-    // The label card's own screen rect -- kept separate from `rings` (see
-    // the function comment above) -- by projecting its real on-screen
-    // corners (not a guessed fixed padding), so this stays correct whether
-    // the card is tiny from far away or filling half the screen up close.
-    var cardRect = null;
-    var L = (this._annotationLabels || []).filter(function(e) { return e.annotation && e.annotation.id === a.id; })[0];
-    if (L && L.plane && L.plane.geometry && L.plane.geometry.parameters) {
-      var pw = L.plane.geometry.parameters.width, ph = L.plane.geometry.parameters.height;
-      var g = L.group;
-      var cMinX = Infinity, cMinY = Infinity, cMaxX = -Infinity, cMaxY = -Infinity;
-      [[-pw / 2, -ph / 2], [pw / 2, -ph / 2], [pw / 2, ph / 2], [-pw / 2, ph / 2]].forEach(function(c) {
-        var world = new THREE.Vector3(c[0], c[1], 0).multiply(g.scale).applyQuaternion(g.quaternion).add(g.position);
-        var px = self._worldToPixel(world, camera);
-        if (px.x < cMinX) cMinX = px.x; if (px.x > cMaxX) cMaxX = px.x;
-        if (px.y < cMinY) cMinY = px.y; if (px.y > cMaxY) cMaxY = px.y;
-      });
-      // A bit of extra margin on every side: the 4 projected corners trace
-      // the card's geometric edge exactly, but screenshots at this card's
-      // actual rendered size showed a thin sliver of its own border/glow
-      // still peeking out past that exact edge -- scales with the card's
-      // own size (bigger up close, where a fixed pixel pad would look
-      // stingy) with a sane floor for when it's small/far away.
-      var cardPad = Math.max(14, (cMaxX - cMinX) * 0.04);
-      cardRect = { minX: cMinX - cardPad, minY: cMinY - cardPad, maxX: cMaxX + cardPad, maxY: cMaxY + cardPad };
-    }
-
-    this._drawSelectionVignette({ rings: rings, cardRect: cardRect });
-    this._vignetteActive = true;
+    (this.modelMeshObjects || []).forEach(function(m) {
+      var mat = m && m.isPoints && m.material;
+      var shader = mat && mat.userData && mat.userData.shader;
+      if (!shader || !shader.uniforms || !shader.uniforms.uSelCenter) return;
+      if (active) shader.uniforms.uSelCenter.value.copy(center);
+      shader.uniforms.uSelRadius.value = radius;
+      shader.uniforms.uSelFalloff.value = falloff;
+      shader.uniforms.uSelActive.value = active ? 1 : 0;
+    });
   };

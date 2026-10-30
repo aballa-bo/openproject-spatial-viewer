@@ -1251,15 +1251,16 @@
     this._arInfoCard = null;
   };
 
-  // Selection highlight for a saved lasso annotation: a 2D dark vignette
-  // around its ring + label card on screen (see _updateSelectionVignette),
-  // not the solid colored fill shown while actively drawing one -- filling
-  // the exact selected area again here read as "this is what's selected"
-  // rather than "this is what's highlighted", and competed with the label
-  // card for attention. Setting _selectedLassoAnnotation is all this does;
-  // the actual drawing happens every frame from the render loop, since it
-  // has to track wherever the ring/card land on screen as the camera moves
-  // (see closeAnnotationDetail for where this gets cleared again).
+  // Selection highlight for a saved lasso annotation: a real 3D spotlight
+  // aimed at its ring, plus dimming the rest of the scene (see
+  // _updateSelectionSpotlight), not the solid colored fill shown while
+  // actively drawing one -- filling the exact selected area again here read
+  // as "this is what's selected" rather than "this is what's highlighted",
+  // and competed with the label card for attention. Setting
+  // _selectedLassoAnnotation is all this does; the actual light updates
+  // happen every frame from the render loop, since the spotlight has to
+  // track the camera's current position (see closeAnnotationDetail for
+  // where this gets cleared again).
   SpatialViewerApp.prototype.showAnnotationSurface = function(a) {
     this._setLassoHighlight(null);
     this._selectedLassoAnnotation = (a && a.annotation_type === 'lasso_selection') ? a : null;
@@ -1443,8 +1444,8 @@
     this.renderAnnotationsList(list);
     this.renderExisting3DAnnotations();
     // flyToAnnotation (not showAnnotationSurface directly): the selection
-    // vignette tracks the camera every frame regardless (see
-    // _updateSelectionVignette), but flying back to the annotation's own
+    // spotlight tracks the camera every frame regardless (see
+    // _updateSelectionSpotlight), but flying back to the annotation's own
     // saved viewpoint is still worth doing here so the user lands back on a
     // familiar view of what they just edited, not wherever they'd
     // orbited/zoomed to while reading the detail panel.

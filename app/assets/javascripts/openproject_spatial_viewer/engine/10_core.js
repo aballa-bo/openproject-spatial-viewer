@@ -205,6 +205,19 @@
     this.hemiLight = new THREE.HemisphereLight(0xdfe7f2, 0x8d8375, 0.0);
     this.scene.add(this.hemiLight);
 
+    // Selection highlight: a real 3D spotlight from the camera toward
+    // whatever lasso selection is open (see _updateSelectionSpotlight and
+    // SELECTION_SPOTLIGHT_COLOR in interaction/lasso code -- referenced
+    // here even though that file runs later in the concatenated build,
+    // since this constructor body only ever executes long after the whole
+    // file has loaded and every top-level var has already been assigned),
+    // rather than a hand-projected 2D overlay. Intensity 0 here means
+    // invisible/inert until a selection sets it.
+    this.selectionSpotlight = new THREE.SpotLight(SELECTION_SPOTLIGHT_COLOR, 0, 0, Math.PI / 6, 0.5, 2);
+    this.selectionSpotlight.castShadow = false;
+    this.scene.add(this.selectionSpotlight);
+    this.scene.add(this.selectionSpotlight.target);
+
     // Invisible plane under the model that only catches shadows.
     this.shadowCatcher = new THREE.Mesh(
       new THREE.PlaneGeometry(1, 1),
@@ -295,10 +308,7 @@
       if (self._annotationLabels && self._annotationLabels.length) self._updateAnnotationLabels();
 
       if (self.controls && !presenting) self.controls.update();
-      // After controls.update() (not before): the vignette projects world
-      // points to screen pixels, which needs this frame's camera
-      // position/orientation already applied, not last frame's.
-      self._updateSelectionVignette();
+      self._updateSelectionSpotlight();
       // Frame-rate-driven sampling of the drawing stroke: guarantees a dense
       // outline regardless of how the browser batches pointermove events.
       if (self.isDrawing && self._pointerClient) {
@@ -341,6 +351,16 @@
   SpatialViewerApp.prototype._applyRenderSettings = function() {
     try { this._applyRenderSettingsUnsafe(); }
     catch (e) { console.warn('[SpatialViewer] _applyRenderSettings failed:', e); }
+  };
+
+  // The "full strength" (no selection active) intensity for each of the 4
+  // scene lights, from the current renderSettings -- the single formula
+  // both _applyRenderSettingsUnsafe and _applySelectionDim (see
+  // interaction/lasso code) scale from, so they can never drift apart.
+  SpatialViewerApp.prototype._baseLightIntensities = function() {
+    var s = this.renderSettings || {};
+    var k = s.light != null ? s.light : 1;
+    return { ambient: 0.45 * k, key: 0.85 * k, fill: 0.35 * k, hemi: s.env ? (0.65 * k) : 0 };
   };
 
   SpatialViewerApp.prototype._applyRenderSettingsUnsafe = function() {
@@ -388,13 +408,10 @@
       m.receiveShadow = shadowsOn;
     });
 
-    // Light intensity multiplier
-    var k = s.light;
-    if (this.ambientLight) this.ambientLight.intensity = 0.45 * k;
-    if (this.keyLight) this.keyLight.intensity = 0.85 * k;
-    if (this.fillLight) this.fillLight.intensity = 0.35 * k;
-    // "Environment light" -> soft sky/ground hemisphere ambient
-    if (this.hemiLight) this.hemiLight.intensity = s.env ? (0.65 * k) : 0;
+    // Light intensity multiplier -- routed through _applySelectionDim (not
+    // set directly) so that re-applying settings while a lasso selection is
+    // open re-dims to the new slider value instead of undoing the dim.
+    this._applySelectionDim(!!this._selectionLit);
 
     // Wireframe
     var wf = !!s.wireframe;

@@ -786,5 +786,3 @@
     var l = document.getElementById('viewerLoader');
     if (l) l.style.display = 'none';
   };
-
-})();
