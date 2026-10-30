@@ -77,9 +77,11 @@
   // requiring all 4 corners: a lasso edge or a small gap in the surface then
   // only loses a sliver instead of the whole cell. `grid` is a flat
   // rows*cols array of {x,y,z}-like points, with a falsy entry wherever
-  // there was no hit at that cell. Shared by the live fill (built from fresh
-  // raycasts every time it's called) and by rebuilding a SAVED fill directly
-  // from its stored grid (no raycasting at all -- see _buildLassoFillFromGrid).
+  // there was no hit at that cell. Used by the live fill shown while
+  // actively drawing a lasso (built from fresh raycasts every time it's
+  // called) -- a saved selection's highlight is the 2D vignette instead
+  // (see _updateSelectionVignette), built from the stored ring directly,
+  // not this grid.
   function triangulateLassoGrid(grid, rows, cols) {
     var positions = [];
     for (var j = 0; j < rows - 1; j++) {
@@ -486,15 +488,26 @@
 
     var self = this;
     // setAnimationLoop (not requestAnimationFrame) is required for WebXR:
-    // during an immersive session the browser drives the frame timing.
-    this.renderer.setAnimationLoop(function() {
+    // during an immersive session the browser drives the frame timing. The
+    // 2nd argument (frame) is only meaningful while presenting -- three.js's
+    // XR manager passes the raw XRFrame through to this callback itself
+    // (verified against the vendored build, not assumed); AR's hit-test
+    // needs it (see _processARFrame/_handleArSelect) and there is no
+    // three.js-level equivalent to fetch it separately in this version.
+    this.renderer.setAnimationLoop(function(time, frame) {
       var presenting = self.renderer.xr && self.renderer.xr.isPresenting;
 
       var now = (window.performance && performance.now) ? performance.now() : Date.now();
       var dt = Math.min(0.1, (now - self._lastFrameT) / 1000);
       self._lastFrameT = now;
-      if (presenting) self._processXRInput(dt);
-      else self._processNavKeys(dt);
+      if (presenting && self._xrMode === 'ar') {
+        self._arLastFrame = frame || null;
+        self._processARFrame(frame);
+      } else if (presenting) {
+        self._processXRInput(dt);
+      } else {
+        self._processNavKeys(dt);
+      }
       if (self._layerFades) self._tickLayerFades();
       if (self._splatRenderers && self._splatRenderers.length) {
         var vw = self.viewport.clientWidth || 1, vh = self.viewport.clientHeight || 1;
@@ -524,6 +537,10 @@
       if (self._annotationLabels && self._annotationLabels.length) self._updateAnnotationLabels();
 
       if (self.controls && !presenting) self.controls.update();
+      // After controls.update() (not before): the vignette projects world
+      // points to screen pixels, which needs this frame's camera
+      // position/orientation already applied, not last frame's.
+      self._updateSelectionVignette();
       // Frame-rate-driven sampling of the drawing stroke: guarantees a dense
       // outline regardless of how the browser batches pointermove events.
       if (self.isDrawing && self._pointerClient) {
@@ -576,6 +593,20 @@
     var tmName = TONE_MAP[s.tone] || TONE_MAP.aces;
     r.toneMapping = (THREE[tmName] != null) ? THREE[tmName] : THREE.NoToneMapping;
     r.toneMappingExposure = s.exposure;
+    // True Gaussian-splat materials (SplatRenderer/SplatRendererTex) write
+    // gl_FragColor directly and never run through three.js's own
+    // <tonemapping_fragment> chunk, so r.toneMappingExposure above has no
+    // effect on them -- see the `exposure` uniform note in
+    // SPLAT_FRAGMENT_SHADER. Push the same slider value into that uniform
+    // by hand instead. `light` (ambient/key/fill/hemi below) intentionally
+    // does NOT get a splat-side equivalent: splat color is baked-in per-
+    // splat spherical harmonics from training, never re-lit by scene
+    // lights, so there is nothing physically meaningful for a "light
+    // intensity" control to multiply there.
+    (this._splatRenderers || []).forEach(function(sr) {
+      var u = sr && sr.mesh && sr.mesh.material && sr.mesh.material.uniforms;
+      if (u && u.exposure) u.exposure.value = s.exposure;
+    });
 
     // Pixel ratio
     var ratio = s.hiDpi ? Math.min(window.devicePixelRatio, 2) : 1;
@@ -740,23 +771,11 @@
     if (btn) btn.classList.toggle('active', !!s.wireframe);
   };
 
+  // Render quality is a plain tab now (#renderPanel, see show.html.erb),
+  // not a floating panel of its own -- this only wires up the settings
+  // controls inside it, same as always.
   SpatialViewerApp.prototype._initRenderPanel = function() {
     var self = this;
-    var panel = document.getElementById('renderPanel');
-    var btn = document.getElementById('btnRender');
-    if (btn && panel) {
-      btn.addEventListener('click', function() {
-        var open = panel.style.display === 'none' || !panel.style.display;
-        panel.style.display = open ? 'block' : 'none';
-        btn.classList.toggle('active', open);
-      });
-    }
-    var closeBtn = document.getElementById('closeRenderBtn');
-    if (closeBtn && panel) closeBtn.addEventListener('click', function() {
-      panel.style.display = 'none';
-      if (btn) btn.classList.remove('active');
-    });
-
     var bind = function(id, key, kind) {
       var el = document.getElementById(id);
       if (!el) return;
@@ -832,6 +851,10 @@
 
   SpatialViewerApp.prototype._startLayerLoading = function(layers) {
     var self = this;
+    // The currently hovered mesh part (if any) is about to be torn down
+    // with the rest of the old layer -- drop the hover state (and its
+    // cloned material / halo mesh) before that happens, not after.
+    this._clearHoverEffects();
     if (!this.layersRoot) { this.layersRoot = new THREE.Group(); this.scene.add(this.layersRoot); }
     while (this.layersRoot.children.length) this.layersRoot.remove(this.layersRoot.children[0]);
 
@@ -929,7 +952,14 @@
       // later toggled -- see that function for why this matters (THREE's
       // Raycaster.intersectObjects does NOT check .visible on the objects
       // it's handed directly, only during normal rendering).
-      (this._lastLayerMeshes || []).forEach(function(m) { m.userData.layerVisibilityGroup = g; });
+      // layerKind drives the hover glow's IFC-only gating (see
+      // _updateHoverEffects) -- photogrammetry/scan meshes (kind "mesh") are
+      // one big fused surface with no discrete "parts" to highlight, unlike
+      // an IFC conversion's per-element meshes (kind "ifc").
+      (this._lastLayerMeshes || []).forEach(function(m) {
+        m.userData.layerVisibilityGroup = g;
+        m.userData.layerKind = meta.kind;
+      });
       this._allLayerMeshes = (this._allLayerMeshes || []).concat(this._lastLayerMeshes || []);
       this.modelMeshObjects = this._allLayerMeshes;
       if (meta.visible !== false) this._fadeLayer(id, true, 320);
@@ -1032,9 +1062,9 @@
 
   SpatialViewerApp.prototype._buildLayerPanel = function() {
     var self = this;
-    var panel = document.getElementById('layerPanel');
+    var panel = document.getElementById('layerPanel'); // now a tab-content div, see show.html.erb
     var list = document.getElementById('layerList');
-    var btn = document.getElementById('btnLayers');
+    var btn = document.getElementById('tabBtnLayers'); // the tab button, not a toolbar button anymore
     if (!panel || !list) return;
 
     var ids = Object.keys(this.layerMeta || {});
@@ -1044,19 +1074,33 @@
     list.innerHTML = '';
     ids.forEach(function(id) {
       var m = self.layerMeta[id];
-      var row = document.createElement('label');
+      var row = document.createElement('div');
       row.className = 'layer-row';
-      var cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.checked = m.visible !== false && !self.layerError[id];
-      cb.disabled = !self.layerGroups[id];
-      cb.addEventListener('change', function() { self.setLayerVisible(id, cb.checked); });
+
       var span = document.createElement('span');
+      span.className = 'layer-row-name';
       span.textContent = (m.title || id);
+
       var tag = document.createElement('em');
       tag.textContent = self.layerError[id] ? ('— ' + self.layerError[id])
         : (m.kind || '') + (m.source_format ? ' · ' + String(m.source_format).toUpperCase() : '');
-      row.appendChild(cb); row.appendChild(span); row.appendChild(tag);
+
+      var eyeBtn = document.createElement('button');
+      eyeBtn.type = 'button';
+      eyeBtn.className = 'layer-row-eye';
+      eyeBtn.disabled = !self.layerGroups[id];
+      var setEyeState = function(visible) {
+        eyeBtn.title = visible ? 'Hide layer' : 'Show layer';
+        eyeBtn.innerHTML = '<i class="' + (visible ? 'icon-watched' : 'icon-unwatched') + '"></i>';
+      };
+      setEyeState(m.visible !== false && !self.layerError[id]);
+      eyeBtn.addEventListener('click', function() {
+        var next = !(m.visible !== false);
+        self.setLayerVisible(id, next); // also updates self.layerMeta[id].visible (== m) synchronously
+        setEyeState(next);
+      });
+
+      row.appendChild(span); row.appendChild(tag); row.appendChild(eyeBtn);
       list.appendChild(row);
     });
   };
@@ -2039,6 +2083,18 @@
   var SPLAT_FRAGMENT_SHADER = [
     'precision highp float;',
     'uniform float opacity;',
+    // Splat color comes straight out of the per-splat spherical-harmonics
+    // evaluation in the vertex shader (baked in at training time) -- this
+    // material writes gl_FragColor directly and never goes through
+    // three.js's own <tonemapping_fragment> chunk, so the renderer's
+    // toneMappingExposure (wired up for every normal lit material in
+    // _applyRenderSettingsUnsafe) has no effect on it at all. This uniform
+    // is the splat-side equivalent, set from the same Exposure slider value
+    // (see _applyRenderSettingsUnsafe) and applied as a simple linear
+    // brightness multiply -- there's no real "tone mapping curve" to run
+    // splats through, just like there's no relighting them (see
+    // `light` below).
+    'uniform float exposure;',
     // 0 (default, every non-glTF source): the reconstructed color is
     // already display-referred (matches "srgb_rec709_display" per the
     // KHR_gaussian_splatting spec, the same convention .sog/.ply already
@@ -2056,7 +2112,7 @@
     '  float falloff = exp(-0.5 * r2);',
     '  float a = vColor.a * falloff * opacity;',
     '  if (a < 0.01) discard;',
-    '  vec3 outColor = vColor.rgb;',
+    '  vec3 outColor = clamp(vColor.rgb * exposure, 0.0, 1.0);',
     '  if (linearColor > 0.5) {',
     '    vec3 lo = outColor * 12.92;',
     '    vec3 hi = 1.055 * pow(outColor, vec3(1.0 / 2.4)) - 0.055;',
@@ -2158,6 +2214,7 @@
         focal: { value: new THREE.Vector2(1000, 1000) },
         viewport: { value: new THREE.Vector2(1000, 1000) },
         opacity: { value: 1.0 },
+        exposure: { value: 1.0 },
         linearColor: { value: colorSpaceLinear ? 1.0 : 0.0 }
       },
       vertexShader: SPLAT_VERTEX_SHADER,
@@ -2649,6 +2706,7 @@
         focal: { value: new THREE.Vector2(1000, 1000) },
         viewport: { value: new THREE.Vector2(1000, 1000) },
         opacity: { value: 1.0 },
+        exposure: { value: 1.0 },
         linearColor: { value: colorSpaceLinear ? 1.0 : 0.0 },
         texSize: { value: new THREE.Vector2(W, H) },
         texCenter: { value: texCenter },
@@ -3791,6 +3849,10 @@
     this.viewport.addEventListener('pointermove', function(e) { self.onPointerMove(e); });
     this.viewport.addEventListener('pointerup', function(e) { self.onPointerUp(e); });
     this.viewport.addEventListener('pointercancel', function(e) { self.onPointerUp(e); });
+    // Otherwise a label's/mesh part's red/glow hover state (see
+    // _updateHoverEffects) could stay stuck on if the pointer leaves the
+    // canvas without ever crossing another hoverable thing on the way out.
+    this.viewport.addEventListener('pointerleave', function() { self._clearHoverEffects(); });
 
     // Zoom toward the point under the cursor (passive:false so we can preventDefault).
     this.viewport.addEventListener('wheel', function(e) { self._onWheel(e); }, { passive: false });
@@ -4203,7 +4265,11 @@
 
   SpatialViewerApp.prototype.onPointerMove = function(e) {
     this._pointerClient = { x: e.clientX, y: e.clientY };
-    if (!this.isDrawing) return;
+    if (!this.isDrawing) {
+      this._updateHoverEffects(e.clientX, e.clientY);
+      return;
+    }
+    this._clearHoverEffects(); // no hover feedback while a drawing tool is actively tracing
     var list = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
     var n = list.length, cap = 24, stride = n > cap ? Math.ceil(n / cap) : 1;
     for (var i = 0; i < n; i += stride) {
@@ -4277,6 +4343,20 @@
     return true;
   };
 
+  // Walks up from a hit mesh to the nearest ancestor carrying a glTF node
+  // name (GLTFLoader names either the Mesh itself or a wrapping Group,
+  // depending on whether the node's primitive got split into child meshes),
+  // stopping at the per-layer group (named "layer:<id>" in _harvestLayer) --
+  // that name is the layer's own id, not anything element-specific, so it
+  // must never be returned as if it were one.
+  function ifcElementIdForMesh(obj) {
+    for (var o = obj; o; o = o.parent) {
+      if (o.name && o.name.indexOf('layer:') === 0) break;
+      if (o.name) return o.name;
+    }
+    return null;
+  }
+
   SpatialViewerApp.prototype.onPointerUp = function(e) {
     // Clicking a lasso's label card (in orbit/navigate mode, i.e. no drawing
     // tool active) opens the same annotation detail view as clicking its
@@ -4289,6 +4369,17 @@
       if (!moved) {
         var hitAnnotation = this._raycastAnnotationLabels(e.clientX, e.clientY);
         if (hitAnnotation) { this.openAnnotationDetail(hitAnnotation); return; }
+
+        // Clicking an IFC element directly (same IFC-only gating as the
+        // hover glow in _updateHoverEffects) opens a brand new pin
+        // annotation on that exact surface point, pre-linked to the
+        // element -- instead of requiring the "3D Pin" tool first.
+        var ifcHit = this._raycastAt(e.clientX, e.clientY);
+        if (ifcHit && ifcHit.object && ifcHit.object.isMesh &&
+            ifcHit.object.userData && ifcHit.object.userData.layerKind === 'ifc') {
+          this.place3DPin(this._surfacePoint(ifcHit), this._hitNormal(ifcHit), ifcElementIdForMesh(ifcHit.object));
+          return;
+        }
       }
     }
     if (!this.isDrawing) return;
@@ -4327,22 +4418,25 @@
     // (downsamplePolyPx's cap) -- it used to be 64, a leftover from the old
     // GLSL-shader lasso where the ring fed a fixed-size uniform array. That
     // constraint is gone now that the inside-test runs in plain JS, but the
-    // low cap stayed, so the *stored* ring was a coarser approximation of the
-    // drawn shape than the live fill: re-selecting the surface from it after
-    // save (showAnnotationSurface -> _selectSurfaceInLasso) rebuilt a visibly
-    // different, "cut-corners" polygon -- looked aligned while drawing,
-    // misaligned once saved.
+    // low cap stayed, making the *stored* ring a coarser approximation of
+    // the drawn shape than the live fill saw. Kept high regardless, since a
+    // coarser ring is still used for re-editing and for the fill_grid-based
+    // Area computation server-side, even though the on-reload selection
+    // highlight (_updateSelectionVignette) only needs the ring's bounding
+    // box and wouldn't itself care about the resolution.
     var ring = this._screenPathToWorldRing(path, 220);
     if (ring.length < 3) { this._clearLassoOverlay(); this.clearTempMarkup(); return; }
 
     this.currentDrawingPoints = ring;
     console.log('[SpatialViewer] lasso: ' + path.length + ' screen points -> ' + ring.length + ' 3D points');
 
-    // `points` (the ring) is kept for legacy-annotation fallback / potential
-    // re-editing; `fill_*` is what actually gets displayed on reload now --
-    // the exact triangulated surface patch the user just saw, stored as real
-    // 3D points so no raycasting or camera-dependent reprojection is needed
-    // to show it correctly again later (see _buildLassoFillFromGrid).
+    // `points` (the ring) is what drives the selection vignette on reload
+    // (see _updateSelectionVignette) and stays available for potential
+    // re-editing;
+    // `fill_*` is the exact triangulated surface patch the user just saw,
+    // stored as real 3D points purely for the Area custom field computation
+    // server-side (see SpatialAnnotation#calculate_grid_fill_area) -- no
+    // longer read by the JS side at all.
     var gd = {
       type: 'lasso_selection',
       closed: true,
@@ -4451,20 +4545,14 @@
     if (objOrNull) g.add(objOrNull);
   };
 
-  // World point -> canvas-relative CSS pixel (same convention as _viewportPoint
-  // / this.lassoScreenPath), via the given camera.
-  SpatialViewerApp.prototype._worldToPixel = function(worldPt, camera) {
-    var p = worldPt.clone().project(camera || this.camera);
-    var w = this.viewport.clientWidth || 1, h = this.viewport.clientHeight || 1;
-    return { x: (p.x + 1) / 2 * w, y: (1 - p.y) / 2 * h };
-  };
-
   // Build the lasso fill by casting a grid of rays (one per sample point
   // inside the screen-space polygon) at the model and meshing the hits into a
-  // triangle patch. `quality=false` uses a coarser grid for snappy live-drag
-  // updates; `_finishLasso` and replay (`_selectSurfaceInLasso`) ask for the
-  // finer one since they only run once. `screenPathPx` is in the same
-  // canvas-relative CSS-pixel space as `this.lassoScreenPath`.
+  // triangle patch -- the live preview shown only while actively drawing a
+  // lasso (see _finishLasso and the drag-update call site above).
+  // `quality=false` uses a coarser grid for snappy live-drag updates;
+  // `_finishLasso` asks for the finer one since it only runs once.
+  // `screenPathPx` is in the same canvas-relative CSS-pixel space as
+  // `this.lassoScreenPath`.
   SpatialViewerApp.prototype._buildLassoFill = function(screenPathPx, color, quality) {
     this._lastLassoGrid = null; // avoid a stale grid surviving an early return below
     if (!screenPathPx || screenPathPx.length < 3 || !this.modelMeshObjects || !this.modelMeshObjects.length) {
@@ -4505,10 +4593,11 @@
     }
     if (!any) { this._setLassoHighlight(null); this._lastLassoGrid = null; return; }
 
-    // Stashed so _finishLasso can persist this exact grid (see
-    // _buildLassoFillFromGrid) -- the saved annotation then re-displays this
-    // same surface patch forever, with no raycasting or camera-dependent
-    // reprojection involved on reload.
+    // Stashed so _finishLasso can persist this exact grid -- kept purely for
+    // the Area custom field computation server-side (see
+    // SpatialAnnotation#calculate_grid_fill_area); the saved annotation's
+    // on-reload highlight is the 2D selection vignette instead (see
+    // _updateSelectionVignette), not this grid.
     this._lastLassoGrid = { grid: grid, rows: rows, cols: cols };
 
     var positions = triangulateLassoGrid(grid, rows, cols);
@@ -4538,43 +4627,258 @@
     return group;
   };
 
-  // Rebuilds a SAVED lasso fill directly from its stored grid of 3D hit
-  // points -- no raycasting, no screen-space reprojection, no dependency on
-  // the current (or restored) camera at all. The patch is the same real
-  // surface geometry that was selected when it was drawn, so it stays
-  // correctly anchored to the surface from any viewing angle, exactly like
-  // the live fill the user saw while drawing it.
-  SpatialViewerApp.prototype._buildLassoFillFromGrid = function(gridData, color) {
-    if (!gridData || !gridData.grid || !gridData.rows || !gridData.cols) return false;
-    var positions = triangulateLassoGrid(gridData.grid, gridData.rows, gridData.cols);
-    if (!positions.length) return false;
-    this._setLassoHighlight(this._lassoMeshGroup(positions, color));
-    return true;
+  // World point -> viewport-relative CSS pixel (same convention as
+  // _viewportPoint / this.lassoScreenPath), via the given camera. Used by
+  // the selection vignette (see _updateSelectionVignette) to find where a
+  // saved annotation's ring and label card land on screen each frame.
+  SpatialViewerApp.prototype._worldToPixel = function(worldPt, camera) {
+    var p = worldPt.clone().project(camera || this.camera);
+    var w = this.viewport.clientWidth || 1, h = this.viewport.clientHeight || 1;
+    return { x: (p.x + 1) / 2 * w, y: (1 - p.y) / 2 * h };
   };
 
-  // Same fill, driven by a stored 3D ring: project it to screen pixels through
-  // `camera` (the viewer has just flown back to the annotation's saved
-  // viewpoint, so this is effectively the same view the ring was drawn in)
-  // and run the same raycast grid.
-  SpatialViewerApp.prototype._selectSurfaceInLasso = function(ring3d, camera, color) {
-    if (!ring3d || ring3d.length < 3) return;
-    camera = camera || this.camera;
-    camera.updateMatrixWorld();
-    this.scene.updateMatrixWorld(true);
+  // Draws the dark vignette into the 2D lasso overlay canvas (same element
+  // _drawLassoOverlay uses while actively drawing -- the two are never
+  // needed at once, so sharing it avoids a second always-present canvas
+  // layered over the viewport). `data` is null to just clear it.
+  //
+  // Not an ellipse, and not a flat near-zone either: the whole canvas starts
+  // at the "far" opacity, then `data.rings` -- concentric copies of the
+  // lasso's own screen-space shape (see _updateSelectionVignette), ordered
+  // OUTERMOST FIRST -- are each redrawn at their own exact opacity, biggest/
+  // highest-opacity ring first so every smaller ring drawn after it
+  // overwrites the center of its area with a lower value. The innermost
+  // ring (at the ~5cm margin) is opacity 0, so everything from the lasso's
+  // own boundary out to that margin stays fully, exactly transparent --
+  // never touched by any ring at all. `data.cardRect`, if given, is cut to
+  // fully transparent last, on top of everything -- the callout stays
+  // completely unaffected by the overlay, wherever it floats.
+  var VIGNETTE_MARGIN_OPACITY = 0.7;
+  var VIGNETTE_FAR_OPACITY = 0.8;
+
+  SpatialViewerApp.prototype._drawSelectionVignette = function(data) {
+    var c = this._ensureLassoOverlay();
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var w = this.viewport.clientWidth, h = this.viewport.clientHeight;
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+      c.width = Math.round(w * dpr);
+      c.height = Math.round(h * dpr);
+    }
+    var ctx = c.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (!data || !data.rings || !data.rings.length) return;
+
+    ctx.fillStyle = 'rgba(4,6,9,' + VIGNETTE_FAR_OPACITY + ')';
+    ctx.fillRect(0, 0, w, h);
+
+    function fillPoly(pts) {
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Each ring: first erase whatever is already there in its shape (so the
+    // next fill sets an EXACT resulting opacity, not a blend on top of
+    // whatever the previous, larger ring left behind), then fill it flat at
+    // its own target opacity. Outermost-to-innermost order means every
+    // pixel's final value is set by the SMALLEST ring that contains it --
+    // i.e. the correct, closest-to-the-lasso value for that pixel.
+    for (var i = 0; i < data.rings.length; i++) {
+      var ring = data.rings[i];
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.fillStyle = 'rgba(0,0,0,1)';
+      fillPoly(ring.points);
+      ctx.restore();
+
+      ctx.save();
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = 'rgba(4,6,9,' + ring.opacity + ')';
+      fillPoly(ring.points);
+      ctx.restore();
+    }
+
+    // The callout card: cut to fully transparent on top of everything --
+    // it's a crisp rectangle, not a blobby selection shape, and it must
+    // never be dimmed at all, right up to its own edge.
+    if (data.cardRect) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.fillStyle = 'rgba(0,0,0,1)';
+      ctx.fillRect(data.cardRect.minX, data.cardRect.minY,
+        data.cardRect.maxX - data.cardRect.minX, data.cardRect.maxY - data.cardRect.minY);
+      ctx.restore();
+    }
+  };
+
+  // Recomputes and redraws the selection vignette every frame (screen-space,
+  // so it has to track the ring's (and label card's) projected position as
+  // the camera orbits) -- see this.showAnnotationSurface, which sets/clears
+  // this._selectedLassoAnnotation, and closeAnnotationDetail, which clears
+  // it. Cheap no-op (one flag check) whenever nothing is selected.
+  //
+  // Algorithm (as specified): project the lasso's ring to its 2D shape on
+  // screen (NOT its bounding ellipse -- see _drawSelectionVignette). Inside
+  // the ring, and out to a margin of ~5cm beyond it, stays fully
+  // transparent -- untouched by any opacity at all. From that margin
+  // outward, opacity ramps up smoothly, reaching its maximum exactly at the
+  // viewport's own edges. The label card is handled completely separately
+  // (its own cardRect, cut fully transparent) rather than folded into the
+  // same shape, so it's never darkened regardless of where it floats
+  // relative to the ring.
+  //
+  // camera.updateMatrixWorld() is forced here (not left to the renderer)
+  // because this runs mid-frame, before OrbitControls' own update/render
+  // pass refreshes the camera's cached world matrix -- without it, every
+  // projection below would read the PREVIOUS frame's camera transform, one
+  // step behind, which is what made the vignette look like it wasn't
+  // tracking camera movement at all.
+  var SELECTION_VIGNETTE_MARGIN_M = 0.05;
+
+  SpatialViewerApp.prototype._updateSelectionVignette = function() {
+    var a = this._selectedLassoAnnotation;
+    if (!a) {
+      if (this._vignetteActive) { this._clearLassoOverlay(); this._vignetteActive = false; }
+      return;
+    }
+    var gd = a.geometry_data;
+    if (!gd || !gd.points || gd.points.length < 3) {
+      this._clearLassoOverlay();
+      this._vignetteActive = false;
+      return;
+    }
 
     var self = this;
-    var pixelPoly = ring3d.map(function(v) { return self._worldToPixel(v, camera); });
-    this._buildLassoFill(pixelPoly, color, true);
+    var camera = this.camera;
+    if (!camera) return;
+    camera.updateMatrixWorld();
+
+    var ring = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
+    var centroid3d = new THREE.Vector3();
+    ring.forEach(function(p) { centroid3d.add(p); });
+    centroid3d.divideScalar(ring.length);
+
+    // Pixels-per-5cm at the ring's own depth: project the centroid and a
+    // point 5cm to one side of it (along the camera's own right axis, so
+    // it's measured across the screen, not into it) and measure the pixel
+    // distance between the two -- perspective-correct, unlike a flat pixel
+    // constant that would look right at one zoom level and wrong at every
+    // other.
+    var camRight = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+    var centroidPx = this._worldToPixel(centroid3d, camera);
+    var marginPx = this._worldToPixel(centroid3d.clone().addScaledVector(camRight, SELECTION_VIGNETTE_MARGIN_M), camera);
+    var margin = Math.max(8, Math.abs(marginPx.x - centroidPx.x));
+
+    // Project the ring to its actual 2D screen shape, then build many
+    // concentric copies of it, each vertex pushed outward from the shape's
+    // own 2D centroid -- this keeps every band the lasso's own silhouette
+    // (just bigger), not an unrelated ellipse around its bounding box. The
+    // offset/opacity pairing for each band comes from the keypoints below
+    // (0% at the boundary itself, VIGNETTE_MARGIN_OPACITY at the ~5cm
+    // margin, VIGNETTE_FAR_OPACITY at the farthest viewport corner) -- see
+    // _drawSelectionVignette for how the bands are composited into a smooth
+    // ramp.
+    var screenRing = ring.map(function(p) { return self._worldToPixel(p, camera); });
+    var c2 = { x: 0, y: 0 };
+    screenRing.forEach(function(p) { c2.x += p.x; c2.y += p.y; });
+    c2.x /= screenRing.length; c2.y /= screenRing.length;
+
+    function offsetRingBy(amount) {
+      return screenRing.map(function(p) {
+        var dx = p.x - c2.x, dy = p.y - c2.y;
+        var len = Math.sqrt(dx * dx + dy * dy);
+        if (len < 1e-6) return { x: p.x, y: p.y };
+        var k = (len + amount) / len;
+        return { x: c2.x + dx * k, y: c2.y + dy * k };
+      });
+    }
+
+    var vw = this.viewport.clientWidth, vh = this.viewport.clientHeight;
+    var maxCornerDist = 0;
+    [[0, 0], [vw, 0], [0, vh], [vw, vh]].forEach(function(pt) {
+      var d = Math.hypot(pt[0] - c2.x, pt[1] - c2.y);
+      if (d > maxCornerDist) maxCornerDist = d;
+    });
+    // Generous overshoot: the radial-from-centroid offset isn't a true
+    // uniform (Minkowski) outward offset, so an irregular ring can reach a
+    // given corner slower in some directions than others -- doubling the
+    // raw corner distance keeps the outermost band safely past every
+    // corner regardless of the ring's own shape.
+    var maxReach = margin + 2 * Math.max(40, maxCornerDist - margin);
+
+    // Three checkpoints, piecewise-linear between them: 0% right at the
+    // lasso's own boundary, 70% at the ~5cm margin, 80% at the viewport
+    // edge. Built as flat (offset, opacity) samples across both segments,
+    // then sorted outermost-first -- see _drawSelectionVignette for why
+    // that order matters.
+    var keypoints = [
+      { offset: 0, opacity: 0 },
+      { offset: margin, opacity: VIGNETTE_MARGIN_OPACITY },
+      { offset: maxReach, opacity: VIGNETTE_FAR_OPACITY }
+    ];
+    var SUBSTEPS = 6;
+    var samples = [];
+    for (var seg = 0; seg < keypoints.length - 1; seg++) {
+      var kp0 = keypoints[seg], kp1 = keypoints[seg + 1];
+      for (var s = 0; s <= SUBSTEPS; s++) {
+        var t = s / SUBSTEPS;
+        samples.push({
+          offset: kp0.offset + t * (kp1.offset - kp0.offset),
+          opacity: kp0.opacity + t * (kp1.opacity - kp0.opacity)
+        });
+      }
+    }
+    samples.sort(function(p, q) { return q.offset - p.offset; });
+    var rings = samples.map(function(s) { return { points: offsetRingBy(s.offset), opacity: s.opacity }; });
+
+    // The label card's own screen rect -- kept separate from `rings` (see
+    // the function comment above) -- by projecting its real on-screen
+    // corners (not a guessed fixed padding), so this stays correct whether
+    // the card is tiny from far away or filling half the screen up close.
+    var cardRect = null;
+    var L = (this._annotationLabels || []).filter(function(e) { return e.annotation && e.annotation.id === a.id; })[0];
+    if (L && L.plane && L.plane.geometry && L.plane.geometry.parameters) {
+      var pw = L.plane.geometry.parameters.width, ph = L.plane.geometry.parameters.height;
+      var g = L.group;
+      var cMinX = Infinity, cMinY = Infinity, cMaxX = -Infinity, cMaxY = -Infinity;
+      [[-pw / 2, -ph / 2], [pw / 2, -ph / 2], [pw / 2, ph / 2], [-pw / 2, ph / 2]].forEach(function(c) {
+        var world = new THREE.Vector3(c[0], c[1], 0).multiply(g.scale).applyQuaternion(g.quaternion).add(g.position);
+        var px = self._worldToPixel(world, camera);
+        if (px.x < cMinX) cMinX = px.x; if (px.x > cMaxX) cMaxX = px.x;
+        if (px.y < cMinY) cMinY = px.y; if (px.y > cMaxY) cMaxY = px.y;
+      });
+      // A bit of extra margin on every side: the 4 projected corners trace
+      // the card's geometric edge exactly, but screenshots at this card's
+      // actual rendered size showed a thin sliver of its own border/glow
+      // still peeking out past that exact edge -- scales with the card's
+      // own size (bigger up close, where a fixed pixel pad would look
+      // stingy) with a sane floor for when it's small/far away.
+      var cardPad = Math.max(14, (cMaxX - cMinX) * 0.04);
+      cardRect = { minX: cMinX - cardPad, minY: cMinY - cardPad, maxX: cMaxX + cardPad, maxY: cMaxY + cardPad };
+    }
+
+    this._drawSelectionVignette({ rings: rings, cardRect: cardRect });
+    this._vignetteActive = true;
   };
 
-  SpatialViewerApp.prototype.place3DPin = function(point, normal) {
+  // ifcElementId (optional): set when this pin was placed by clicking
+  // directly on an IFC layer's element (see onPointerUp) rather than via the
+  // "3D Pin" drawing tool -- stored in geometry_data so the created
+  // annotation stays linked to that specific IFC element (surfaced read-only
+  // in the detail panel's "Linked IFC element" field).
+  SpatialViewerApp.prototype.place3DPin = function(point, normal, ifcElementId) {
     var g = new THREE.ConeGeometry(0.2, 0.6, 16);
     g.translate(0, 0.3, 0); g.rotateX(Math.PI);
     var mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: new THREE.Color(this.activeColor), roughness: 0.2 }));
     mesh.position.copy(point);
     mesh.quaternion.copy(pinQuaternionFromNormal(normal));
     this.tempMarkupGroup.add(mesh);
-    this.openAnnotationModal({ type: 'pin', points: [{x:point.x,y:point.y,z:point.z}], normal: {x:normal.x,y:normal.y,z:normal.z} });
+    var gd = { type: 'pin', points: [{x:point.x,y:point.y,z:point.z}], normal: {x:normal.x,y:normal.y,z:normal.z} };
+    if (ifcElementId) gd.ifc_element_id = ifcElementId;
+    this.openAnnotationModal(gd);
   };
 
   SpatialViewerApp.prototype.finishMeasurement = function(ptA, ptB) {
@@ -5018,6 +5322,14 @@
         self.renderAnnotationsList(self.projectData.annotations);
         self.renderExisting3DAnnotations();
         if (!keepLiveFill) self.showAnnotationSurface(result.annotation);
+        // Back to navigate mode once a lasso selection is saved, instead of
+        // leaving the lasso tool armed for another draw -- reuses the
+        // existing toolOrbit click handler (currentTool/controls.enabled/
+        // active class/tooltip) rather than duplicating it here.
+        if (gd.type === 'lasso_selection') {
+          var orbitBtn = document.getElementById('toolOrbit');
+          if (orbitBtn) orbitBtn.click();
+        }
         var c = document.getElementById('annotationCountHeader');
         if (c) c.innerText = self.projectData.annotations.length;
         var annTab = document.querySelector('.tab-btn[data-tab="annotationsTab"]');
@@ -5077,60 +5389,375 @@
     return lines;
   }
 
-  // Renders the card's content (rounded semi-transparent rect in the
-  // annotation's own color, title/type/description with a dark text halo so
-  // it stays legible over any fill color) onto a fixed-size canvas.
-  function buildAnnotationLabelCanvas(a, colorHex) {
-    var W = 512, H = 300, pad = 32;
-    var canvas = document.createElement('canvas');
-    canvas.width = W; canvas.height = H;
-    var ctx = canvas.getContext('2d');
-
-    var c = new THREE.Color(colorHex);
-    var rgb = Math.round(c.r * 255) + ',' + Math.round(c.g * 255) + ',' + Math.round(c.b * 255);
-
+  // Thin rounded-rect outline, drawn manually (not ctx.roundRect, for
+  // consistent behavior on every browser this runs on) -- the plain-outline
+  // "readout box" shape the HUD reference uses for its callout labels.
+  function roundRectPath(ctx, x, y, w, h, r) {
+    r = Math.max(0, Math.min(r, w / 2, h / 2));
     ctx.beginPath();
-    var x = 6, y = 6, w = W - 12, h = H - 12, r = 22;
     ctx.moveTo(x + r, y);
     ctx.arcTo(x + w, y, x + w, y + h, r);
     ctx.arcTo(x + w, y + h, x, y + h, r);
     ctx.arcTo(x, y + h, x, y, r);
     ctx.arcTo(x, y, x + w, y, r);
     ctx.closePath();
-    ctx.fillStyle = 'rgba(' + rgb + ',0.72)';
+  }
+
+  // Manual letter-spaced text -- canvas's own ctx.letterSpacing isn't
+  // reliably supported everywhere this renders, so characters are placed
+  // by hand. Returns the x position just past the last character.
+  function fillTextTracked(ctx, text, x, y, spacing) {
+    var cx = x;
+    for (var i = 0; i < text.length; i++) {
+      ctx.fillText(text[i], cx, y);
+      cx += ctx.measureText(text[i]).width + spacing;
+    }
+    return cx - spacing;
+  }
+
+  function trackedTextWidth(ctx, text, spacing) {
+    var w = 0;
+    for (var i = 0; i < text.length; i++) w += ctx.measureText(text[i]).width;
+    return w + spacing * Math.max(0, text.length - 1);
+  }
+
+  // Truncates (with a trailing ellipsis) so tracked text fits maxWidth --
+  // the letter-spaced equivalent of wrapCanvasTextLines's single-line case.
+  function truncateTracked(ctx, text, maxWidth, spacing) {
+    if (trackedTextWidth(ctx, text, spacing) <= maxWidth) return text;
+    var t = text;
+    while (t.length > 1 && trackedTextWidth(ctx, t + '…', spacing) > maxWidth) t = t.slice(0, -1);
+    return t + '…';
+  }
+
+  function annotationTypeLabel(type) {
+    if (type === 'lasso_selection') return 'LASSO SELECTION';
+    if (type === 'draw_polyline') return 'POLYLINE';
+    if (type === 'pin') return 'PIN';
+    if (type === 'measurement') return 'MEASUREMENT';
+    return String(type || '').toUpperCase().replace(/_/g, ' ') || 'ANNOTATION';
+  }
+
+  // One hand-drawn glyph per SpatialAnnotation::annotation_type (see that
+  // model's validation list), stroked/filled in `color` inside the box
+  // (bx, by, bsize, bsize). Plain canvas paths rather than the icon font
+  // used elsewhere in the UI -- this draws onto an offscreen canvas that
+  // becomes a texture, with no guarantee the icon font has finished
+  // loading by the time it's rasterized, so a dependency-free vector shape
+  // is the only way to render it reliably every time.
+  function drawAnnotationTypeIcon(ctx, type, bx, by, bsize, color) {
+    var cx = bx + bsize / 2, cy = by + bsize / 2, s = bsize / 2;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = Math.max(1.5, bsize * 0.09);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    if (type === 'pin') {
+      // Map-pin silhouette: a ringed head over a pointed base.
+      ctx.beginPath();
+      ctx.arc(cx, cy - s * 0.22, s * 0.42, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(cx - s * 0.26, cy + s * 0.06);
+      ctx.lineTo(cx, cy + s * 0.6);
+      ctx.lineTo(cx + s * 0.26, cy + s * 0.06);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy - s * 0.22, s * 0.13, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (type === 'lasso_selection') {
+      // Freeform dashed loop -- a selection outline, not a geometric shape.
+      var pts = [
+        [-0.36, -0.02], [-0.18, -0.4], [0.24, -0.34], [0.4, 0.02],
+        [0.3, 0.38], [-0.08, 0.42], [-0.36, 0.22]
+      ];
+      ctx.beginPath();
+      ctx.moveTo(cx + pts[0][0] * s, cy + pts[0][1] * s);
+      for (var i = 1; i <= pts.length; i++) {
+        var p0 = pts[i - 1], p1 = pts[i % pts.length];
+        var mx = cx + (p0[0] + p1[0]) / 2 * s, my = cy + (p0[1] + p1[1]) / 2 * s;
+        ctx.quadraticCurveTo(cx + p0[0] * s, cy + p0[1] * s, mx, my);
+      }
+      ctx.closePath();
+      ctx.setLineDash([bsize * 0.1, bsize * 0.08]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    } else if (type === 'draw_polyline') {
+      // Zigzag path with its vertices marked -- same idea as the drawn
+      // polyline itself, just abstracted to a few points.
+      var vtx = [[-0.38, 0.22], [-0.1, -0.32], [0.18, 0.16], [0.4, -0.38]];
+      ctx.beginPath();
+      ctx.moveTo(cx + vtx[0][0] * s, cy + vtx[0][1] * s);
+      for (var j = 1; j < vtx.length; j++) ctx.lineTo(cx + vtx[j][0] * s, cy + vtx[j][1] * s);
+      ctx.stroke();
+      vtx.forEach(function(p) {
+        ctx.beginPath();
+        ctx.arc(cx + p[0] * s, cy + p[1] * s, s * 0.1, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    } else if (type === 'measurement') {
+      // Ruler: a span between two end ticks, with inward arrowheads.
+      ctx.beginPath();
+      ctx.moveTo(cx - s * 0.42, cy);
+      ctx.lineTo(cx + s * 0.42, cy);
+      ctx.stroke();
+      [-1, 1].forEach(function(side) {
+        var ex = cx + side * s * 0.42;
+        ctx.beginPath();
+        ctx.moveTo(ex, cy - s * 0.22);
+        ctx.lineTo(ex, cy + s * 0.22);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(ex, cy - s * 0.14);
+        ctx.lineTo(ex - side * s * 0.2, cy);
+        ctx.lineTo(ex, cy + s * 0.14);
+        ctx.stroke();
+      });
+    } else {
+      // Fallback for any future annotation_type: a plain generic marker.
+      ctx.beginPath();
+      ctx.arc(cx, cy, s * 0.4, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy, s * 0.1, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Renders the card as a minimal mil-spec/sci-fi HUD "callout": a bare
+  // dark readout box (plain thin outline, no chamfering) fed by a small
+  // elbowed leader line from a reticle dot, a bold tracked-caps title with
+  // a lighter tracked-caps type line beneath it (the HUD reference's
+  // bold-keyword / light-descriptor pairing), a divider, then the
+  // description below. The annotation's own color is kept, but used
+  // sparingly -- just the reticle/leader and a thin left-edge tick --
+  // rather than washing the whole card, to match the reference's mostly
+  // monochrome white-on-black look.
+  function buildAnnotationLabelCanvas(a, colorHex) {
+    var W = 512, H = 300, pad = 22, m = 10, topPad = 40;
+    var canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    var ctx = canvas.getContext('2d');
+
+    var c = new THREE.Color(colorHex);
+    var rgb = Math.round(c.r * 255) + ',' + Math.round(c.g * 255) + ',' + Math.round(c.b * 255);
+    var accent = 'rgba(' + rgb + ',';
+
+    var x = m, y = topPad, w = W - m * 2, h = H - topPad - m;
+
+    // ---- Leader line: reticle dot outside the box, elbowed into its top edge ----
+    var dotX = m + 8, dotY = 14, bendX = x + 40, bendY = y - 16;
+    ctx.strokeStyle = accent + '0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(dotX, dotY);
+    ctx.lineTo(bendX, bendY);
+    ctx.lineTo(bendX, y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(dotX, dotY, 4, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(dotX, dotY, 1.4, 0, Math.PI * 2);
+    ctx.fillStyle = accent + '0.9)';
     ctx.fill();
-    ctx.lineWidth = 5;
-    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+
+    // ---- The readout box itself: thin outline, plain near-black fill ----
+    roundRectPath(ctx, x, y, w, h, 4);
+    ctx.fillStyle = 'rgba(8,10,14,0.74)';
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
     ctx.stroke();
 
-    function drawTextHalo(text, tx, ty) {
-      ctx.lineWidth = 6;
-      ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-      ctx.strokeText(text, tx, ty);
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText(text, tx, ty);
-    }
+    // Thin color-coded tick on the box's left edge -- the one place the
+    // annotation's own color still marks the card, for quick visual
+    // association with its 3D marker/pin color elsewhere in the viewer.
+    ctx.fillStyle = accent + '0.85)';
+    ctx.fillRect(x, y + 6, 3, h - 12);
 
+    // ---- Header: small plain-outline icon badge + bold tracked title ----
+    var iconSize = 34, iconX = x + pad, iconY = y + pad - 6;
+    roundRectPath(ctx, iconX, iconY, iconSize, iconSize, 3);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.stroke();
+    drawAnnotationTypeIcon(ctx, a.annotation_type, iconX, iconY, iconSize, 'rgba(255,255,255,0.95)');
+
+    var textX = iconX + iconSize + 14;
     ctx.textBaseline = 'alphabetic';
-    var cy = pad + 28;
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '700 26px monospace';
+    var titleY = y + pad + 10;
+    fillTextTracked(ctx, truncateTracked(ctx, (a.title || '(untitled)').toUpperCase(), W - pad - textX, 2), textX, titleY, 2);
 
-    var titleLines = wrapCanvasTextLines(ctx, a.title || '(untitled)', 'bold 32px sans-serif', W - pad * 2, 2);
-    titleLines.forEach(function(line) { drawTextHalo(line, pad, cy); cy += 38; });
+    // Light tracked-caps descriptor line -- annotation type, plus the
+    // linked Work Package type when there is one.
+    var typeLine = annotationTypeLabel(a.annotation_type);
+    if (a.work_package_type) typeLine += '  ·  ' + String(a.work_package_type).toUpperCase();
+    ctx.font = '400 15px monospace';
+    ctx.fillStyle = 'rgba(190,198,208,0.95)';
+    var typeY = titleY + 22;
+    fillTextTracked(ctx, truncateTracked(ctx, typeLine, W - pad - textX, 1.5), textX, typeY, 1.5);
 
-    if (a.work_package_type) {
-      cy += 4;
-      ctx.font = '600 22px sans-serif';
-      drawTextHalo(String(a.work_package_type).toUpperCase(), pad, cy);
-      cy += 32;
-    }
+    var headerBottom = Math.max(iconY + iconSize, typeY + 8) + 14;
 
+    // ---- Divider between the title section and the description below ----
+    ctx.beginPath();
+    ctx.moveTo(x + pad, headerBottom);
+    ctx.lineTo(x + w - pad, headerBottom);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + pad, headerBottom - 4);
+    ctx.lineTo(x + pad, headerBottom + 4);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = accent + '0.95)';
+    ctx.stroke();
+
+    // ---- Description section ----
     if (a.description) {
-      cy += 6;
-      var maxDescLines = Math.max(1, Math.floor((H - pad - cy) / 28));
-      var descLines = wrapCanvasTextLines(ctx, a.description, '24px sans-serif', W - pad * 2, maxDescLines);
-      descLines.forEach(function(line) { drawTextHalo(line, pad, cy); cy += 28; });
+      var descY = headerBottom + 26;
+      var maxDescLines = Math.max(1, Math.floor((y + h - pad - descY) / 23));
+      ctx.font = '19px sans-serif';
+      var descLines = wrapCanvasTextLines(ctx, a.description, '19px sans-serif', w - pad * 2, maxDescLines);
+      ctx.fillStyle = 'rgba(214,221,230,0.9)';
+      descLines.forEach(function(line) { ctx.fillText(line, x + pad, descY); descY += 23; });
     }
 
+    return canvas;
+  }
+
+  // Soft red glow traced around the callout box's own rounded-rect
+  // silhouette, shown only on hover (see _setHoveredLabel) -- not tied to
+  // the annotation's own color, since the hover highlight is deliberately
+  // always red regardless of the card's base color.
+  //
+  // Mirrors buildAnnotationLabelCanvas's box geometry (cardW/cardH/m/
+  // topPad below must stay in sync with that function's W/H/m/x,y,w,h) so
+  // the glow actually hugs the box's shape instead of a generic blob --
+  // a plain radial gradient on a square canvas, stretched onto this card's
+  // wide/short plane, used to render as an oval with no relation to the
+  // box's outline. Drawn on a canvas GLOW_SCALE times bigger (not just a
+  // bigger plane) so there's real pixel margin for the blur layers to
+  // bleed into without being clipped at the canvas edge; GLOW_SCALE must
+  // match the glow plane's own size multiple at its call site in
+  // renderExisting3DAnnotations (currently both 1.5), so pixels-per-world-
+  // unit stays identical between the glow and card planes and the traced
+  // box lines up exactly with the real card's edges once billboarded
+  // together.
+  function buildAnnotationGlowCanvas() {
+    var GLOW_SCALE = 1.5;
+    var cardW = 512, cardH = 300, m = 10, topPad = 40;
+    var W = cardW * GLOW_SCALE, H = cardH * GLOW_SCALE;
+    var canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    var ctx = canvas.getContext('2d');
+
+    var offX = (W - cardW) / 2, offY = (H - cardH) / 2;
+    var x = offX + m, y = offY + topPad, w = cardW - m * 2, h = cardH - topPad - m;
+
+    ctx.lineJoin = 'round';
+    // Layered strokes, each wider-blurred and fainter than the last --
+    // builds a soft bleed outward from the outline instead of one flat
+    // blurred stroke, which looks noticeably more like a glow.
+    var layers = [
+      { blur: 42, width: 3, alpha: 0.16 },
+      { blur: 26, width: 4, alpha: 0.26 },
+      { blur: 14, width: 5, alpha: 0.42 },
+      { blur: 5, width: 5, alpha: 0.8 }
+    ];
+    layers.forEach(function(ly) {
+      roundRectPath(ctx, x, y, w, h, 4);
+      ctx.shadowColor = 'rgba(255,40,40,1)';
+      ctx.shadowBlur = ly.blur;
+      ctx.lineWidth = ly.width;
+      ctx.strokeStyle = 'rgba(255,60,60,' + ly.alpha + ')';
+      ctx.stroke();
+    });
+
+    // Crisp bright edge right on the silhouette itself, no blur.
+    ctx.shadowBlur = 0;
+    roundRectPath(ctx, x, y, w, h, 4);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(255,140,140,0.9)';
+    ctx.stroke();
+
+    return canvas;
+  }
+
+  // ---- AR: real-world-anchored annotations --------------------------------
+  // A model-space anchor point for an annotation -- the pin's own point, or
+  // the centroid of a lasso/polyline's stored points. Used as one half of an
+  // AR calibration correspondence (see computeArAnchorTransform) -- a
+  // separate, AR-specific helper rather than reusing
+  // renderExisting3DAnnotations's inline lasso-centroid computation, which
+  // is tied to live THREE.Vector3 ring data built during rendering, not the
+  // raw a.geometry_data every annotation (including pins) already carries.
+  function annotationAnchorPoint(a) {
+    var gd = a && a.geometry_data;
+    if (!gd || !gd.points || !gd.points.length) return null;
+    if (a.annotation_type === 'pin') {
+      var p = gd.points[0];
+      return new THREE.Vector3(p.x, p.y, p.z);
+    }
+    var c = new THREE.Vector3();
+    gd.points.forEach(function(p) { c.add(new THREE.Vector3(p.x, p.y, p.z)); });
+    return c.divideScalar(gd.points.length);
+  }
+
+  // The rigid transform (Y-axis rotation + translation, no scale/tilt --
+  // see the AR plan for why that's sufficient) mapping model-space points to
+  // real-world AR space, from 2 known correspondences. Averages the
+  // translation derived from each point pair to split any calibration-tap
+  // imprecision evenly between them rather than trusting one arbitrarily.
+  function computeArAnchorTransform(m1, m2, r1, r2) {
+    var modelAngle = Math.atan2(m2.z - m1.z, m2.x - m1.x);
+    var realAngle = Math.atan2(r2.z - r1.z, r2.x - r1.x);
+    // THREE.Quaternion.setFromAxisAngle(Y, +angle) rotates +X toward -Z
+    // (verified directly against THREE's own rotation, not assumed) -- i.e.
+    // a positive angle DECREASES atan2(z,x) heading. To turn the model
+    // heading INTO the real heading, the angle is modelAngle - realAngle,
+    // not the more "obvious" realAngle - modelAngle (which was tried first
+    // and caught by the standalone verification script: every calibration
+    // pair came out exactly backwards).
+    var q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), modelAngle - realAngle);
+    var t1 = r1.clone().sub(m1.clone().applyQuaternion(q));
+    var t2 = r2.clone().sub(m2.clone().applyQuaternion(q));
+    return { quaternion: q, position: t1.add(t2).multiplyScalar(0.5) };
+  }
+
+  // Simple rounded-rect-plus-centered-text button face for the in-AR tool
+  // switcher HUD (see _arSetupScene) -- deliberately much plainer than
+  // buildAnnotationLabelCanvas above (no title/type/description layout
+  // needed, just a short label).
+  function buildArHudButtonCanvas(label) {
+    var W = 220, H = 90;
+    var canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    var ctx = canvas.getContext('2d');
+    var r = 20, x = 4, y = 4, w = W - 8, h = H - 8;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(20,20,26,0.78)';
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.stroke();
+    ctx.font = 'bold 36px sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, W / 2, H / 2 + 2);
     return canvas;
   }
 
@@ -5204,7 +5831,25 @@
           new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, side: THREE.DoubleSide })
         );
         plane.renderOrder = 1000;
+
+        // Hover-only glow (see _setHoveredLabel) -- a bit larger than the
+        // card itself, additively blended, sitting just behind it. Hidden
+        // by default; toggled on/off, never rebuilt, as the mouse moves
+        // on/off this label.
+        var glowPlane = new THREE.Mesh(
+          new THREE.PlaneGeometry(1.5, 1.5 / aspect),
+          new THREE.MeshBasicMaterial({
+            map: new THREE.CanvasTexture(buildAnnotationGlowCanvas()),
+            transparent: true, depthTest: false, depthWrite: false,
+            side: THREE.DoubleSide, blending: THREE.AdditiveBlending
+          })
+        );
+        glowPlane.renderOrder = 999;
+        glowPlane.position.z = -0.001;
+        glowPlane.visible = false;
+
         var labelGroup = new THREE.Group();
+        labelGroup.add(glowPlane);
         labelGroup.add(plane);
         labelGroup.userData = { annotation: a };
         labelGroup.visible = self._labelsVisible !== false;
@@ -5219,7 +5864,7 @@
         connLine.visible = self._labelsVisible !== false;
         self.annotationsGroup.add(connLine);
 
-        self._annotationLabels.push({ group: labelGroup, line: connLine, plane: plane, centroid: centroid, ringRadius: ringRadius, annotation: a });
+        self._annotationLabels.push({ group: labelGroup, line: connLine, plane: plane, glow: glowPlane, centroid: centroid, ringRadius: ringRadius, annotation: a });
       } else if (a.annotation_type === 'draw_polyline' && gd.points) {
         var pts = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
         var line = new THREE.Line(
@@ -5275,10 +5920,11 @@
     }
   };
 
-  // Hit-tests a click against every live label card's plane (not the model
-  // mesh -- see _raycastAt/_visibleRaycastTargets for that, a separate,
-  // unrelated target list). Returns the matching annotation, or null.
-  SpatialViewerApp.prototype._raycastAnnotationLabels = function(clientX, clientY) {
+  // Hit-tests a click/hover against every live label card's plane (not the
+  // model mesh -- see _raycastAt/_visibleRaycastTargets for that, a
+  // separate, unrelated target list). Returns the matching entry from
+  // _annotationLabels (group/plane/glow/annotation/...), or null.
+  SpatialViewerApp.prototype._raycastAnnotationLabelEntry = function(clientX, clientY) {
     var labels = this._annotationLabels;
     if (!labels || !labels.length || this._labelsVisible === false) return null;
     var rect = this.canvas.getBoundingClientRect();
@@ -5287,35 +5933,201 @@
     this.raycaster.setFromCamera(this.mouse, this.camera);
     var planes = labels.map(function(L) { return L.plane; });
     var hits = this.raycaster.intersectObjects(planes, false);
-    return hits.length ? hits[0].object.parent.userData.annotation : null;
+    if (!hits.length) return null;
+    for (var i = 0; i < labels.length; i++) {
+      if (labels[i].plane === hits[0].object) return labels[i];
+    }
+    return null;
   };
 
-  // Re-project a saved lasso annotation's 3D ring through the current camera
-  // and tint the model surface inside it (the same filled highlight shown while
-  // drawing). Rebuilt each time so it matches the current viewpoint.
-  SpatialViewerApp.prototype.showAnnotationSurface = function(a) {
-    this._setLassoHighlight(null);
-    if (!a || a.annotation_type !== 'lasso_selection') return;
-    var gd = a.geometry_data;
-    if (!gd) return;
+  // Back-compat convenience wrapper for callers that only want the
+  // annotation itself (onPointerUp's click-to-open-detail path).
+  SpatialViewerApp.prototype._raycastAnnotationLabels = function(clientX, clientY) {
+    var L = this._raycastAnnotationLabelEntry(clientX, clientY);
+    return L ? L.annotation : null;
+  };
 
-    // Preferred path: the exact surface patch stored at save time, replayed
-    // directly with no raycasting or camera-dependent reprojection -- always
-    // anchored to the real geometry, from any viewing angle.
-    if (gd.fill_grid && gd.fill_rows && gd.fill_cols) {
-      var grid = gd.fill_grid.map(function(p) { return p ? { x: p[0], y: p[1], z: p[2] } : null; });
-      if (this._buildLassoFillFromGrid({ grid: grid, rows: gd.fill_rows, cols: gd.fill_cols }, a.color || '#3b82f6')) {
-        return;
+  // Red tint + glow while the mouse hovers a lasso annotation's label
+  // card (only while labels are toggled on -- see _raycastAnnotationLabelEntry's
+  // own _labelsVisible check), OR an IFC layer's mesh part (only while that
+  // layer is visible -- _raycastAt already only hits visible layers, see
+  // _visibleRaycastTargets). Deliberately does NOT react to photogrammetry/
+  // scan mesh layers (layerKind "mesh", set in _harvestLayer): those are one
+  // big fused scanned surface with no discrete "parts" an IFC conversion
+  // would have, so highlighting "the whole scan" on hover would be
+  // meaningless. A label wins over a mesh part directly behind it.
+  // Orbit/navigate mode only -- same gating as onPointerUp's click-to-open
+  // behavior, so a drawing tool in progress never shows or reacts to this.
+  // Called from onPointerMove on every move.
+  SpatialViewerApp.prototype._updateHoverEffects = function(clientX, clientY) {
+    if (this.currentTool !== 'orbit') { this._clearHoverEffects(); return; }
+    var L = this._raycastAnnotationLabelEntry(clientX, clientY);
+    this._setHoveredLabel(L);
+    var meshHit = null;
+    if (!L) {
+      var hit = this._raycastAt(clientX, clientY);
+      if (hit && hit.object && hit.object.isMesh && hit.object.userData &&
+          hit.object.userData.layerKind === 'ifc') {
+        meshHit = hit.object;
       }
     }
+    this._setHoveredMeshPart(meshHit);
+    if (this.viewport) this.viewport.style.cursor = (L || meshHit) ? 'pointer' : '';
+  };
 
-    // Fallback for annotations saved before fill_grid existed: reprojects
-    // the stored ring through the current camera and re-raycasts -- only as
-    // correct as the camera's reproduction of the original viewpoint (see
-    // _selectSurfaceInLasso).
-    if (!gd.points || gd.points.length < 3) return;
-    var ring = gd.points.map(function(p) { return new THREE.Vector3(p.x, p.y, p.z); });
-    this._selectSurfaceInLasso(ring, this.camera, a.color || '#3b82f6');
+  SpatialViewerApp.prototype._clearHoverEffects = function() {
+    this._setHoveredLabel(null);
+    this._setHoveredMeshPart(null);
+    if (this.viewport) this.viewport.style.cursor = '';
+  };
+
+  var ANNOTATION_HOVER_COLOR = 0xff3030;
+
+  SpatialViewerApp.prototype._setHoveredLabel = function(L) {
+    if (this._hoveredLabel === L) return;
+    if (this._hoveredLabel) {
+      this._hoveredLabel.plane.material.color.setHex(0xffffff);
+      this._hoveredLabel.glow.visible = false;
+    }
+    this._hoveredLabel = L;
+    if (L) {
+      L.plane.material.color.setHex(ANNOTATION_HOVER_COLOR);
+      L.glow.visible = true;
+    }
+  };
+
+  // Tinted clone of a model mesh's own material, used ONLY while that mesh
+  // is hovered (see _setHoveredMeshPart) -- a clone, never a mutation of
+  // the original, because glTF-converted meshes (IFC in particular)
+  // routinely share one material instance across many mesh parts, and
+  // mutating it in place would turn every part made of that material
+  // yellow, not just the one under the cursor.
+  function tintMeshMaterialForHover(mat) {
+    var c = mat.clone();
+    if (c.color) c.color.lerp(new THREE.Color(ANNOTATION_HOVER_COLOR), 0.55);
+    if (c.emissive) {
+      c.emissive.set(ANNOTATION_HOVER_COLOR);
+      if ('emissiveIntensity' in c) c.emissiveIntensity = Math.max(c.emissiveIntensity, 0.6);
+    }
+    return c;
+  }
+
+  // Same red-tint-plus-glow language as the label hover, applied to a
+  // model mesh part instead of a billboard card. There is no post-
+  // processing bloom pipeline in this viewer, so the "glow" here is the
+  // classic cheap stand-in: a slightly bigger, back-face-only, additively
+  // blended copy of the same geometry sitting just behind the real surface,
+  // bleeding a soft red edge past its silhouette.
+  SpatialViewerApp.prototype._setHoveredMeshPart = function(mesh) {
+    if (this._hoveredMeshPart === mesh) return;
+    if (this._hoveredMeshPart) {
+      this._hoveredMeshPart.material = this._hoveredMeshPartOrigMaterial;
+      this._hoveredMeshPartOrigMaterial = null;
+      (Array.isArray(this._hoveredMeshPartTinted) ? this._hoveredMeshPartTinted : [this._hoveredMeshPartTinted])
+        .forEach(function(m) { if (m) m.dispose(); });
+      this._hoveredMeshPartTinted = null;
+      if (this._meshHoverHalo) {
+        if (this._meshHoverHalo.parent) this._meshHoverHalo.parent.remove(this._meshHoverHalo);
+        this._meshHoverHalo.material.dispose();
+        this._meshHoverHalo = null;
+      }
+    }
+    this._hoveredMeshPart = mesh;
+    if (!mesh) return;
+
+    this._hoveredMeshPartOrigMaterial = mesh.material;
+    this._hoveredMeshPartTinted = Array.isArray(mesh.material)
+      ? mesh.material.map(tintMeshMaterialForHover)
+      : tintMeshMaterialForHover(mesh.material);
+    mesh.material = this._hoveredMeshPartTinted;
+
+    var halo = new THREE.Mesh(mesh.geometry, new THREE.MeshBasicMaterial({
+      color: ANNOTATION_HOVER_COLOR,
+      transparent: true,
+      opacity: 0.5,
+      side: THREE.BackSide,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: true
+    }));
+    halo.position.copy(mesh.position);
+    halo.quaternion.copy(mesh.quaternion);
+    halo.scale.copy(mesh.scale).multiplyScalar(1.03);
+    if (mesh.parent) mesh.parent.add(halo);
+    this._meshHoverHalo = halo;
+  };
+
+  // AR equivalent of _raycastAnnotationLabels, but from an arbitrary 3D ray
+  // (an XR input source's pointing ray) instead of a mouse/touch position,
+  // and against every clickable annotation mesh in the scene (pin cones AND
+  // lasso label-card planes), not just label planes -- in AR there's no
+  // separate list like _annotationLabels for pins, so this walks
+  // annotationsGroup directly. Returns {annotation, point} or null.
+  SpatialViewerApp.prototype._arPickAnnotationAt = function(origin, direction) {
+    var targets = [];
+    this.annotationsGroup.traverse(function(n) { if (n.isMesh) targets.push(n); });
+    this.raycaster.set(origin, direction);
+    var hits = this.raycaster.intersectObjects(targets, false);
+    if (!hits.length) return null;
+    var obj = hits[0].object;
+    var a = (obj.userData && obj.userData.annotation) ||
+      (obj.parent && obj.parent.userData && obj.parent.userData.annotation);
+    return a ? { annotation: a, point: hits[0].point } : null;
+  };
+
+  // Builds (or replaces) the single floating info card shown when an
+  // annotation is tapped in AR -- reuses buildAnnotationLabelCanvas as-is
+  // (already generic over annotation type, not lasso-specific) and the same
+  // CanvasTexture-on-a-plane technique as the desktop lasso label cards.
+  // Added directly to the scene in world space (the raycast hit point
+  // already IS world space) rather than to arAnchorGroup, so no coordinate
+  // conversion is needed.
+  SpatialViewerApp.prototype._showArInfoCard = function(a, worldPoint) {
+    this._clearArInfoCard();
+    var canvas = buildAnnotationLabelCanvas(a, a.color || '#3b82f6');
+    var tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    var aspect = canvas.width / canvas.height;
+    var plane = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.4, 0.4 / aspect),
+      new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, side: THREE.DoubleSide })
+    );
+    plane.renderOrder = 1002;
+    var group = new THREE.Group();
+    group.add(plane);
+    group.position.copy(worldPoint);
+    group.position.y += 0.25; // sits just above the tapped point, not on top of it
+    this.scene.add(group);
+    this._arInfoCard = group;
+  };
+
+  SpatialViewerApp.prototype._clearArInfoCard = function() {
+    if (!this._arInfoCard) return;
+    var card = this._arInfoCard;
+    card.traverse(function(n) {
+      if (n.geometry) n.geometry.dispose();
+      if (n.material) {
+        if (n.material.map) n.material.map.dispose();
+        if (n.material.dispose) n.material.dispose();
+      }
+    });
+    if (card.parent) card.parent.remove(card);
+    this._arInfoCard = null;
+  };
+
+  // Selection highlight for a saved lasso annotation: a 2D dark vignette
+  // around its ring + label card on screen (see _updateSelectionVignette),
+  // not the solid colored fill shown while actively drawing one -- filling
+  // the exact selected area again here read as "this is what's selected"
+  // rather than "this is what's highlighted", and competed with the label
+  // card for attention. Setting _selectedLassoAnnotation is all this does;
+  // the actual drawing happens every frame from the render loop, since it
+  // has to track wherever the ring/card land on screen as the camera moves
+  // (see closeAnnotationDetail for where this gets cleared again).
+  SpatialViewerApp.prototype.showAnnotationSurface = function(a) {
+    this._setLassoHighlight(null);
+    this._selectedLassoAnnotation = (a && a.annotation_type === 'lasso_selection') ? a : null;
   };
 
   SpatialViewerApp.prototype.flyToAnnotation = function(a) {
@@ -5347,43 +6159,28 @@
       list.innerHTML = '<div class="text-muted small text-center p-3">No 3D annotations yet.</div>';
       return;
     }
+    // Compact row: snapshot (or a color swatch when there's none) on the
+    // left, 3 single-line-truncated rows on the right -- title, then the
+    // start of the description, then the type last. Full detail (incl. the
+    // linked Work Package, author/date, area) is one click away in
+    // openAnnotationDetail, so none of that needs to be repeated here.
     var self = this;
     annotations.forEach(function(a) {
       var card = document.createElement('div');
-      card.className = 'annotation-card';
+      card.className = 'ann3d-card';
 
-      var wpLabel = a.work_package_id
-        ? ('WP #' + a.work_package_id + (a.work_package_status ? ' · ' + esc(a.work_package_status) : ''))
-        : '';
+      var thumb = a.snapshot_url
+        ? '<img class="ann3d-thumb" src="' + esc(a.snapshot_url) + '" alt="viewpoint snapshot">'
+        : '<div class="ann3d-thumb ann3d-thumb-placeholder" style="background:' + esc(a.color || '#3b82f6') + '"></div>';
 
-      var html = '';
-      if (a.snapshot_url) {
-        html += '<img class="annotation-thumb" src="' + esc(a.snapshot_url) + '" alt="viewpoint snapshot">';
-      }
-      html += '<div class="annotation-card-body">' +
-        '<div class="annotation-card-header">' +
-          '<span class="annotation-title">' + esc(a.title) + '</span>' +
-          '<span class="annotation-type-badge" style="background:' + esc(a.color || '#3b82f6') + ';color:#fff;">' +
-            esc(String(a.annotation_type || '').toUpperCase()) + '</span>' +
-        '</div>' +
-        (a.description ? '<div class="annotation-desc">' + esc(a.description) + '</div>' : '') +
-        (a.area != null ? '<div class="text-muted small">Area: ' + esc(a.area.toFixed(2)) + ' m²</div>' : '') +
-        (a.work_package_id
-          ? '<a class="annotation-wp-link" href="' + esc(a.work_package_url || ('/work_packages/' + a.work_package_id)) +
-              '" target="_blank" rel="noopener" title="' + esc(a.work_package_subject || '') + '">' +
-              '<i class="icon-relations"></i> ' + esc(wpLabel) + '</a>'
-          : '') +
-        '<div class="annotation-meta"><span>' + esc(a.author_name || '') + '</span><span>' + esc(a.created_at || '') + '</span></div>' +
-      '</div>';
+      card.innerHTML = thumb +
+        '<div class="ann3d-body">' +
+          '<div class="ann3d-title">' + esc(a.title || '(untitled)') + '</div>' +
+          '<div class="ann3d-desc">' + esc(a.description || '') + '</div>' +
+          '<div class="ann3d-type">' + esc(String(a.annotation_type || '').replace(/_/g, ' ').toUpperCase()) + '</div>' +
+        '</div>';
 
-      card.innerHTML = html;
-
-      // Click the card -> full annotation detail (also restores the viewpoint).
-      // Click the WP link -> straight to the Work Package (new tab).
-      card.addEventListener('click', function(e) {
-        if (e.target.closest && e.target.closest('.annotation-wp-link')) return;
-        self.openAnnotationDetail(a);
-      });
+      card.addEventListener('click', function() { self.openAnnotationDetail(a); });
       list.appendChild(card);
     });
   };
@@ -5421,6 +6218,12 @@
       var hasArea = a.area != null;
       areaGroup.style.display = hasArea ? '' : 'none';
       if (hasArea) setv('adArea', a.area.toFixed(2) + ' m²');
+    }
+    var ifcGroup = $('adIfcGroup');
+    if (ifcGroup) {
+      var ifcElementId = a.geometry_data && a.geometry_data.ifc_element_id;
+      ifcGroup.style.display = ifcElementId ? '' : 'none';
+      if (ifcElementId) setv('adIfcElement', ifcElementId);
     }
     this._adColor = a.color || '#3b82f6';
     document.querySelectorAll('#adColorGroup .color-dot').forEach(function(d) {
@@ -5489,6 +6292,7 @@
     var panel = document.getElementById('spatialSidePanel');
     if (panel) panel.classList.remove('detailing');
     this._setLassoHighlight(null);
+    this._selectedLassoAnnotation = null;
     var annTab = document.querySelector('.tab-btn[data-tab="annotationsTab"]');
     if (annTab) annTab.click();
   };
@@ -5503,7 +6307,13 @@
     this._detailAnnotation = updated;
     this.renderAnnotationsList(list);
     this.renderExisting3DAnnotations();
-    if (!keepView) this.showAnnotationSurface(updated);
+    // flyToAnnotation (not showAnnotationSurface directly): the selection
+    // vignette tracks the camera every frame regardless (see
+    // _updateSelectionVignette), but flying back to the annotation's own
+    // saved viewpoint is still worth doing here so the user lands back on a
+    // familiar view of what they just edited, not wherever they'd
+    // orbited/zoomed to while reading the detail panel.
+    if (!keepView) this.flyToAnnotation(updated);
   };
 
   SpatialViewerApp.prototype._sendAnnotation = function(method, payload, btn, onOk) {
@@ -5711,24 +6521,12 @@
       self.lassoScreenPath = null;
     });
 
-    var sliceBtn = document.getElementById('btnSliceToggle');
-    var slicePanel = document.getElementById('slicingPanel');
-    var closeSliceBtn = document.getElementById('closeSliceBtn');
-    if (sliceBtn && slicePanel) sliceBtn.addEventListener('click', function() { slicePanel.style.display = slicePanel.style.display === 'none' ? 'block' : 'none'; });
-    if (closeSliceBtn && slicePanel) closeSliceBtn.addEventListener('click', function() { slicePanel.style.display = 'none'; });
-
-    var layersBtn = document.getElementById('btnLayers');
-    var layersPanel = document.getElementById('layerPanel');
-    var closeLayersBtn = document.getElementById('closeLayerBtn');
-    if (layersBtn && layersPanel) layersBtn.addEventListener('click', function() {
-      var open = layersPanel.style.display === 'none' || !layersPanel.style.display;
-      layersPanel.style.display = open ? 'block' : 'none';
-      layersBtn.classList.toggle('active', open);
-    });
-    if (closeLayersBtn && layersPanel) closeLayersBtn.addEventListener('click', function() {
-      layersPanel.style.display = 'none';
-      if (layersBtn) layersBtn.classList.remove('active');
-    });
+    // Layers/Render/Sections used to be floating panels toggled by their own
+    // toolbar buttons -- now plain tabs in the side panel (see
+    // show.html.erb), so the generic .tab-btn handler below already covers
+    // opening/switching to them; only _buildLayerPanel's own show/hide of
+    // its tab button (depending on whether there's more than one layer)
+    // remains special-cased, see that method.
 
     var labelsBtn = document.getElementById('btnAnnotationLabels');
     if (labelsBtn) {
@@ -5792,6 +6590,7 @@
     });
 
     this.initVR();
+    this.initAR();
   };
 
   // ---- WebXR / VR headsets --------------------------------------------------
@@ -5825,6 +6624,7 @@
     function onSessionEnded() {
       if (self._xrSession) self._xrSession.removeEventListener('end', onSessionEnded);
       self._xrSession = null;
+      self._xrMode = null;
       self._xrTurnArmed = false;
       self.xrDolly.position.set(0, 0, 0);
       self.xrDolly.rotation.set(0, 0, 0);
@@ -5834,13 +6634,60 @@
     }
 
     btn.addEventListener('click', function() {
-      if (self._xrSession) { endVR(); return; }
+      // Only this button's own (VR) session is toggled off by clicking it
+      // again -- if an AR session happens to be active instead (see
+      // initAR), fall through to requestSession below, which the browser
+      // itself rejects (only one immersive session at a time), caught by
+      // the existing .catch with a clear message.
+      if (self._xrSession && self._xrMode === 'vr') { endVR(); return; }
 
       btn.disabled = true;
+
+      // A splat scene is by far the most GPU-fill-rate-heavy thing this
+      // viewer renders (lots of overlapping alpha-blended quads -- see the
+      // sort-cost comments on SplatRenderer/SplatRendererTex above). VR
+      // renders that cost TWICE (once per eye), normally at a higher
+      // per-eye resolution than the flat canvas and with no foveation, with
+      // nothing here previously capping it -- on a weaker/standalone
+      // headset GPU that combination can make a single frame take long
+      // enough that the browser decides the page is hung and kills/crashes
+      // the tab, matching "presses VR, long silence, then crash". Must be
+      // set before setSession (three.js requirement), so it's done here,
+      // right before requestSession, not after the session exists. Only
+      // applied when a splat is actually loaded -- plain OBJ/IFC/point
+      // cloud scenes are far cheaper and keep full native resolution.
+      try {
+        if (self.renderer.xr.setFramebufferScaleFactor) {
+          var hasSplats = !!(self._splatRenderers && self._splatRenderers.length);
+          self.renderer.xr.setFramebufferScaleFactor(hasSplats ? 0.7 : 1.0);
+        }
+      } catch (ignore) {}
+
+      // Watchdog: if the session never finishes starting (device/runtime
+      // hang rather than an outright rejection), don't leave the button
+      // disabled and the page looking frozen forever -- surface it as a
+      // recoverable error after a timeout instead. This can't abort a
+      // native hang already in progress, but it stops OUR UI from being
+      // stuck once/if control does return to JS.
+      var settled = false;
+      var watchdog = setTimeout(function() {
+        if (settled) return;
+        settled = true;
+        console.error('[SpatialViewer] VR session did not start within 20s -- giving up.');
+        if (self._xrSession) { try { self._xrSession.end(); } catch (ignore) {} }
+        self._xrSession = null;
+        self._xrMode = null;
+        btn.disabled = false;
+        btn.classList.remove('active');
+        btn.title = ENTER_TITLE;
+        alert('VR is taking too long to start and may be stuck -- try reloading the page, or restarting the headset\'s browser.');
+      }, 20000);
+
       navigator.xr.requestSession('immersive-vr', {
         optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
       }).then(function(session) {
         self._xrSession = session;
+        self._xrMode = 'vr';
         session.addEventListener('end', onSessionEnded);
 
         // Stand the player ~1.6 m below and 3 m back from the current focus
@@ -5852,14 +6699,21 @@
 
         try { self.renderer.xr.setReferenceSpaceType('local-floor'); } catch (ignore) {}
         return self.renderer.xr.setSession(session).then(function() {
+          if (settled) return; // watchdog already fired and tore this down
+          settled = true;
+          clearTimeout(watchdog);
           btn.disabled = false;
           btn.classList.add('active');
           btn.title = 'Exit VR';
         });
       }).catch(function(err) {
+        if (settled) return; // watchdog already handled it
+        settled = true;
+        clearTimeout(watchdog);
         console.error('[SpatialViewer] Could not start VR session:', err);
         if (self._xrSession) { try { self._xrSession.end(); } catch (ignore) {} }
         self._xrSession = null;
+        self._xrMode = null;
         self.xrDolly.position.set(0, 0, 0);
         self.xrDolly.rotation.set(0, 0, 0);
         btn.disabled = false;
@@ -5868,6 +6722,488 @@
         alert('Could not start VR: ' + (err.message || err));
       });
     });
+  };
+
+  // ---- WebXR / AR passthrough (additive -- does not touch VR above) ------
+  // Unlike VR (a self-contained virtual room), AR overlays the real,
+  // physical site -- so only the annotations are shown (never the mesh/
+  // point cloud/splat model itself), and they must appear in the correct
+  // real-world position. That requires a one-time per-session calibration:
+  // the user picks 2 existing annotations they can physically walk up to,
+  // then in AR taps each one's real-world location (via a hit-test
+  // reticle) to establish how model space maps onto the real, tracked AR
+  // space -- see computeArAnchorTransform above for the math.
+  SpatialViewerApp.prototype.initAR = function() {
+    var self = this;
+    var btn = document.getElementById('btnAR');
+    if (!btn) return;
+
+    if (!window.isSecureContext || !navigator.xr || !navigator.xr.isSessionSupported) {
+      btn.style.display = 'none';
+      return;
+    }
+
+    btn.disabled = true;
+    navigator.xr.isSessionSupported('immersive-ar').then(function(supported) {
+      if (!supported) { btn.style.display = 'none'; return; }
+      btn.style.display = '';
+      btn.disabled = false;
+    }).catch(function() { btn.style.display = 'none'; });
+
+    var calibPanel = document.getElementById('arCalibPanel');
+    var ref1Sel = document.getElementById('arCalibRef1');
+    var ref2Sel = document.getElementById('arCalibRef2');
+    var statusEl = document.getElementById('arCalibStatus');
+    var startBtn = document.getElementById('arCalibStartBtn');
+    var closeBtn = document.getElementById('closeArCalibBtn');
+    if (!calibPanel || !ref1Sel || !ref2Sel || !startBtn) return;
+
+    function populateRefSelects() {
+      var opts = (self.projectData && self.projectData.annotations || []).filter(function(a) {
+        return !!annotationAnchorPoint(a);
+      });
+      [ref1Sel, ref2Sel].forEach(function(sel) {
+        sel.innerHTML = '';
+        opts.forEach(function(a) {
+          var o = document.createElement('option');
+          o.value = String(a.id);
+          o.textContent = a.title || ('#' + a.id);
+          sel.appendChild(o);
+        });
+      });
+      if (opts.length > 1 && ref2Sel.options.length > 1) ref2Sel.selectedIndex = 1;
+    }
+
+    function endAR() {
+      if (self._xrSession) { try { self._xrSession.end(); } catch (ignore) {} }
+    }
+
+    function onARSessionEnded() {
+      if (self._xrSession) self._xrSession.removeEventListener('end', onARSessionEnded);
+      self._xrSession = null;
+      self._xrMode = null;
+      self._arTeardownScene();
+      btn.disabled = false;
+      btn.classList.remove('active');
+    }
+
+    function onARSelect(event) { self._handleArSelect(event); }
+    function onARSelectStart(event) { self._handleArSelectStart(event); }
+    function onARSelectEnd(event) { self._handleArSelectEnd(event); }
+
+    function startARSession() {
+      btn.disabled = true;
+      navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['hit-test', 'local-floor'] })
+        .then(function(session) {
+          self._xrSession = session;
+          self._xrMode = 'ar';
+          session.addEventListener('end', onARSessionEnded);
+          session.addEventListener('select', onARSelect);
+          // selectstart/selectend bound a lasso-drawing stroke -- see
+          // _handleArSelectStart/_handleArSelectEnd. 'select' alone (a
+          // completed tap) is enough for calibration taps, HUD taps, and
+          // placing a pin.
+          session.addEventListener('selectstart', onARSelectStart);
+          session.addEventListener('selectend', onARSelectEnd);
+
+          self._arSetupScene();
+
+          session.requestReferenceSpace('viewer').then(function(viewerSpace) {
+            return session.requestHitTestSource({ space: viewerSpace });
+          }).then(function(source) {
+            self._arHitTestSource = source;
+          }).catch(function(err) {
+            console.warn('[SpatialViewer] AR hit-test source unavailable:', err);
+          });
+
+          try { self.renderer.xr.setReferenceSpaceType('local-floor'); } catch (ignore) {}
+          return self.renderer.xr.setSession(session).then(function() {
+            btn.disabled = false;
+            btn.classList.add('active');
+            self._updateArCalibStatus();
+          });
+        }).catch(function(err) {
+          console.error('[SpatialViewer] Could not start AR session:', err);
+          self._xrSession = null;
+          self._xrMode = null;
+          btn.disabled = false;
+          btn.classList.remove('active');
+          alert('Could not start AR: ' + (err.message || err));
+        });
+    }
+
+    btn.addEventListener('click', function() {
+      if (self._xrSession && self._xrMode === 'ar') { endAR(); return; }
+      populateRefSelects();
+      if (statusEl) statusEl.textContent = '';
+      calibPanel.style.display = 'block';
+    });
+
+    if (closeBtn) closeBtn.addEventListener('click', function() { calibPanel.style.display = 'none'; });
+
+    startBtn.addEventListener('click', function() {
+      var annotations = (self.projectData && self.projectData.annotations) || [];
+      var a1 = annotations.find(function(a) { return String(a.id) === ref1Sel.value; });
+      var a2 = annotations.find(function(a) { return String(a.id) === ref2Sel.value; });
+      if (!a1 || !a2 || a1.id === a2.id) { alert('Pick two different reference points.'); return; }
+      var p1 = annotationAnchorPoint(a1), p2 = annotationAnchorPoint(a2);
+      if (!p1 || !p2) { alert('Could not read those annotations’ positions.'); return; }
+      self._arCalibModelPoints = [p1, p2];
+      self._arCalibRealPoints = [];
+      self._arCalibStep = 0;
+      calibPanel.style.display = 'none';
+      startARSession();
+    });
+  };
+
+  // Hides the real model, reparents annotationsGroup under a fresh
+  // arAnchorGroup (its transform is set once calibration finishes --
+  // identity until then), and builds the hit-test reticle. Mirrors initVR's
+  // own entry setup, but AR's scene changes are undone on session end
+  // (_arTeardownScene) rather than persisting, since nothing here should
+  // affect the normal desktop/VR view afterward.
+  SpatialViewerApp.prototype._arSetupScene = function() {
+    var self = this;
+    this._arHiddenGroups = [];
+    Object.keys(this.layerGroups || {}).forEach(function(id) {
+      var g = self.layerGroups[id];
+      if (g && g.visible) { self._arHiddenGroups.push(g); g.visible = false; }
+    });
+    [this.gridHelper, this.shadowCatcher, this.lassoHighlightGroup, this.tempMarkupGroup].forEach(function(g) {
+      if (g && g.visible) { self._arHiddenGroups.push(g); g.visible = false; }
+    });
+
+    this.arAnchorGroup = new THREE.Group();
+    this.scene.add(this.arAnchorGroup);
+    this._arAnnotationsOriginalParent = this.annotationsGroup.parent;
+    this.arAnchorGroup.add(this.annotationsGroup);
+
+    this._arReticle = new THREE.Mesh(
+      new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: 0x22c55e, transparent: true, opacity: 0.9, depthTest: false, side: THREE.DoubleSide })
+    );
+    this._arReticle.visible = false;
+    this._arReticle.renderOrder = 1001;
+    this.scene.add(this._arReticle);
+
+    // Tool switcher HUD -- 3 small always-visible buttons attached to the
+    // camera (so they follow the headset/phone), used once calibration is
+    // done to pick between inspecting existing annotations (default) and
+    // creating a new pin or lasso region. Same canvas-texture-on-a-plane
+    // technique as every other label in this file.
+    this._arHud = new THREE.Group();
+    this._arHud.position.set(0, -0.2, -0.5);
+    this.camera.add(this._arHud);
+    [
+      { tool: 'inspect', label: 'Inspect', x: -0.17 },
+      { tool: 'pin', label: 'Pin', x: 0 },
+      { tool: 'lasso', label: 'Lasso', x: 0.17 }
+    ].forEach(function(t) {
+      var canvas = buildArHudButtonCanvas(t.label);
+      var tex = new THREE.CanvasTexture(canvas);
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      var aspect = canvas.width / canvas.height;
+      var h = 0.05;
+      var mesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(h * aspect, h),
+        new THREE.MeshBasicMaterial({
+          map: tex, transparent: true, depthTest: false, side: THREE.DoubleSide,
+          opacity: t.tool === 'inspect' ? 1.0 : 0.55
+        })
+      );
+      mesh.position.set(t.x, 0, 0);
+      mesh.renderOrder = 1003;
+      mesh.userData = { arTool: t.tool };
+      self._arHud.add(mesh);
+    });
+
+    this._arTool = 'inspect';
+    this._arLassoActive = false;
+    this._arLassoPoints = null;
+    this._arLassoLastPoint = null;
+    this._arLastFrame = null;
+    this._arHitTestSource = null;
+  };
+
+  SpatialViewerApp.prototype._arTeardownScene = function() {
+    (this._arHiddenGroups || []).forEach(function(g) { g.visible = true; });
+    this._arHiddenGroups = null;
+
+    if (this._arAnnotationsOriginalParent) this._arAnnotationsOriginalParent.add(this.annotationsGroup);
+    this._arAnnotationsOriginalParent = null;
+
+    if (this.arAnchorGroup) { this.scene.remove(this.arAnchorGroup); this.arAnchorGroup = null; }
+    if (this._arReticle) {
+      this._arReticle.geometry.dispose();
+      this._arReticle.material.dispose();
+      this.scene.remove(this._arReticle);
+      this._arReticle = null;
+    }
+    this._clearArInfoCard();
+    if (this._arHud) {
+      this._arHud.traverse(function(n) {
+        if (n.geometry) n.geometry.dispose();
+        if (n.material) {
+          if (n.material.map) n.material.map.dispose();
+          if (n.material.dispose) n.material.dispose();
+        }
+      });
+      if (this._arHud.parent) this._arHud.parent.remove(this._arHud);
+      this._arHud = null;
+    }
+    if (this._arHitTestSource) { try { this._arHitTestSource.cancel(); } catch (ignore) {} this._arHitTestSource = null; }
+    this._arLastFrame = null;
+    this._arCalibStep = 0;
+    this._arCalibModelPoints = null;
+    this._arCalibRealPoints = null;
+    this._arTool = null;
+    this._arLassoActive = false;
+    this._arLassoPoints = null;
+    this._arLassoLastPoint = null;
+  };
+
+  // Called every presenting-AR frame from the main render loop (see
+  // initThree). The reticle stays live for the whole session now, not just
+  // during calibration -- placing a pin and sampling a lasso stroke both
+  // read its current position every frame, same as calibration did.
+  SpatialViewerApp.prototype._processARFrame = function(frame) {
+    if (this._arInfoCard) this._arInfoCard.quaternion.copy(this.camera.quaternion);
+    this._arUpdateReticle(frame);
+    if (this._arLassoActive) this._arSampleLassoPoint();
+  };
+
+  SpatialViewerApp.prototype._arUpdateReticle = function(frame) {
+    if (!this._arReticle) return;
+    if (!frame || !this._arHitTestSource) { this._arReticle.visible = false; return; }
+    var refSpace = this.renderer.xr.getReferenceSpace();
+    if (!refSpace) { this._arReticle.visible = false; return; }
+    var results = frame.getHitTestResults(this._arHitTestSource);
+    if (results.length) {
+      var pose = results[0].getPose(refSpace);
+      if (pose) {
+        this._arReticle.visible = true;
+        this._arReticle.matrix.fromArray(pose.transform.matrix);
+        this._arReticle.matrix.decompose(this._arReticle.position, this._arReticle.quaternion, this._arReticle.scale);
+        return;
+      }
+    }
+    this._arReticle.visible = false;
+  };
+
+  SpatialViewerApp.prototype._updateArCalibStatus = function() {
+    var el = document.getElementById('arCalibStatus');
+    if (!el) return;
+    var msgs = [
+      'Point at the FIRST reference point’s real-world location and tap/select to confirm.',
+      'Now point at the SECOND reference point’s real-world location and tap/select to confirm.'
+    ];
+    el.textContent = msgs[this._arCalibStep] || '';
+  };
+
+  SpatialViewerApp.prototype._finishArCalibration = function() {
+    var xform = computeArAnchorTransform(
+      this._arCalibModelPoints[0], this._arCalibModelPoints[1],
+      this._arCalibRealPoints[0], this._arCalibRealPoints[1]
+    );
+    this.arAnchorGroup.quaternion.copy(xform.quaternion);
+    this.arAnchorGroup.position.copy(xform.position);
+    // The reticle keeps running after this (not hidden) -- placing a pin
+    // and sampling a lasso stroke both need it live for the rest of the
+    // session, see _processARFrame/_arUpdateReticle.
+    this._updateArCalibStatus();
+  };
+
+  // Routes a WebXR 'select' event (screen tap on handheld AR, or a
+  // controller trigger) to either a calibration-point confirmation (the
+  // first 2 taps) or an annotation pick (every tap after that) -- see
+  // initAR's session setup for how this gets attached.
+  SpatialViewerApp.prototype._handleArSelect = function(event) {
+    if (this._arCalibStep < 2) {
+      if (!this._arReticle || !this._arReticle.visible) return; // no valid surface under the ray yet
+      this._arCalibRealPoints[this._arCalibStep] = this._arReticle.position.clone();
+      this._arCalibStep++;
+      if (this._arCalibStep >= 2) this._finishArCalibration();
+      else this._updateArCalibStatus();
+      return;
+    }
+
+    var ray = this._arRayFromEvent(event);
+    if (!ray) return;
+
+    // The HUD tool switcher takes priority over every other tap.
+    var hudTool = this._arPickHudTool(ray.origin, ray.direction);
+    if (hudTool) { this._setArTool(hudTool); return; }
+
+    if (this._arTool === 'pin') { this._arPlacePinAtReticle(); return; }
+    if (this._arTool === 'lasso') return; // driven by selectstart/selectend below, not a single select
+
+    var pick = this._arPickAnnotationAt(ray.origin, ray.direction);
+    if (pick) this._showArInfoCard(pick.annotation, pick.point);
+    else this._clearArInfoCard();
+  };
+
+  // Shared ray extraction for every 'select'-family handler: the XR input
+  // source's pointing ray (screen tap on handheld AR, or a controller), as
+  // a world-space origin/direction pair ready for this.raycaster.
+  SpatialViewerApp.prototype._arRayFromEvent = function(event) {
+    var frame = this._arLastFrame;
+    var refSpace = this.renderer.xr.getReferenceSpace();
+    if (!frame || !refSpace || !event.inputSource || !event.inputSource.targetRaySpace) return null;
+    var pose = frame.getPose(event.inputSource.targetRaySpace, refSpace);
+    if (!pose) return null;
+    var m = new THREE.Matrix4().fromArray(pose.transform.matrix);
+    return {
+      origin: new THREE.Vector3().setFromMatrixPosition(m),
+      direction: new THREE.Vector3(0, 0, -1).transformDirection(m)
+    };
+  };
+
+  // Hit-tests the 3 HUD tool buttons (see _arSetupScene) and returns the
+  // tapped tool name, or null if the ray missed all of them.
+  SpatialViewerApp.prototype._arPickHudTool = function(origin, direction) {
+    if (!this._arHud) return null;
+    var buttons = this._arHud.children.filter(function(c) { return c.isMesh; });
+    this.raycaster.set(origin, direction);
+    var hits = this.raycaster.intersectObjects(buttons, false);
+    return hits.length ? hits[0].object.userData.arTool : null;
+  };
+
+  SpatialViewerApp.prototype._setArTool = function(tool) {
+    this._arTool = tool;
+    // Any in-progress lasso stroke is abandoned when switching tools mid-hold
+    // (selectstart already fired under the old tool) -- selectend will see
+    // too few points and simply not create anything.
+    this._arLassoActive = false;
+    if (this._arHud) {
+      this._arHud.children.forEach(function(btn) {
+        if (btn.userData && btn.userData.arTool) {
+          btn.material.opacity = (btn.userData.arTool === tool) ? 1.0 : 0.55;
+        }
+      });
+    }
+  };
+
+  // Converts the current reticle hit (a real surface point AND its normal)
+  // into model space and creates a pin there. The normal needs the
+  // calibration ROTATION only (not worldToLocal, which also subtracts
+  // position -- correct for a point, wrong for a direction).
+  SpatialViewerApp.prototype._arPlacePinAtReticle = function() {
+    if (!this._arReticle || !this._arReticle.visible || !this.arAnchorGroup) return;
+    var modelPos = this.arAnchorGroup.worldToLocal(this._arReticle.position.clone());
+    var worldNormal = new THREE.Vector3(0, 1, 0).applyQuaternion(this._arReticle.quaternion);
+    var invRot = this.arAnchorGroup.quaternion.clone().invert();
+    var modelNormal = worldNormal.applyQuaternion(invRot).normalize();
+    this._createArAnnotation({
+      type: 'pin',
+      points: [{ x: modelPos.x, y: modelPos.y, z: modelPos.z }],
+      normal: { x: modelNormal.x, y: modelNormal.y, z: modelNormal.z }
+    });
+  };
+
+  // selectstart/selectend bound a lasso stroke: begin collecting hit-test
+  // points (sampled every frame in _processARFrame while active) on
+  // selectstart, close the loop and create the annotation on selectend.
+  // Calibration taps only ever go through the plain 'select' handler above,
+  // so both bail out immediately if calibration isn't finished yet.
+  SpatialViewerApp.prototype._handleArSelectStart = function(event) {
+    if (this._arCalibStep < 2) return;
+    var ray = this._arRayFromEvent(event);
+    if (ray && this._arPickHudTool(ray.origin, ray.direction)) return; // a HUD tap, not a stroke
+    if (this._arTool !== 'lasso') return;
+    this._arLassoActive = true;
+    this._arLassoPoints = [];
+    this._arLassoLastPoint = null;
+  };
+
+  SpatialViewerApp.prototype._handleArSelectEnd = function() {
+    if (!this._arLassoActive) return;
+    this._arLassoActive = false;
+    var pts = this._arLassoPoints || [];
+    if (pts.length < 3) return;
+    this._createArAnnotation({
+      type: 'lasso_selection',
+      closed: true,
+      points: pts.map(function(p) { return { x: p.x, y: p.y, z: p.z }; })
+    });
+  };
+
+  // Called every AR frame (from _processARFrame) while a lasso stroke is
+  // active. Mirrors the desktop lasso's own minimum-spacing dedup
+  // (_sampleLassoScreen's `minPx` check) but in real-world meters instead
+  // of screen pixels, since there's no 2D path here -- just a sequence of
+  // real-world hit-test points converted straight to model space.
+  SpatialViewerApp.prototype._arSampleLassoPoint = function() {
+    if (!this._arReticle || !this._arReticle.visible || !this.arAnchorGroup) return;
+    var modelPoint = this.arAnchorGroup.worldToLocal(this._arReticle.position.clone());
+    var last = this._arLassoLastPoint;
+    if (last && last.distanceTo(modelPoint) < 0.05) return; // 5cm minimum spacing
+    this._arLassoPoints.push(modelPoint);
+    this._arLassoLastPoint = modelPoint;
+  };
+
+  // POSTs a newly AR-created annotation (pin or lasso) with an automatic
+  // title and no linked Work Package or snapshot -- there's no in-AR
+  // keyboard to fill those in, so the user completes them afterward via the
+  // normal detail panel, same as any other field. Mirrors saveAnnotation's
+  // own fetch/payload shape (this._annUrl(), same headers) but with
+  // create_work_package left to its own server-side defaults (falls back to
+  // this title and the project's default type -- see
+  // SpatialAnnotationsController#create_work_package, unchanged).
+  SpatialViewerApp.prototype._createArAnnotation = function(gd) {
+    var self = this;
+    var title = (gd.type === 'pin' ? 'AR pin — ' : 'AR region — ') + new Date().toLocaleString();
+    var payload = {
+      spatial_annotation: {
+        title: title,
+        description: '',
+        annotation_type: gd.type,
+        color: this.activeColor || '#3b82f6',
+        work_package_id: null,
+        thumbnail_base64: null,
+        camera_viewpoint: null,
+        geometry_data: gd
+      },
+      create_work_package: 'true',
+      wp_subject: title,
+      wp_description: ''
+    };
+    fetch(this._annUrl(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': this.csrfToken },
+      body: JSON.stringify(payload)
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(result) {
+        if (result && result.success) {
+          self.projectData.annotations.unshift(result.annotation);
+          self.renderAnnotationsList(self.projectData.annotations);
+          self.renderExisting3DAnnotations();
+          self._flashArConfirm();
+          // Same reasoning as the desktop save flow: once a lasso region is
+          // saved, drop back to inspect mode instead of leaving 'lasso'
+          // armed for another stroke.
+          if (gd.type === 'lasso_selection') self._setArTool('inspect');
+        } else {
+          console.warn('[SpatialViewer] AR annotation create failed:', result && result.errors);
+        }
+      })
+      .catch(function(err) {
+        console.warn('[SpatialViewer] AR annotation create network error:', err);
+      });
+  };
+
+  // Brief visual acknowledgement that a pin/lasso was created -- there's no
+  // toast/alert visible during an immersive session, so this is the only
+  // feedback available: flash the reticle white for 200ms.
+  SpatialViewerApp.prototype._flashArConfirm = function() {
+    if (!this._arReticle) return;
+    var mat = this._arReticle.material;
+    var original = mat.color.getHex();
+    mat.color.setHex(0xffffff);
+    setTimeout(function() {
+      try { mat.color.setHex(original); } catch (ignore) {}
+    }, 200);
   };
 
   SpatialViewerApp.prototype.updateTooltip = function() {

@@ -222,42 +222,47 @@
   padding-bottom: 6px;
 }
 
-.slicing-body label {
+#slicingPanel .slicing-body label {
   display: flex;
   flex-direction: column;
-  font-size: 0.8rem;
-  margin-bottom: 10px;
-  color: var(--fgColor-muted);
+  font-size: 0.8125rem;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--borderColor-default);
+  color: var(--body-font-color);
+}
+
+#slicingPanel .slicing-body label:last-of-type {
+  border-bottom: none;
 }
 
 .slicing-body input[type=range] {
   margin-top: 4px;
 }
 
-/* Render-quality panel — floats top-right of the viewport */
-.render-panel {
-  position: absolute;
-  top: 16px;
-  right: 16px;
-  background: var(--bgColor-default);
-  border: 1px solid var(--borderColor-default);
-  border-radius: 6px;
-  padding: 12px 14px;
-  width: 264px;
-  max-height: calc(100% - 32px);
-  overflow-y: auto;
-  z-index: 30;
-  box-shadow: var(--shadow-floating-small, 0 8px 25px rgba(27, 31, 36, 0.18));
-}
+/* Render quality / Layers / Sections now live as plain tabs in the side
+   panel (see show.html.erb) instead of their own floating panels, so the
+   old .render-panel positioning rule is gone -- .tab-content already
+   handles layout/scrolling for all of them. */
 
+/* Label left, control right -- a separator line between rows instead of
+   margin-based spacing, same border color/weight/font-size/text color as
+   .layer-row's (the other settings-style tab these sit next to), so
+   Render quality / Layers / Sections all read as one consistent family.
+   The -range variant (Exposure / Light intensity) keeps its own vertical
+   label-above-slider layout, just with the same separator + font. */
 .render-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--borderColor-default);
   font-size: 0.8125rem;
   color: var(--body-font-color);
-  margin-bottom: 10px;
+}
+
+.render-row:last-of-type {
+  border-bottom: none;
 }
 
 .render-row .form-select {
@@ -288,9 +293,9 @@
   cursor: pointer;
 }
 
-.render-panel .button {
-  width: 100%;
-  margin-top: 2px;
+#renderPanel .slicing-body .button,
+#slicingPanel .slicing-body .button {
+  margin-top: 10px;
 }
 
 /* ---- Layers panel -------------------------------------------------- */
@@ -298,27 +303,31 @@
 #layerList {
   display: flex;
   flex-direction: column;
-  gap: 6px;
 }
 
+/* A separator line between rows instead of a boxed/card look -- same
+   treatment as .ann3d-card below, same border color. */
 .layer-row {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--borderColor-default);
   font-size: 0.8125rem;
   color: var(--body-font-color);
-  cursor: pointer;
 }
 
-.layer-row input[type=checkbox] {
-  flex: 0 0 auto;
+.layer-row:last-child {
+  border-bottom: none;
 }
 
-.layer-row span {
+.layer-row-name {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: left;
 }
 
 .layer-row em {
@@ -326,6 +335,25 @@
   font-style: normal;
   font-size: 0.72rem;
   color: var(--fgColor-muted);
+}
+
+.layer-row-eye {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  padding: 2px 4px;
+  font-size: 1rem;
+  color: var(--fgColor-muted);
+  cursor: pointer;
+}
+
+.layer-row-eye:hover {
+  color: var(--body-font-color);
+}
+
+.layer-row-eye:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 /* ---- Layer manager (model edit page) ------------------------------- */
@@ -393,12 +421,15 @@
 
 .tab-btn {
   flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   background: transparent;
   border: none;
   padding: 11px 12px;
   color: var(--fgColor-muted);
   font-weight: 500;
-  font-size: 0.8125rem;
+  font-size: 1.05rem;
   cursor: pointer;
   border-bottom: 2px solid transparent;
   transition: color 0.15s, border-color 0.15s;
@@ -427,28 +458,91 @@
 
 /* ---- Annotation / work package cards ---------------------------------- */
 
+/* Separator line between rows instead of a boxed card -- same border
+   color/weight as .layer-row's/.ann3d-card's separator. */
 .annotation-card {
-  background: var(--bgColor-default);
-  border: 1px solid var(--borderColor-default);
-  border-radius: 6px;
-  overflow: hidden;
-  margin-bottom: 10px;
+  display: block;
+  border-bottom: 1px solid var(--borderColor-default);
   cursor: pointer;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition: background-color 0.15s;
+}
+
+.annotation-card:last-child {
+  border-bottom: none;
 }
 
 .annotation-card:hover {
-  border-color: var(--accent-color);
-  box-shadow: var(--shadow-resting-small, 0 2px 8px rgba(27, 31, 36, 0.12));
+  background: var(--bgColor-muted);
 }
 
-.annotation-thumb {
-  display: block;
-  width: 100%;
-  height: 130px;
+/* Compact 3D-annotations list row: separate from .annotation-card/
+   .annotation-title/etc. above (shared with the Work Packages tab's own
+   list, which keeps its original layout) on purpose, so this doesn't
+   change anything there. */
+/* A separator line between rows instead of a boxed card -- same border
+   color/weight as .layer-row's separator above. */
+.ann3d-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--borderColor-default);
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.ann3d-card:last-child {
+  border-bottom: none;
+}
+
+.ann3d-card:hover {
+  background: var(--bgColor-muted);
+}
+
+.ann3d-thumb {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  border-radius: 4px;
   object-fit: cover;
   background: var(--bgColor-muted);
-  border-bottom: 1px solid var(--borderColor-default);
+}
+
+.ann3d-thumb-placeholder {
+  opacity: 0.5;
+}
+
+.ann3d-body {
+  flex: 1;
+  min-width: 0; /* required for text-overflow ellipsis on a flex child */
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.ann3d-title,
+.ann3d-desc,
+.ann3d-type {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ann3d-title {
+  font-weight: var(--base-text-weight-bold);
+  font-size: 0.85rem;
+  color: var(--body-font-color);
+}
+
+.ann3d-desc {
+  font-size: 0.78rem;
+  color: var(--fgColor-muted);
+}
+
+.ann3d-type {
+  font-size: 0.68rem;
+  color: var(--fgColor-muted);
+  letter-spacing: 0.02em;
 }
 
 .annotation-card-body {
@@ -494,12 +588,6 @@
   background: var(--bgColor-neutral-muted, #eaeef2);
   color: var(--fgColor-muted);
   white-space: nowrap;
-}
-
-.annotation-desc {
-  font-size: 0.8125rem;
-  color: var(--fgColor-muted);
-  margin-bottom: 8px;
 }
 
 .annotation-meta {
@@ -695,6 +783,59 @@
   font-weight: var(--base-text-weight-bold);
   color: var(--body-font-color);
   margin-bottom: 4px;
+}
+
+/* Create/detail panels only (the new-annotation + new-work-package form and
+   the existing-annotation detail/edit form): label left, control right, a
+   single separator line between fields instead of margin-based spacing --
+   same treatment, same font-size/border, as .render-row/.layer-row, so this
+   reads as the same family of settings rows. Scoped to these two panels
+   (not .form-group globally) so the AR calibration panel, which reuses the
+   same .form-group/.form-select markup in a much narrower 240px floating
+   panel, keeps its original stacked layout untouched. The big viewpoint
+   snapshot image (.ca-snapshot) is untouched -- it stays full-width at the
+   top of the panel. */
+.annotation-create-panel .form-group,
+.annotation-detail-panel .form-group {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 0;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--borderColor-default);
+  font-size: 0.8125rem;
+}
+
+.annotation-create-panel .form-group:last-of-type,
+.annotation-detail-panel .form-group:last-of-type {
+  border-bottom: none;
+}
+
+.annotation-create-panel .form-group label,
+.annotation-detail-panel .form-group label {
+  flex: 0 0 auto;
+  margin-bottom: 0;
+  padding-top: 5px; /* optically aligns with the control's own top padding */
+  font-size: 0.8125rem;
+}
+
+.annotation-create-panel .form-group .form-input,
+.annotation-create-panel .form-group .form-select,
+.annotation-create-panel .form-group .form-textarea,
+.annotation-detail-panel .form-group .form-input,
+.annotation-detail-panel .form-group .form-select,
+.annotation-detail-panel .form-group .form-textarea {
+  width: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.8125rem;
+}
+
+.annotation-create-panel .form-group .color-picker-group,
+.annotation-detail-panel .form-group .color-picker-group {
+  flex: 0 0 auto;
+  padding-top: 2px;
 }
 
 .form-input,

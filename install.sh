@@ -49,6 +49,36 @@ cp -r "$PLUGIN_SRC/app/assets/javascripts/openproject_spatial_viewer/"*.js "$ASS
 cp -r "$PLUGIN_SRC/app/assets/stylesheets/openproject_spatial_viewer/"* "$ASSET_DIR/" 2>/dev/null || true
 cp -r "$PLUGIN_SRC/app/assets/javascripts/openproject_spatial_viewer/vendor/"* "$ASSET_DIR/vendor/" 2>/dev/null || true
 
+# Minify this plugin's own JS (not vendor/ or vendor.bundle.js, which ship
+# pre-built) in place in $ASSET_DIR, using the Node + uglify-js OpenProject
+# already vendors for its own asset build -- no new dependency, and only
+# the DEPLOYED copy is minified; $PLUGIN_SRC (this repo's source, used for
+# every future edit) is never touched and stays fully readable.
+NODE_BIN="$OP_DIR/.heroku/node/bin/node"
+UGLIFYJS="$OP_DIR/node_modules/.bin/uglifyjs"
+OWN_JS_FILES="viewer_engine.js layer_manager.js gltf_worker.js splat_sort_worker.js"
+if [ -x "$NODE_BIN" ] && [ -f "$UGLIFYJS" ]; then
+  echo "    Minifying plugin JS with uglify-js..."
+  for name in $OWN_JS_FILES; do
+    f="$ASSET_DIR/$name"
+    [ -f "$f" ] || continue
+    before=$(wc -c < "$f")
+    tmp="$f.min.tmp"
+    if "$NODE_BIN" "$UGLIFYJS" "$f" -c -m -o "$tmp" 2>"$tmp.err"; then
+      mv "$tmp" "$f"
+      after=$(wc -c < "$f")
+      echo "      $name: $before -> $after bytes"
+    else
+      echo "    [!] Minification failed for $name, deploying it unminified:"
+      cat "$tmp.err"
+      rm -f "$tmp"
+    fi
+    rm -f "$tmp.err"
+  done
+else
+  echo "    [!] node/uglify-js not found under $OP_DIR -- deploying plugin JS unminified."
+fi
+
 chown -R openproject:openproject "$ASSET_DIR"
 
 echo "[6/8] Clearing cache & checking IFC conversion toolchain..."

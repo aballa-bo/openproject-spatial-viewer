@@ -26,6 +26,15 @@ class SpatialAnnotation < ApplicationRecord
   belongs_to :author, class_name: "User"
   belongs_to :bcf_issue, class_name: "Bim::Bcf::Issue", optional: true
 
+  # acts_as_attachable's permission checks (attachments_addable?/_visible?/
+  # _deletable?) scope themselves to `project if respond_to?(:project)` --
+  # without this, every one of them falls back to an unscoped "does this
+  # user have the permission in ANY project" check instead of this
+  # annotation's own project, which is both looser than intended and, for a
+  # user whose only relevant role is in THIS project, requires it to even
+  # resolve correctly in the first place.
+  delegate :project, to: :spatial_model, allow_nil: true
+
   attr_accessor :pending_snapshot
 
   before_validation :assign_viewpoint_uuid, on: :create
@@ -57,10 +66,17 @@ class SpatialAnnotation < ApplicationRecord
 
   def self.snapshot_file_from(source)
     return source if source.respond_to?(:original_filename)
-    return nil unless source.is_a?(String) && source.start_with?("data:")
+    unless source.is_a?(String) && source.start_with?("data:")
+      Rails.logger.warn("[SpatialViewer] snapshot_file_from: source is not a data: URI " \
+                         "(class=#{source.class}, #{source.is_a?(String) ? "length=#{source.length}" : 'not a string'})")
+      return nil
+    end
 
     meta, b64 = source.split(",", 2)
-    return nil if b64.blank?
+    if b64.blank?
+      Rails.logger.warn("[SpatialViewer] snapshot_file_from: data URI has no base64 payload (meta=#{meta.inspect})")
+      return nil
+    end
 
     ext = meta[%r{data:image/(\w+)}, 1] || "png"
     tempfile = Tempfile.new(["spatial_annotation_snapshot", ".#{ext}"])
@@ -198,10 +214,31 @@ class SpatialAnnotation < ApplicationRecord
     return if file.nil?
 
     snapshot&.destroy
-    ::Attachments::BuildService
-      .bypass_allowlist(user: author || User.current)
-      .call(file:, container: self, filename: file.try(:original_filename) || "snapshot.png",
-            description: SNAPSHOT_DESCRIPTION)
+    result = ::Attachments::BuildService
+             .bypass_allowlist(user: author || User.current)
+             .call(file:, container: self, filename: file.try(:original_filename) || "snapshot.png",
+                   description: SNAPSHOT_DESCRIPTION)
+    unless result.success?
+      Rails.logger.warn("[SpatialViewer] Could not store annotation snapshot for ##{id}: " \
+                         "#{result.errors&.full_messages&.join(', ') || 'unknown error'}")
+      return
+    end
+
+    # BuildService's own persist step (Attachments::BuildService#persist)
+    # only calls attachment.valid? and adds it to this record's in-memory
+    # `attachments` association (add_to_target) -- it never calls .save.
+    # That matters here specifically: Rails' has_many autosave only kicks
+    # in when the OWNER is saved, and by the time this runs (an after_save
+    # callback on THIS already-persisted record) that owner-save has
+    # already happened. Without an explicit save here, the attachment
+    # exists only in memory for the rest of this request and is never
+    # written to the database -- which is exactly what was happening
+    # (BuildService reporting success, no warnings anywhere, yet
+    # attachment lookup always empty and /snapshot always 404).
+    unless result.result.save
+      Rails.logger.warn("[SpatialViewer] Could not store annotation snapshot for ##{id}: " \
+                         "#{result.result.errors.full_messages.join(', ')}")
+    end
   rescue StandardError => e
     Rails.logger.warn("[SpatialViewer] Could not store annotation snapshot for ##{id}: #{e.message}")
   ensure
@@ -258,11 +295,20 @@ class SpatialAnnotation < ApplicationRecord
     self.area = annotation_type == "lasso_selection" ? calculate_fill_area : nil
   end
 
+  # Prefers the exact triangulated surface patch (fill_grid); falls back to
+  # an approximation from the stored ring for annotations saved before
+  # fill_grid existed (same "preferred path, then fallback" split as the
+  # viewer's own showAnnotationSurface in viewer_engine.js) -- otherwise
+  # those older annotations would never get an Area at all.
+  def calculate_fill_area
+    calculate_grid_fill_area || calculate_ring_area
+  end
+
   # Mirrors the client's triangulateLassoGrid (viewer_engine.js) exactly --
   # same quad-to-2-triangles split, same "skip the triangle if any of its 3
   # grid points is a null (no-surface-hit) cell" rule -- so the computed area
   # matches what the user actually sees filled in on the model.
-  def calculate_fill_area
+  def calculate_grid_fill_area
     gd = (geometry_data || {}).with_indifferent_access
     grid = gd[:fill_grid]
     rows = gd[:fill_rows].to_i
@@ -283,6 +329,29 @@ class SpatialAnnotation < ApplicationRecord
     total.round(4)
   rescue StandardError => e
     Rails.logger.warn("[SpatialViewer] Could not compute fill area for annotation ##{id}: #{e.message}")
+    nil
+  end
+
+  # Fallback for annotations with no fill_grid: fan-triangulates the stored
+  # ring from its centroid. Only as accurate as a flat polygon approximation
+  # of the ring (it ignores any surface curvature inside it, unlike the grid
+  # path above), but gives a usable Area instead of leaving it blank forever
+  # for annotations that predate fill_grid.
+  def calculate_ring_area
+    pts = geometry_points
+    return nil if pts.length < 3
+
+    centroid = pts.reduce([0.0, 0.0, 0.0]) { |sum, p| sum.each_index.map { |i| sum[i] + p[i] } }
+    centroid = centroid.map { |c| c / pts.length }
+
+    total = 0.0
+    pts.each_with_index do |p, i|
+      q = pts[(i + 1) % pts.length]
+      total += triangle_area(centroid, p, q)
+    end
+    total.round(4)
+  rescue StandardError => e
+    Rails.logger.warn("[SpatialViewer] Could not compute ring area for annotation ##{id}: #{e.message}")
     nil
   end
 

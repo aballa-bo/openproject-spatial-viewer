@@ -69,20 +69,11 @@
     </div>
 
     <div class="toolbar-section">
-      <button type="button" class="toolbar-btn" id="btnSliceToggle" title="3D Section & Clipping Planes">
-        <i class="icon-scissors"></i> Sections
-      </button>
       <button type="button" class="toolbar-btn" id="btnWireframe" title="Toggle Wireframe">
-        <i class="icon-grid"></i>
-      </button>
-      <button type="button" class="toolbar-btn" id="btnRender" title="Render quality: lighting, shadows, environment">
-        <i class="icon-settings2"></i> Render
-      </button>
-      <button type="button" class="toolbar-btn" id="btnLayers" title="Show / hide model layers" style="display: none;">
-        <i class="icon-copy"></i> Layers
+        <i class="icon-view-model"></i>
       </button>
       <button type="button" class="toolbar-btn" id="btnAnnotationLabels" title="Show / hide annotation label cards">
-        <i class="icon-comment"></i> Labels
+        <i class="icon-flag"></i> Labels
       </button>
       <button type="button" class="toolbar-btn" id="btnVR" title="Enter VR" style="display: none;">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true" focusable="false">
@@ -90,8 +81,11 @@
         </svg>
         VR
       </button>
+      <button type="button" class="toolbar-btn" id="btnAR" title="Enter AR (on-site, annotations only)" style="display: none;">
+        <i class="icon-location"></i> AR
+      </button>
       <button type="button" class="toolbar-btn" id="btnSidePanelToggle" title="Toggle Side Panel">
-        <i class="icon-task"></i> Tickets & Annotations (<span id="annotationCountHeader"><%= @annotations.count %></span>)
+        <i class="icon-task"></i> Info (<span id="annotationCountHeader"><%= @annotations.count %></span>)
       </button>
       <% if @unity_player_available %>
         <a href="<%= download_exe_project_spatial_model_path(@project, @spatial_model) %>" class="toolbar-btn" title="Download a standalone Windows app (Unity) with this model">
@@ -108,32 +102,67 @@
         <div class="loader-text" id="loaderText">Loading 3D model...</div>
       </div>
 
-      <div class="render-panel" id="layerPanel" style="display: none; right: auto; left: 16px;">
+      <%# AR needs a one-time calibration per session: 2 existing annotations
+          picked here as real-world reference points, confirmed by tapping
+          their physical location once inside the AR session (see
+          SpatialViewerApp.prototype.initAR). %>
+      <div class="slicing-panel" id="arCalibPanel" style="display: none;">
         <div class="slicing-header">
-          <span>Layers</span>
-          <button type="button" class="close-btn" id="closeLayerBtn">&times;</button>
+          <span>AR setup</span>
+          <button type="button" class="close-btn" id="closeArCalibBtn">&times;</button>
         </div>
+        <div class="slicing-body">
+          <p class="text-muted small">
+            Pick 2 existing annotations you can physically walk up to on site.
+            Once in AR, you'll be asked to tap their real-world location, in
+            this order, to align the model with the real space.
+          </p>
+          <div class="form-group">
+            <label>Reference point 1</label>
+            <select id="arCalibRef1" class="form-select"></select>
+          </div>
+          <div class="form-group">
+            <label>Reference point 2</label>
+            <select id="arCalibRef2" class="form-select"></select>
+          </div>
+          <button type="button" class="button -primary -small" id="arCalibStartBtn">Start AR</button>
+          <p class="text-muted small" id="arCalibStatus"></p>
+        </div>
+      </div>
+
+      <div class="drawing-tooltip" id="drawingTooltip" style="display: none;">
+        Click on the mesh surface to place a point or drag to draw.
+      </div>
+
+      <canvas id="threeCanvas" class="three-canvas"></canvas>
+    </div>
+
+    <div class="spatial-side-panel" id="spatialSidePanel">
+      <div class="side-panel-tabs">
+        <button type="button" class="tab-btn active" data-tab="annotationsTab" title="3D Annotations"><i class="icon-notes"></i></button>
+        <button type="button" class="tab-btn" data-tab="workPackagesTab" title="Work Packages"><i class="icon-work-packages"></i></button>
+        <button type="button" class="tab-btn" id="tabBtnLayers" data-tab="layerPanel" title="Layers" style="display: none;"><i class="icon-copy"></i></button>
+        <button type="button" class="tab-btn" data-tab="renderPanel" title="Render quality"><i class="icon-settings2"></i></button>
+        <button type="button" class="tab-btn" data-tab="slicingPanel" title="3D Section Planes"><i class="icon-cut"></i></button>
+      </div>
+
+      <div class="tab-content active" id="annotationsTab">
+        <div class="annotations-list" id="annotationsList"></div>
+      </div>
+
+      <div class="tab-content" id="workPackagesTab">
+        <div class="wp-list" id="workPackagesList"></div>
+      </div>
+
+      <%# Moved here from floating panels that used to open from their own
+          toolbar buttons -- same ids reused (_buildLayerPanel,
+          _initRenderPanel's settings bindings, the clip-plane slider
+          bindings) so no JS besides the open/close wiring itself changed. %>
+      <div class="tab-content" id="layerPanel">
         <div class="slicing-body" id="layerList"></div>
       </div>
 
-      <div class="slicing-panel" id="slicingPanel" style="display: none;">
-        <div class="slicing-header">
-          <span>3D Section Planes</span>
-          <button type="button" class="close-btn" id="closeSliceBtn">&times;</button>
-        </div>
-        <div class="slicing-body">
-          <label>X Plane: <input type="range" id="clipX" min="-50" max="50" value="50" step="0.5"></label>
-          <label>Y Plane: <input type="range" id="clipY" min="-50" max="50" value="50" step="0.5"></label>
-          <label>Z Plane: <input type="range" id="clipZ" min="-50" max="50" value="50" step="0.5"></label>
-          <button type="button" class="button -small" id="resetClipBtn">Reset Sections</button>
-        </div>
-      </div>
-
-      <div class="render-panel" id="renderPanel" style="display: none;">
-        <div class="slicing-header">
-          <span>Render quality</span>
-          <button type="button" class="close-btn" id="closeRenderBtn">&times;</button>
-        </div>
+      <div class="tab-content" id="renderPanel">
         <div class="slicing-body">
           <label class="render-row">
             <span>Shadows</span>
@@ -176,25 +205,13 @@
         </div>
       </div>
 
-      <div class="drawing-tooltip" id="drawingTooltip" style="display: none;">
-        Click on the mesh surface to place a point or drag to draw.
-      </div>
-
-      <canvas id="threeCanvas" class="three-canvas"></canvas>
-    </div>
-
-    <div class="spatial-side-panel" id="spatialSidePanel">
-      <div class="side-panel-tabs">
-        <button type="button" class="tab-btn active" data-tab="annotationsTab">3D Annotations</button>
-        <button type="button" class="tab-btn" data-tab="workPackagesTab">Work Packages</button>
-      </div>
-
-      <div class="tab-content active" id="annotationsTab">
-        <div class="annotations-list" id="annotationsList"></div>
-      </div>
-
-      <div class="tab-content" id="workPackagesTab">
-        <div class="wp-list" id="workPackagesList"></div>
+      <div class="tab-content" id="slicingPanel">
+        <div class="slicing-body">
+          <label>X Plane: <input type="range" id="clipX" min="-50" max="50" value="50" step="0.5"></label>
+          <label>Y Plane: <input type="range" id="clipY" min="-50" max="50" value="50" step="0.5"></label>
+          <label>Z Plane: <input type="range" id="clipZ" min="-50" max="50" value="50" step="0.5"></label>
+          <button type="button" class="button -small" id="resetClipBtn">Reset Sections</button>
+        </div>
       </div>
 
       <%# Inline "New Work Package" panel — shown beside the viewer while
@@ -388,6 +405,10 @@
             <label>Area</label>
             <input type="text" id="adArea" class="form-input" readonly disabled title="Calculated automatically from the lasso selection's surface; recalculated whenever the selection changes.">
           </div>
+          <div class="form-group" id="adIfcGroup" style="display:none;">
+            <label>Linked IFC element</label>
+            <input type="text" id="adIfcElement" class="form-input" readonly disabled title="The IFC element this annotation was placed on, captured automatically when it was created by clicking that element directly in the IFC view.">
+          </div>
           <div class="form-group">
             <label>Annotation colour</label>
             <div class="color-picker-group" id="adColorGroup">
@@ -411,19 +432,17 @@
               <label>Subject</label>
               <input type="text" id="adWpSubject" class="form-input">
             </div>
-            <div class="form-row">
-              <div class="form-group">
-                <label>Type</label>
-                <select id="adWpType" class="form-select">
-                  <% @wp_types.each do |t| %><option value="<%= t.id %>"><%= t.name %></option><% end %>
-                </select>
-              </div>
-              <div class="form-group">
-                <label>Status</label>
-                <select id="adWpStatus" class="form-select">
-                  <% @wp_statuses.each do |s| %><option value="<%= s.id %>"><%= s.name %></option><% end %>
-                </select>
-              </div>
+            <div class="form-group">
+              <label>Type</label>
+              <select id="adWpType" class="form-select">
+                <% @wp_types.each do |t| %><option value="<%= t.id %>"><%= t.name %></option><% end %>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Status</label>
+              <select id="adWpStatus" class="form-select">
+                <% @wp_statuses.each do |s| %><option value="<%= s.id %>"><%= s.name %></option><% end %>
+              </select>
             </div>
 
             <!-- Populated/replaced by JS on Type change -- see
