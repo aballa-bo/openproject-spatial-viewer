@@ -38,9 +38,22 @@ Command line:
     python transform_gaussians.py scan.ply --matrix-file matrix.txt -o scan_aligned.ply
     python transform_gaussians.py scan.sog --matrix "0.99 -0.01 0 12.3  0.01 0.99 0 -4.1  0 0 1 0.5  0 0 0 1"
     python transform_gaussians.py scan.ply --matrix-file matrix.txt --invert
+    python transform_gaussians.py scan.ply --matrix-file matrix.txt --no-viewer-flip
 
 The matrix is pasted exactly as CloudCompare prints it (4 rows of 4 numbers;
 labels and brackets are ignored). Without `-o` the output is `<input>_aligned.<ext>`.
+
+### Spatial Viewer flip
+
+The Spatial Viewer rotates every splat by 180° about X (`diag(1,-1,-1)`) when it
+loads it, because 3DGS training pipelines usually have +Y pointing down. Meshes
+and point clouds are not rotated. A matrix computed in CloudCompare against a
+mesh or cloud in the same raw frame as the splat would therefore land the splat
+in the wrong place in the viewer. By default the script cancels that flip
+(`M' = F·M`), so the viewer shows the splat exactly at `M·p`. Use
+`--no-viewer-flip` (or untick the box in the GUI) for files meant for other
+viewers. Always start from the **original** splat, never from an already
+transformed one.
 
 ### Things to check
 

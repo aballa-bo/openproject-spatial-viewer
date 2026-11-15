@@ -502,13 +502,25 @@ def transform_sog(inp, out, r, s, t, log):
 # Driver
 # ---------------------------------------------------------------------------
 
-def run(inp, out, matrix, invert=False, log=print):
+# The Spatial Viewer flips every splat by diag(1,-1,-1) (180 deg about X) when it
+# loads it, because 3DGS training pipelines usually have +Y pointing down. Meshes
+# and point clouds are not flipped. A splat whose matrix was computed against a
+# mesh/point cloud in the *same raw frame* therefore needs that flip cancelled:
+# file' = F * M * file, so that viewer(file') = F * file' = M * file.
+VIEWER_FLIP = np.diag([1.0, -1.0, -1.0])
+
+
+def run(inp, out, matrix, invert=False, log=print, viewer_flip=True):
     r, s, t = decompose(matrix)
     if invert:
         r_i = r.T
         s_i = 1.0 / s
         t = -(s_i * (r_i @ t))
         r, s = r_i, s_i
+    if viewer_flip:
+        r = VIEWER_FLIP @ r
+        t = VIEWER_FLIP @ t
+        log("Compensating the Spatial Viewer's Y/Z flip of splats.")
     log("Applying: " + ("(inverse) " if invert else "") +
         "scale %.6f, translation (%.4f, %.4f, %.4f)" % (s, t[0], t[1], t[2]))
     ext = os.path.splitext(inp)[1].lower()
@@ -532,7 +544,8 @@ def gui():
     root = tk.Tk()
     root.title("Transform Gaussian Splatting (CloudCompare matrix)")
     root.geometry("720x640")
-    st = {'inp': tk.StringVar(), 'out': tk.StringVar(), 'inv': tk.BooleanVar(value=False)}
+    st = {'inp': tk.StringVar(), 'out': tk.StringVar(), 'inv': tk.BooleanVar(value=False),
+          'flip': tk.BooleanVar(value=True)}
 
     def row(label, var, cmd):
         f = tk.Frame(root)
@@ -578,6 +591,9 @@ def gui():
     mtx.bind('<KeyRelease>', refresh)
     mtx.bind('<<Paste>>', lambda e: root.after(50, refresh))
     tk.Checkbutton(root, text="Apply the inverse matrix", variable=st['inv']).pack(anchor='w', padx=10)
+    tk.Checkbutton(root, text="Compensate the Spatial Viewer's Y/Z flip of splats "
+                              "(keep ON for files uploaded there)",
+                   variable=st['flip']).pack(anchor='w', padx=10)
 
     logbox = scrolledtext.ScrolledText(root, height=10, state='disabled', font=('Courier', 9))
 
@@ -598,7 +614,7 @@ def gui():
                 st['out'].set(out)
             if os.path.abspath(inp) == os.path.abspath(out):
                 raise ValueError("Output must be a different file from the input.")
-            run(inp, out, parse_matrix(mtx.get('1.0', 'end')), st['inv'].get(), log)
+            run(inp, out, parse_matrix(mtx.get('1.0', 'end')), st['inv'].get(), log, st['flip'].get())
             messagebox.showinfo("Done", "Saved:\n" + out)
         except Exception as e:
             log("ERROR: %s" % e)
@@ -636,6 +652,9 @@ def main(argv=None):
     g.add_argument('--matrix-file', help="text file containing the 4x4 matrix")
     ap.add_argument('-o', '--output', help="output file (default: <input>_aligned.<ext>)")
     ap.add_argument('--invert', action='store_true', help="apply the inverse of the matrix")
+    ap.add_argument('--no-viewer-flip', action='store_true',
+                    help="do not compensate the Spatial Viewer's diag(1,-1,-1) flip of splats "
+                         "(use this if the output is for another viewer)")
     a = ap.parse_args(argv)
 
     if not a.input:
@@ -659,7 +678,7 @@ def main(argv=None):
     try:
         m = parse_matrix(text)
         print(describe(m))
-        run(a.input, out, m, a.invert)
+        run(a.input, out, m, a.invert, viewer_flip=not a.no_viewer_flip)
     except Exception as e:
         sys.stderr.write("ERROR: %s\n" % e)
         return 1
