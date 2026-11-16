@@ -88,6 +88,7 @@
       this.modelObject = this.layersRoot;
       this.hideLoader();
       this._buildLayerPanel();
+      if (this._embedMode) this._initEmbed();
       var errs = Object.keys(this.layerError || {});
       if (errs.length) {
         this.showTooltip(errs.length + ' layer(s) could not be loaded — see the console.');
@@ -239,11 +240,33 @@
     });
   };
 
+  // Embedded (iframe) mode: the toolbar/panels are hidden by CSS. Spot-light the
+  // annotation the share link points at and offer a single "reset view" button.
+  SpatialViewerApp.prototype._initEmbed = function() {
+    var self = this;
+    var anns = (this.projectData && this.projectData.annotations) || [];
+    if (anns.length) this.showAnnotationSurface(anns[0]);
+    if (this._embedHomeBtn || !this.viewport) return;
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sv-embed-home';
+    btn.title = 'Reset view';
+    btn.textContent = '\u2302';
+    btn.addEventListener('click', function() {
+      if (!self._homeView) return;
+      self.camera.position.copy(self._homeView.position);
+      self.controls.target.copy(self._homeView.target);
+      self.controls.update();
+    });
+    this.viewport.appendChild(btn);
+    this._embedHomeBtn = btn;
+  };
+
   SpatialViewerApp.prototype.setLayerVisible = function(id, visible) {
     this._fadeLayer(id, !!visible);
     if (this.layerMeta[id]) this.layerMeta[id].visible = !!visible;
     // Persist for real layers (not the legacy "model" file).
-    if (id !== 'model' && this.apiUrl) {
+    if (id !== 'model' && this.apiUrl && !this._embedMode) {
       var base = this.apiUrl.replace('/api_data', '/spatial_layers/' + id);
       fetch(base, {
         method: 'PATCH',

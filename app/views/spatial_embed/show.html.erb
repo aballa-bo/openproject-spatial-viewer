@@ -1,0 +1,16 @@
+<%# Same viewer markup as the project page, with every instance variable that
+    carries project data stubbed out. The chrome is hidden by `.sv-embed`. %>
+<%
+  @custom_fields_by_type = {}
+  @annotations = []
+  @work_packages = []
+  @wp_types = []
+  @wp_statuses = []
+  @wp_priorities = []
+  @wp_assignees = []
+  @wp_categories = []
+  @wp_versions = []
+  @can_set_start_view = false
+  @unity_player_available = false
+%>
+<%= render template: "spatial_models/show" %>

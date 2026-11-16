@@ -1,7 +1,8 @@
 <% html_title "#{@spatial_model.title} - 3D Viewer" %>
 
-<div class="spatial-viewer-app" id="spatialViewerApp"
-     data-api-url="<%= api_data_project_spatial_model_path(@project, @spatial_model) %>"
+<div class="spatial-viewer-app<%= ' sv-embed' if @embed %>" id="spatialViewerApp"
+     <%= 'data-embed="1"'.html_safe if @embed %>
+     data-api-url="<%= @embed ? @api_url : api_data_project_spatial_model_path(@project, @spatial_model) %>"
      data-csrf-token="<%= form_authenticity_token %>"
      data-max-model-mb="250"
      data-heavy-model-mb="40"
@@ -9,9 +10,11 @@
 
   <div class="spatial-toolbar">
     <div class="toolbar-section toolbar-title-group">
+      <% unless @embed %>
       <a href="<%= project_spatial_models_path(@project) %>" class="toolbar-btn" title="Back to models list">
         <i class="icon-arrow-left1"></i>
       </a>
+      <% end %>
       <span class="toolbar-model-title"><%= @spatial_model.title %></span>
       <% @spatial_model.layer_formats.each do |fmt| %><span class="badge -primary"><%= fmt.upcase %></span><% end %>
     </div>
@@ -576,6 +579,22 @@
               <button type="button" class="button -primary -small" id="adSaveWpBtn">Save work package</button>
             </div>
           </div>
+
+          <% if @can_set_start_view %>
+          <div class="detail-section" id="adShareSection">
+            <label>Embed link (Moodle, read-only)</label>
+            <p class="text-muted small">Anyone with the link can view this model, opened on this view with the area highlighted. Title and description are not shown.</p>
+            <div class="form-row">
+              <div class="form-group">
+                <input type="number" id="adShareDays" class="form-input" value="365" min="1" max="3650" title="Days until the link expires">
+              </div>
+              <div class="form-group">
+                <button type="button" class="button -small" id="adShareBtn">Create link</button>
+              </div>
+            </div>
+            <textarea id="adShareOut" class="form-input" rows="4" readonly style="display:none; width:100%; font-family:monospace; font-size:11px;"></textarea>
+          </div>
+          <% end %>
 
           <div class="detail-actions -danger">
             <button type="button" class="button -small text-danger" id="adDeleteBtn">Delete annotation</button>

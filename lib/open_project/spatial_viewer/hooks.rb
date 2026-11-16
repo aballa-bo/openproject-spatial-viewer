@@ -28,7 +28,8 @@ module OpenProject
         return '' unless controller
         return '' unless controller.is_a?(::SpatialModelsController) ||
                          controller.is_a?(::SpatialAnnotationsController) ||
-                         controller.is_a?(::SpatialLayersController)
+                         controller.is_a?(::SpatialLayersController) ||
+                         controller.is_a?(::SpatialEmbedController)
 
         vc = controller.view_context
         stylesheet = vc.stylesheet_link_tag(bust('/assets/openproject_spatial_viewer/viewer.css'))

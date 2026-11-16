@@ -1330,6 +1330,8 @@
   SpatialViewerApp.prototype.openAnnotationDetail = function(a) {
     var self = this;
     this._detailAnnotation = a;
+    var shareOut = document.getElementById('adShareOut');
+    if (shareOut) { shareOut.style.display = 'none'; shareOut.value = ''; }
     var $ = function(id) { return document.getElementById(id); };
     var setv = function(id, v) { var el = $(id); if (el) el.value = (v == null ? '' : v); };
     var wp = a.work_package || {};
@@ -1542,6 +1544,32 @@
     });
   };
 
+  // Creates an anonymous read-only embed link for the open annotation and shows
+  // the URL + a ready-to-paste <iframe> snippet (SpatialShareLinksController).
+  SpatialViewerApp.prototype.createShareLink = function() {
+    var a = this._detailAnnotation;
+    var btn = document.getElementById('adShareBtn');
+    var out = document.getElementById('adShareOut');
+    if (!a || !out) return;
+    var days = parseInt((document.getElementById('adShareDays') || {}).value, 10) || 365;
+    var url = this.apiUrl.replace('/api_data', '/spatial_share_links');
+    if (btn) btn.disabled = true;
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-Token': this.csrfToken },
+      body: JSON.stringify({ annotation_id: a.id, days: days })
+    })
+      .then(function(r) { return r.json().catch(function() { return {}; }); })
+      .then(function(res) {
+        if (btn) btn.disabled = false;
+        if (!res || !res.success) { alert('Could not create the link: ' + ((res && res.errors) || ['unknown error']).join(', ')); return; }
+        out.style.display = 'block';
+        out.value = res.link.url + '\n\n' + res.link.iframe;
+        out.focus(); out.select();
+      })
+      .catch(function(err) { if (btn) btn.disabled = false; alert('Network error: ' + err); });
+  };
+
   SpatialViewerApp.prototype._initAnnotationDetail = function() {
     var self = this;
     var bind = function(id, fn) { var el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
@@ -1550,6 +1578,7 @@
     bind('adSaveAnnBtn', function() { self.saveAnnotationEdits(); });
     bind('adSaveWpBtn', function() { self.saveWorkPackageEdits(); });
     bind('adDeleteBtn', function() { self.deleteAnnotationFromDetail(); });
+    bind('adShareBtn', function() { self.createShareLink(); });
     var adWpType = document.getElementById('adWpType');
     if (adWpType) {
       adWpType.addEventListener('change', function() {

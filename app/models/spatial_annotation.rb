@@ -25,6 +25,7 @@ class SpatialAnnotation < ApplicationRecord
   belongs_to :work_package
   belongs_to :author, class_name: "User"
   belongs_to :bcf_issue, class_name: "Bim::Bcf::Issue", optional: true
+  has_many :spatial_share_links, dependent: :destroy
 
   # acts_as_attachable's permission checks (attachments_addable?/_visible?/
   # _deletable?) scope themselves to `project if respond_to?(:project)` --

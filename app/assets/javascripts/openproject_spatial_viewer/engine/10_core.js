@@ -239,7 +239,8 @@
     // Per-frame billboard state for lasso label cards built in
     // renderExisting3DAnnotations -- see _updateAnnotationLabels.
     this._annotationLabels = [];
-    this._labelsVisible = true; // toggled by the toolbar's Labels button
+    this._embedMode = this.container.dataset.embed === '1'; // read-only iframe view (SpatialEmbedController)
+    this._labelsVisible = !this._embedMode; // toggled by the toolbar's Labels button; never shown when embedded
 
     this.tempMarkupGroup = new THREE.Group();
     this.scene.add(this.tempMarkupGroup);

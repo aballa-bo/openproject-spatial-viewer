@@ -15,12 +15,22 @@ OpenProject::Application.routes.draw do
           get :octree
         end
       end
+      resources :spatial_share_links, controller: 'spatial_share_links', only: [:index, :create, :destroy]
       resources :spatial_annotations, controller: 'spatial_annotations', only: [:index, :create, :update, :destroy] do
         member do
           get :snapshot
         end
       end
     end
+  end
+
+  # Anonymous, token-protected, read-only viewer for iframes (e.g. Moodle).
+  scope 'spatial_embed/:token', constraints: { token: /[A-Za-z0-9_-]+/ }, controller: 'spatial_embed' do
+    get '/', action: :show, as: :spatial_embed
+    get 'api_data', action: :api_data, as: :spatial_embed_api_data
+    get 'model_file', action: :model_file, as: :spatial_embed_model_file
+    get 'layers/:layer_id/file', action: :layer_file, as: :spatial_embed_layer_file
+    get 'layers/:layer_id/octree', action: :layer_octree, as: :spatial_embed_layer_octree
   end
 
   # Global routes

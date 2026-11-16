@@ -8,6 +8,7 @@ class SpatialModel < ApplicationRecord
   belongs_to :project
   belongs_to :uploader, class_name: "User"
   has_many :spatial_annotations, dependent: :destroy
+  has_many :spatial_share_links, dependent: :destroy
   has_many :spatial_layers, -> { ordered }, dependent: :destroy, inverse_of: :spatial_model
 
   validates :title, presence: true
