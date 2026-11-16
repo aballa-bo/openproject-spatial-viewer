@@ -145,12 +145,21 @@ def _scale_unit(text, ents, sc, next_id):
         "#%d=IFCCONVERSIONBASEDUNIT(#%d,.LENGTHUNIT.,'SCALED',#%d);" % (cu, d, mw)]
 
 
-def transform_ifc(inp, out, matrix, invert=False, log=print):
+def transform_ifc(inp, out, matrix, invert=False, log=print, yup=False):
     r, sc, t = decompose(matrix)
     if invert:
         rt = [[r[j][i] for j in range(3)] for i in range(3)]
         t = [-v / sc for v in mv(rt, t)]
         r, sc = rt, 1.0 / sc
+    if yup:
+        # The matrix was computed on a Y-up export of the model (glTF/GLB,
+        # IfcConvert...): (x, y, z)_ifc -> (x, z, -y). Conjugate it back into
+        # the IFC's own Z-up frame: R' = C^T R C, t' = C^T t.
+        c = [[1, 0, 0], [0, 0, 1], [0, -1, 0]]
+        ct = [[c[j][i] for j in range(3)] for i in range(3)]
+        r = mm(ct, mm(r, c))
+        t = mv(ct, t)
+        log("Matrix converted from a Y-up export to the IFC's Z-up frame")
     with open(inp, 'r', encoding='latin-1', newline='') as f:
         text = f.read()
     unit = length_unit_in_metres(text)
@@ -237,6 +246,7 @@ def run_gui():
     root.title("Transform IFC with a CloudCompare matrix")
     path = tk.StringVar()
     inv = tk.BooleanVar(value=False)
+    yup = tk.BooleanVar(value=False)
     tk.Label(root, text="IFC file:").grid(row=0, column=0, sticky='w', padx=6, pady=4)
     tk.Entry(root, textvariable=path, width=60).grid(row=0, column=1, padx=6)
     tk.Button(root, text="Browse…", command=lambda: path.set(filedialog.askopenfilename(
@@ -248,6 +258,9 @@ def run_gui():
     box.grid(row=2, column=0, columnspan=3, padx=6, pady=4)
     tk.Checkbutton(root, text="Apply the inverse matrix", variable=inv).grid(
         row=3, column=0, columnspan=2, sticky='w', padx=6)
+    tk.Checkbutton(root, text="Matrix computed on a Y-up export (GLB/glTF, IfcConvert): "
+                   "convert to the IFC's Z-up", variable=yup).grid(
+        row=6, column=0, columnspan=3, sticky='w', padx=6)
     logbox = tk.Text(root, width=70, height=5, state='disabled')
     logbox.grid(row=5, column=0, columnspan=3, padx=6, pady=4)
 
@@ -262,7 +275,7 @@ def run_gui():
             if not path.get():
                 raise ValueError("Choose an IFC file.")
             transform_ifc(path.get(), default_out(path.get()),
-                          parse_matrix(box.get('1.0', 'end')), inv.get(), log)
+                          parse_matrix(box.get('1.0', 'end')), inv.get(), log, yup.get())
         except Exception as e:
             messagebox.showerror("Error", str(e))
     tk.Button(root, text="Transform", command=go).grid(row=4, column=0, padx=6, pady=4, sticky='w')
@@ -288,12 +301,14 @@ def main():
     ap.add_argument('--matrix-file')
     ap.add_argument('-o', '--output')
     ap.add_argument('--invert', action='store_true')
+    ap.add_argument('--yup', action='store_true',
+                    help='the matrix was computed on a Y-up export of the model')
     a = ap.parse_args()
     try:
         if a.input and (a.matrix or a.matrix_file):
             txt = a.matrix if a.matrix else open(a.matrix_file).read()
             transform_ifc(a.input, a.output or default_out(a.input),
-                          parse_matrix(txt), a.invert)
+                          parse_matrix(txt), a.invert, yup=a.yup)
             return
         try:
             import tkinter  # noqa: F401
