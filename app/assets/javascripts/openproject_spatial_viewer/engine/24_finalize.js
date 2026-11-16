@@ -98,7 +98,7 @@
     // the first time a drawing tool is used.
     if (!heavy) this._ensureBVH();
 
-    var box = new THREE.Box3().setFromObject(object);
+    var box = this._robustObjectBox(object);
     var center = box.getCenter(new THREE.Vector3());
     var size = box.getSize(new THREE.Vector3());
     var maxDim = Math.max(size.x, size.y, size.z);
@@ -113,6 +113,7 @@
     // the same coordinate system, so we keep the user's current viewpoint.
     if (!this._framed) {
       this._framed = true;
+      this._resolveUpAxis(this._loadingLayerKind);   // Z-up for scans, else Y-up
       this.modelRadius = maxDim;
       this.surfaceOffset = 0;
       if (this.raycaster) this.raycaster.params.Points.threshold = maxDim * 0.01;
@@ -125,7 +126,7 @@
         this.camera.position.set(startView.position.x, startView.position.y, startView.position.z);
       } else {
         this.controls.target.copy(center);
-        this.camera.position.set(center.x + maxDim * 1.5, center.y + maxDim * 1.2, center.z + maxDim * 1.5);
+        this.camera.position.copy(center).add(this._viewOffset(maxDim));
       }
       this.camera.lookAt(this.controls.target);
       this.controls.update();

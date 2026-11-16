@@ -13,7 +13,7 @@
         <i class="icon-arrow-left1"></i>
       </a>
       <span class="toolbar-model-title"><%= @spatial_model.title %></span>
-      <span class="badge -primary"><%= @spatial_model.model_format.upcase %></span>
+      <% @spatial_model.layer_formats.each do |fmt| %><span class="badge -primary"><%= fmt.upcase %></span><% end %>
     </div>
 
     <div class="toolbar-section">
@@ -141,7 +141,7 @@
       <div class="side-panel-tabs">
         <button type="button" class="tab-btn active" data-tab="annotationsTab" title="3D Annotations"><i class="icon-notes"></i></button>
         <button type="button" class="tab-btn" data-tab="workPackagesTab" title="Work Packages"><i class="icon-work-packages"></i></button>
-        <button type="button" class="tab-btn" id="tabBtnLayers" data-tab="layerPanel" title="Layers" style="display: none;"><i class="icon-copy"></i></button>
+        <button type="button" class="tab-btn" id="tabBtnLayers" data-tab="layerPanel" title="Layers" style="display: none;"><i class="sv-icon-layers"></i></button>
         <button type="button" class="tab-btn" data-tab="renderPanel" title="Render quality"><i class="icon-settings2"></i></button>
         <button type="button" class="tab-btn" data-tab="slicingPanel" title="3D Section Planes"><i class="icon-cut"></i></button>
       </div>
@@ -164,43 +164,100 @@
 
       <div class="tab-content" id="renderPanel">
         <div class="slicing-body">
-          <label class="render-row">
-            <span>Shadows</span>
-            <select id="rqShadows" class="form-select">
-              <option value="off">Off</option>
-              <option value="hard">Hard</option>
-              <option value="soft">Soft</option>
-            </select>
-          </label>
-          <label class="render-row">
-            <span>Tone mapping</span>
-            <select id="rqTone" class="form-select">
-              <option value="aces">Filmic (ACES)</option>
-              <option value="reinhard">Reinhard</option>
-              <option value="linear">Linear</option>
-              <option value="none">None</option>
-            </select>
-          </label>
-          <label class="render-row">
-            <span>Background</span>
-            <select id="rqBackground" class="form-select">
-              <option value="light">Light</option>
-              <option value="dark">Dark</option>
-              <option value="studio">Studio</option>
-            </select>
-          </label>
-          <label class="render-row -range">
-            <span>Exposure <b id="rqExposureVal">1.0</b></span>
-            <input type="range" id="rqExposure" min="0.2" max="2.5" step="0.05" value="1">
-          </label>
-          <label class="render-row -range">
-            <span>Light intensity <b id="rqLightVal">1.0</b></span>
-            <input type="range" id="rqLight" min="0.1" max="3" step="0.1" value="1">
-          </label>
-          <label class="render-row -check"><input type="checkbox" id="rqEnv"> Environment (sky) light</label>
-          <label class="render-row -check"><input type="checkbox" id="rqHiDpi"> High-resolution (HiDPI)</label>
-          <label class="render-row -check"><input type="checkbox" id="rqWireframe"> Wireframe</label>
-          <label class="render-row -check"><input type="checkbox" id="rqGrid"> Ground grid</label>
+
+          <%# Sections: General applies to everything; the others only appear when
+              the model has a layer of that kind (see _updateRenderSections). %>
+          <div class="render-section" data-render-section="general">
+            <div class="render-section-title">General</div>
+            <label class="render-row">
+              <span>Background</span>
+              <select id="rqBackground" class="form-select">
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+                <option value="studio">Studio</option>
+              </select>
+            </label>
+            <label class="render-row">
+              <span>Tone mapping</span>
+              <select id="rqTone" class="form-select">
+                <option value="aces">Filmic (ACES)</option>
+                <option value="reinhard">Reinhard</option>
+                <option value="linear">Linear</option>
+                <option value="none">None</option>
+              </select>
+            </label>
+            <label class="render-row -range">
+              <span>Exposure <b id="rqExposureVal">1.0</b></span>
+              <input type="range" id="rqExposure" min="0.2" max="2.5" step="0.05" value="1">
+            </label>
+            <label class="render-row">
+              <span>Up axis</span>
+              <select id="rqUp" class="form-select">
+                <option value="y">Y up (meshes, IFC)</option>
+                <option value="z">Z up (scans, LAS / E57)</option>
+              </select>
+            </label>
+            <label class="render-row -check"><input type="checkbox" id="rqHiDpi"> High-resolution (HiDPI)</label>
+            <label class="render-row -check"><input type="checkbox" id="rqGrid"> Ground grid</label>
+          </div>
+
+          <div class="render-section" data-render-section="mesh">
+            <div class="render-section-title">Meshes &amp; photogrammetry</div>
+            <label class="render-row">
+              <span>Shadows</span>
+              <select id="rqShadows" class="form-select">
+                <option value="off">Off</option>
+                <option value="hard">Hard</option>
+                <option value="soft">Soft</option>
+              </select>
+            </label>
+            <label class="render-row -range">
+              <span>Light intensity <b id="rqLightVal">1.0</b></span>
+              <input type="range" id="rqLight" min="0.1" max="3" step="0.1" value="1">
+            </label>
+            <label class="render-row -check"><input type="checkbox" id="rqEnv"> Environment (sky) light</label>
+            <label class="render-row -check"><input type="checkbox" id="rqWireframe"> Wireframe</label>
+          </div>
+
+          <div class="render-section" data-render-section="points">
+            <div class="render-section-title">Point clouds</div>
+            <label class="render-row -range">
+              <span>Point size <b id="rqPointSizeVal">1.00</b>&times;</span>
+              <input type="range" id="rqPointSize" min="0.25" max="4" step="0.05" value="1">
+            </label>
+            <label class="render-row -range">
+              <span>Point budget <b id="rqPointBudgetVal">4.0</b> M points</span>
+              <input type="range" id="rqPointBudget" min="0.5" max="12" step="0.5" value="4">
+            </label>
+          </div>
+
+          <div class="render-section" data-render-section="splat">
+            <div class="render-section-title">Gaussian splatting</div>
+            <label class="render-row -range">
+              <span>Opacity <b id="rqSplatOpacityVal">1.00</b>&times;</span>
+              <input type="range" id="rqSplatOpacity" min="0.1" max="2" step="0.05" value="1">
+            </label>
+            <label class="render-row -range">
+              <span>Splat size <b id="rqSplatSizeVal">1.00</b>&times;</span>
+              <input type="range" id="rqSplatSize" min="0.2" max="2" step="0.05" value="1">
+            </label>
+            <label class="render-row -range">
+              <span>Hide faint splats below <b id="rqSplatMinAlphaVal">0.00</b></span>
+              <input type="range" id="rqSplatMinAlpha" min="0" max="0.6" step="0.01" value="0">
+            </label>
+            <label class="render-row">
+              <span>View-dependent colour</span>
+              <select id="rqSplatSh" class="form-select">
+                <option value="0">Off (base colour)</option>
+                <option value="1">Degree 1</option>
+                <option value="2">Degree 1 + 2</option>
+              </select>
+            </label>
+            <label class="render-row -check" title="The viewer rotates splats by 180&deg; about X when loading them; this applies the same rotation to the direction used for the view-dependent colour.">
+              <input type="checkbox" id="rqSplatShFix"> Colour axis correction
+            </label>
+          </div>
+
           <button type="button" class="button -small" id="rqReset">Reset to defaults</button>
         </div>
       </div>

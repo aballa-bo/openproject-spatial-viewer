@@ -17,7 +17,7 @@
   <h2><%= t('spatial_viewer.layers_title', default: 'Model layers') %></h2>
   <p class="text-muted">
     <%= t('spatial_viewer.layers_help',
-          default: 'Upload each format of this model as a separate layer — IFC, mesh (obj/glb/gltf, .zip if it has textures), point cloud (las/laz/e57), gaussian splatting (ply/splat/sog). Every file must already be in the same scale and coordinate system. In the 3D viewer you can then show or hide each layer.') %>
+          default: 'Upload each format of this model as a separate layer — IFC, mesh (obj/glb/gltf, .zip if it has textures), point cloud (las/laz/e57, or .ply), gaussian splatting (ply/splat/sog) — a .ply can be a mesh, a point cloud or a splat. Every file must already be in the same scale and coordinate system. In the 3D viewer you can then show or hide each layer.') %>
   </p>
 
   <% legacy = @spatial_model.model_attachment %>
@@ -35,11 +35,11 @@
     <tbody id="layerRows">
       <% if legacy %>
         <tr>
-          <td><%= @spatial_model.title %> <span class="badge">primary file</span></td>
+          <td><%= @spatial_model.title %> <span class="badge">legacy primary file</span></td>
           <td><%= SpatialLayer.kind_for(@spatial_model.model_format) %></td>
           <td><span class="badge -primary"><%= @spatial_model.model_format.upcase %></span></td>
           <td class="text-muted small"><%= @spatial_model.formatted_size %></td>
-          <td class="text-muted small">managed on the form above</td>
+          <td class="text-muted small">legacy file — re-upload it as a layer to manage it here</td>
           <td></td>
         </tr>
       <% end %>
@@ -78,10 +78,14 @@
         <select name="kind" id="layerKind" class="form--select">
           <option value="">Auto</option>
           <option value="ifc">IFC</option>
-          <option value="mesh">Mesh + textures</option>
-          <option value="pointcloud">Point cloud</option>
-          <option value="splat">Gaussian splatting</option>
+          <option value="mesh">Mesh (obj/glb/gltf/zip, or .ply with faces)</option>
+          <option value="pointcloud">Point cloud (las/laz/e57, or .ply without faces)</option>
+          <option value="splat">Gaussian splatting (ply/splat/sog)</option>
         </select>
+        <p class="form--field-instructions">
+          A .ply file can be a mesh, a point cloud or a Gaussian splat. With "Auto" the type is
+          detected from the file header; pick it here to override.
+        </p>
       </div>
     </div>
     <div class="form--field">

@@ -463,7 +463,12 @@
     if (!count || !pdrLen) throw new Error('LAS header reports no points');
 
     var hasRGB = [2, 3, 5, 7, 8, 10].indexOf(pdrf) !== -1;
-    var rgbOff = (pdrf <= 5) ? 20 : 30;
+    // RGB offset per LAS point data record format: PDRF 2 has no GPS time
+    // (RGB right after the 20-byte base), PDRF 3 and 5 carry an 8-byte GPS
+    // time first (RGB at 28), PDRF 7/8/10 have the 30-byte extended base.
+    // PDAL's e57/laz -> las output is PDRF 3, so reading RGB at 20 there
+    // returns the (zero) GPS time bytes and paints every point black.
+    var rgbOff = (pdrf === 2) ? 20 : (pdrf === 3 || pdrf === 5) ? 28 : 30;
 
     var MAX = 4000000;
     var step = count > MAX ? Math.ceil(count / MAX) : 1;

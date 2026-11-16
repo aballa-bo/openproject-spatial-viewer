@@ -12,6 +12,7 @@ OpenProject::Application.routes.draw do
       resources :spatial_layers, controller: 'spatial_layers', only: [:create, :update, :destroy] do
         member do
           get :file
+          get :octree
         end
       end
       resources :spatial_annotations, controller: 'spatial_annotations', only: [:index, :create, :update, :destroy] do

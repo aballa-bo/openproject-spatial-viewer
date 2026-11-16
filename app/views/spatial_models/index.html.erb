@@ -46,8 +46,12 @@
               <div class="text-muted small"><%= model.description %></div>
             </td>
             <td>
-              <span class="badge -primary"><%= model.model_format.upcase %></span>
-              <span class="text-muted small">(<%= model.formatted_size %>)</span>
+              <% fmts = model.layer_formats %>
+              <% if fmts.any? %>
+                <% fmts.each do |fmt| %><span class="badge -primary"><%= fmt.upcase %></span> <% end %>
+              <% else %>
+                <span class="text-muted small">no files yet</span>
+              <% end %>
             </td>
             <td>
               <span class="badge"><%= model.spatial_annotations.count %></span>

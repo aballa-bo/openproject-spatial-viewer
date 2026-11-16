@@ -37,6 +37,14 @@ class SpatialModel < ApplicationRecord
     end
   end
 
+  # Formats to show in lists: layers' source formats, plus the legacy primary
+  # file's format for models created before files were uploaded as layers.
+  def layer_formats
+    fmts = spatial_layers.map(&:source_format)
+    fmts.unshift(model_format) if model_attachment.present?
+    fmts.compact.uniq
+  end
+
   def formatted_size
     if model_attachment.present?
       "#{(model_attachment.filesize.to_f / 1024 / 1024).round(2)} MB"

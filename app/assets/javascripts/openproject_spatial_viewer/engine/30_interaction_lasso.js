@@ -78,6 +78,101 @@
     }
   };
 
+  // World point under the cursor, for zoom/orbit pivots. Meshes: a (BVH)
+  // raycast. Point clouds: a screen-space pick over a cached subsample --
+  // THREE's Points raycast is O(points) in JS and, with a world-space
+  // threshold, both slow and imprecise on multi-million-point scans. Of the
+  // points near the cursor the 25th-percentile-by-depth one is taken, so a
+  // few floating noise points in front of the surface don't win.
+  SpatialViewerApp.prototype._pickWorldPoint = function(clientX, clientY) {
+    var rect = this.canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    this.mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.mouse, this.camera);
+
+    var best = null, bestDist = Infinity, camPos = this.camera.position;
+    var targets = this._visibleRaycastTargets();
+    var meshes = targets.filter(function(m) { return !m.isPoints; });
+    if (meshes.length) {
+      this._ensureBVH();
+      var hit = this.raycaster.intersectObjects(meshes, true)[0];
+      if (hit) { best = hit.point.clone(); bestDist = hit.distance; }
+    }
+
+    var cam = this.camera;
+    cam.updateMatrixWorld();
+    var vp = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    var mvp = new THREE.Matrix4(), e = null;
+    var pxR = [24, 64];
+    var W = rect.width, H = rect.height;
+    var cx = this.mouse.x, cy = this.mouse.y;
+    targets.forEach(function(obj) {
+      if (!obj.isPoints || obj.visible === false || !obj.geometry || !obj.geometry.getAttribute('position')) return;
+      var sample = obj.userData._pickSample;
+      if (!sample) {
+        var src = obj.geometry.getAttribute('position').array;
+        // LOD nodes are many small objects: a thinner sample each keeps the
+        // whole pick (all visible nodes together) cheap.
+        var cnt = src.length / 3, st = Math.max(1, Math.floor(cnt / (obj.userData.lodNode ? 4000 : 60000)));
+        var m = Math.ceil(cnt / st);
+        sample = obj.userData._pickSample = new Float32Array(m * 3);
+        for (var i = 0, k = 0; i < cnt; i += st, k++) {
+          sample[k * 3] = src[i * 3]; sample[k * 3 + 1] = src[i * 3 + 1]; sample[k * 3 + 2] = src[i * 3 + 2];
+        }
+      }
+      obj.updateMatrixWorld();
+      mvp.multiplyMatrices(vp, obj.matrixWorld);
+      e = mvp.elements;
+      for (var ri = 0; ri < pxR.length; ri++) {
+        var rx = pxR[ri] / W * 2, ry = pxR[ri] / H * 2;
+        var cand = [];
+        for (var j = 0; j < sample.length; j += 3) {
+          var x = sample[j], y = sample[j + 1], z = sample[j + 2];
+          var w = e[3] * x + e[7] * y + e[11] * z + e[15];
+          if (w <= 0) continue;
+          var nx = (e[0] * x + e[4] * y + e[8] * z + e[12]) / w;
+          if (Math.abs(nx - cx) > rx) continue;
+          var ny = (e[1] * x + e[5] * y + e[9] * z + e[13]) / w;
+          if (Math.abs(ny - cy) > ry) continue;
+          cand.push(w, j);
+        }
+        if (cand.length >= 4) {
+          var order = [];
+          for (var q = 0; q < cand.length; q += 2) order.push(q);
+          order.sort(function(a, b) { return cand[a] - cand[b]; });
+          var pick = order[Math.floor((order.length - 1) * 0.25)];
+          var j2 = cand[pick + 1];
+          var wp = new THREE.Vector3(sample[j2], sample[j2 + 1], sample[j2 + 2]).applyMatrix4(obj.matrixWorld);
+          var d = wp.distanceTo(camPos);
+          if (d < bestDist) { best = wp; bestDist = d; }
+          break;
+        }
+      }
+    });
+    return best;
+  };
+
+  // Orbit/pan pivot: before a drag starts, slide the orbit target along the
+  // current view axis to the depth of the surface under the cursor. The view
+  // direction (and so the picture) doesn't change, but rotation and pan now
+  // happen around/at the real surface instead of the bounding-box centre --
+  // which, for a scan with outliers or a big empty interior, can be far from
+  // anything visible and makes tiny mouse moves swing the model wildly.
+  SpatialViewerApp.prototype._adaptOrbitPivot = function(e) {
+    if (!this.controls || !this.camera) return;
+    var p = this._pickWorldPoint(e.clientX, e.clientY);
+    if (!p) return;
+    var fwd = this.controls.target.clone().sub(this.camera.position);
+    if (fwd.lengthSq() < 1e-12) return;
+    fwd.normalize();
+    var depth = p.clone().sub(this.camera.position).dot(fwd);
+    var r = this.modelRadius || 10;
+    if (!(depth > 0) || !isFinite(depth)) return;
+    depth = Math.max(r * 3e-4, Math.min(r * 60, depth));
+    this.controls.target.copy(this.camera.position).addScaledVector(fwd, depth);
+  };
+
   // Wheel: dolly toward the world point under the cursor. Both the camera and
   // the orbit target are scaled about that point, so it stays pinned on screen
   // and there is always distance left to cover — no "stuck" zoom.
@@ -92,13 +187,7 @@
     this.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.mouse, this.camera);
 
-    var pivot = null;
-    var meshes = this._visibleRaycastTargets();
-    if (meshes.length) {
-      this._ensureBVH(); // keep the per-wheel raycast cheap on big meshes
-      var hit = this.raycaster.intersectObjects(meshes, true)[0];
-      if (hit) pivot = hit.point.clone();
-    }
+    var pivot = this._pickWorldPoint(e.clientX, e.clientY);
     if (!pivot) {
       // no surface under the cursor: use the plane through the orbit target
       var n = this.camera.getWorldDirection(new THREE.Vector3()).negate();
@@ -389,6 +478,13 @@
     // below) so onPointerUp can tell a plain click on a label card from the
     // end of an orbit drag -- see the label-click check there.
     this._pdownClient = { x: e.clientX, y: e.clientY };
+    if (e.button === 0 || e.button === 2) {
+      // Rotate (left) / pan (right) around the surface under the cursor.
+      // Skipped while a drawing tool owns the left button.
+      if (e.button === 2 || this.currentTool === 'orbit') {
+        try { this._adaptOrbitPivot(e); } catch (err) { console.warn('[SpatialViewer] orbit pivot failed:', err); }
+      }
+    }
     if (this.currentTool === 'orbit' || e.button !== 0) return;
 
     var isLasso = this.currentTool === 'lasso';

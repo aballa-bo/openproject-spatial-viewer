@@ -10,7 +10,7 @@ class SpatialModelsController < ApplicationController
   layout 'base'
 
   def index
-    @models = SpatialModel.where(project: @project).includes(:uploader).order(is_default: :desc, created_at: :desc)
+    @models = SpatialModel.where(project: @project).includes(:uploader, :spatial_layers).order(is_default: :desc, created_at: :desc)
   end
 
   def show
@@ -66,22 +66,9 @@ class SpatialModelsController < ApplicationController
     @spatial_model.uploader = User.current
 
     if @spatial_model.save
-      if params[:file].present?
-        attachment = Attachment.new(
-          container: @spatial_model,
-          author: User.current,
-          file: params[:file],
-          description: @spatial_model.title
-        )
-        unless attachment.save
-          flash[:error] = "Model created, but file attachment failed: #{attachment.errors.full_messages.join(', ')}"
-          redirect_to edit_project_spatial_model_path(@project, @spatial_model)
-          return
-        end
-        @spatial_model.reload.enqueue_conversion(force: true)
-      end
       flash[:notice] = I18n.t('notice_successful_create')
-      redirect_to project_spatial_model_path(@project, @spatial_model)
+      # Files are added as layers on the edit page.
+      redirect_to edit_project_spatial_model_path(@project, @spatial_model)
     else
       render :new
     end
@@ -92,22 +79,6 @@ class SpatialModelsController < ApplicationController
 
   def update
     if @spatial_model.update(model_params)
-      if params[:file].present?
-        attachment = Attachment.new(
-          container: @spatial_model,
-          author: User.current,
-          file: params[:file],
-          description: @spatial_model.title
-        )
-        if attachment.save
-          @spatial_model.attachments.where.not(id: attachment.id).destroy_all
-          @spatial_model.reload.enqueue_conversion(force: true)
-        else
-          flash[:error] = "Model details saved, but file replacement failed: #{attachment.errors.full_messages.join(', ')}"
-          redirect_to edit_project_spatial_model_path(@project, @spatial_model)
-          return
-        end
-      end
       flash[:notice] = I18n.t('notice_successful_update')
       redirect_to project_spatial_model_path(@project, @spatial_model)
     else
@@ -188,7 +159,10 @@ class SpatialModelsController < ApplicationController
                 end
 
     @spatial_model.enqueue_conversion if @spatial_model.needs_conversion?
-    @spatial_model.spatial_layers.each { |l| l.enqueue_conversion if l.needs_conversion? }
+    @spatial_model.spatial_layers.each do |l|
+      l.enqueue_conversion if l.needs_conversion?
+      l.enqueue_octree if l.octree_applicable?
+    end
 
     render json: {
       id: @spatial_model.id,
@@ -242,7 +216,8 @@ class SpatialModelsController < ApplicationController
         visible: layer.visible,
         url: file_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer),
         conversion: layer.conversion_payload,
-        file_size: (converted ? layer.converted_file_path.size : layer.file_attachment.filesize)
+        file_size: (converted ? layer.converted_file_path.size : layer.file_attachment.filesize),
+        octree_url: (layer.octree_ready? ? octree_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer, v: layer.file_attachment.id) : nil)
       }
     end
 
@@ -334,6 +309,6 @@ class SpatialModelsController < ApplicationController
   end
 
   def model_params
-    params.require(:spatial_model).permit(:title, :description, :model_format, :is_default)
+    params.require(:spatial_model).permit(:title, :description, :is_default)
   end
 end

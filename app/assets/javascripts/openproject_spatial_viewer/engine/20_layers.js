@@ -53,6 +53,8 @@
     // reloading layers repeatedly leaks one Worker thread per previous load.
     (this._splatRenderers || []).forEach(function(s) { if (s._worker) s._worker.terminate(); });
     this._splatRenderers = [];
+    (this._pointLODs || []).forEach(function(l) { try { l.dispose(); } catch (e) {} });
+    this._pointLODs = [];
     this._allLayerMeshes = [];
     this.modelMeshObjects = [];
     this._loadingLayerId = null;
@@ -116,6 +118,10 @@
       self._loadNextLayer();
     }, 1200000);
 
+    this._loadingLayerKind = l.kind;
+    // Big point clouds stream from a server-built octree (25_point_lod.js);
+    // it falls back to the plain full download if that isn't available.
+    if (l.kind === 'pointcloud' && l.octree_url) { this._loadPointOctree(l); return; }
     this.load3DModel(l.url, l.format);
   };
 

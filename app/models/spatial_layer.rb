@@ -37,6 +37,25 @@ class SpatialLayer < ApplicationRecord
     KIND_BY_FORMAT[format.to_s.downcase] || "mesh"
   end
 
+  # A .ply can be a 3DGS-trained Gaussian splat, a plain point cloud or a
+  # triangle mesh; the extension doesn't say which. Read the ASCII header:
+  # scale_0/rot_0 properties => splat, a non-empty `element face` => mesh,
+  # anything else => point cloud. Returns nil when the header is unreadable.
+  def self.sniff_ply_kind(io)
+    io.rewind if io.respond_to?(:rewind)
+    head = io.read(65_536).to_s.b
+    io.rewind if io.respond_to?(:rewind)
+    return nil unless head.start_with?("ply")
+
+    header = head.split(/end_header\r?\n/, 2).first.to_s
+    return "splat" if header.include?("property float scale_0") && header.include?("rot_0")
+
+    faces = header[/^element face (\d+)/, 1].to_i
+    faces.positive? ? "mesh" : "pointcloud"
+  rescue StandardError
+    nil
+  end
+
   def self.format_from_filename(name)
     ext = File.extname(name.to_s).delete(".").downcase
     ext = "gltf" if ext == "gltf"
@@ -85,6 +104,61 @@ class SpatialLayer < ApplicationRecord
   def update_conversion_state(attrs)
     merged = (settings || {}).merge("conversion" => conversion_state.merge(attrs.stringify_keys))
     update_column(:settings, merged) # rubocop:disable Rails/SkipsModelValidations
+  end
+
+  # ---- LOD point-cloud octree ------------------------------------------
+
+  # las/laz/e57 point clouds get a multi-resolution octree on top of the
+  # (converted) LAS so the viewer can stream just what the current view needs.
+  def octree_applicable?
+    kind == "pointcloud" && %w[las laz e57].include?(source_format)
+  end
+
+  def octree_dir
+    conversion_dir.join("octree")
+  end
+
+  def octree_state
+    (settings || {}).fetch("octree", {}) || {}
+  end
+
+  def update_octree_state(attrs)
+    merged = (settings || {}).merge("octree" => octree_state.merge(attrs.stringify_keys))
+    update_column(:settings, merged) # rubocop:disable Rails/SkipsModelValidations
+  end
+
+  def octree_ready?
+    return false unless octree_applicable? && file_attachment.present?
+
+    state = octree_state
+    state["status"] == "completed" &&
+      state["attachment_id"] == file_attachment.id &&
+      octree_dir.join("hierarchy.json").file?
+  end
+
+  # Queue the octree build. For laz/e57 the PDAL conversion has to be done
+  # first (ConvertLayerJob calls this again when it finishes).
+  def enqueue_octree(force: false)
+    return unless octree_applicable? && file_attachment.present?
+    return if needs_conversion? && !converted_file_ready?
+
+    if force
+      FileUtils.rm_rf(octree_dir.to_s)
+    elsif octree_ready?
+      return
+    end
+
+    state = octree_state
+    in_flight = %w[pending processing].include?(state["status"]) &&
+                state["attachment_id"] == file_attachment.id &&
+                recent_enqueue?(state["enqueued_at"])
+    return if in_flight && !force
+    # A failed build is not retried on every page view; re-uploading the layer retries it.
+    return if state["status"] == "error" && state["attachment_id"] == file_attachment.id && !force
+
+    update_octree_state(status: "pending", attachment_id: file_attachment.id,
+                        message: nil, enqueued_at: Time.current)
+    ::SpatialViewer::BuildPointOctreeJob.perform_later(id)
   end
 
   def converted_file_ready?

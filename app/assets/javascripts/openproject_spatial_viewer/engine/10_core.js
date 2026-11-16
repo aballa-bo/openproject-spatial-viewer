@@ -66,7 +66,14 @@
     env: true,            // image-based environment light + reflections
     hiDpi: true,          // render at devicePixelRatio (vs 1)
     wireframe: false,
-    grid: true
+    grid: true,
+    pointSize: 1.0,       // multiplier on point-cloud point diameter
+    pointBudget: 4,       // max points drawn at once, in millions (LOD point clouds)
+    splatOpacity: 1.0,    // multiplier on every Gaussian's opacity
+    splatSize: 1.0,       // multiplier on every Gaussian's extent
+    splatMinAlpha: 0.0,   // hide Gaussians whose own opacity is below this
+    splatSh: 2,           // view-dependent colour: 0 off, 1 degree 1, 2 degree 1+2
+    splatShFix: true      // flip the SH view direction like the splat itself is flipped at load
   };
   var RENDER_STORE_KEY = 'spatialViewer.render';
 
@@ -160,13 +167,8 @@
     this.xrDolly.add(this.camera);
     this.scene.add(this.xrDolly);
 
-    this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
-    this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.05;
-    // The wheel is handled by _onWheel (zoom toward the cursor), not by
-    // OrbitControls' dolly-toward-target — that one stalls as the camera nears
-    // the target and never actually reaches the surface you're looking at.
-    this.controls.enableZoom = false;
+    this.upAxis = 'y';
+    this._createControls();
 
     // Scratch vectors + state for WASD / R-F fly navigation (desktop) and
     // thumbstick locomotion (VR) — the two never run in the same frame, so
@@ -280,6 +282,7 @@
         self._processNavKeys(dt);
       }
       if (self._layerFades) self._tickLayerFades();
+      if (self._pointLODs && self._pointLODs.length) self._updatePointLODs(now);
       if (self._splatRenderers && self._splatRenderers.length) {
         var vw = self.viewport.clientWidth || 1, vh = self.viewport.clientHeight || 1;
         var projCam = self.camera;
@@ -339,6 +342,85 @@
     try { window.localStorage.setItem(RENDER_STORE_KEY, JSON.stringify(this.renderSettings)); } catch (e) {}
   };
 
+  // OrbitControls bakes camera.up into its update() closure when it is
+  // constructed, so changing the up axis means building a new one.
+  SpatialViewerApp.prototype._createControls = function() {
+    var prev = this.controls, tgt = prev ? prev.target.clone() : null;
+    var enabled = prev ? prev.enabled : true;
+    if (prev) prev.dispose();
+    this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.05;
+    // The wheel is handled by _onWheel (zoom toward the cursor), not by
+    // OrbitControls' dolly-toward-target — that one stalls as the camera nears
+    // the target and never actually reaches the surface you're looking at.
+    this.controls.enableZoom = false;
+    this.controls.enabled = enabled;
+    if (tgt) { this.controls.target.copy(tgt); this.camera.lookAt(tgt); this.controls.update(); }
+  };
+
+  // Which world axis points up. Surveys / LAS / E57 are Z-up; glTF/IFC-derived
+  // meshes are Y-up. Decides camera.up (orbit/pan/WASD), the ground grid and
+  // the shadow plane.
+  SpatialViewerApp.prototype._setUpAxis = function(axis) {
+    axis = (axis === 'z') ? 'z' : 'y';
+    this.upAxis = axis;
+    this.camera.up.set(0, axis === 'z' ? 0 : 1, axis === 'z' ? 1 : 0);
+    if (this._nav) this._nav.worldUp.copy(this.camera.up);
+    this._createControls();
+    this._placeGround();
+    if (this.keyLight && this._groundInfo) this._placeKeyLight();
+    var sel = document.getElementById('rqUp');
+    if (sel) sel.value = axis;
+  };
+
+  // Camera offset from the model centre for the default "3/4" view.
+  SpatialViewerApp.prototype._viewOffset = function(maxDim) {
+    return this.upAxis === 'z'
+      ? new THREE.Vector3(maxDim * 1.5, -maxDim * 1.5, maxDim * 1.2)
+      : new THREE.Vector3(maxDim * 1.5, maxDim * 1.2, maxDim * 1.5);
+  };
+
+  SpatialViewerApp.prototype._upStoreKey = function() {
+    return 'spatialViewer.up.' + ((this.projectData && this.projectData.id) || 'x');
+  };
+
+  // Saved choice for this model, else a default by what was loaded first:
+  // point clouds are Z-up, everything else keeps the Y-up convention.
+  SpatialViewerApp.prototype._resolveUpAxis = function(firstKind) {
+    var saved = null;
+    try { saved = window.localStorage.getItem(this._upStoreKey()); } catch (e) {}
+    this._setUpAxis(saved === 'y' || saved === 'z' ? saved : (firstKind === 'pointcloud' ? 'z' : 'y'));
+  };
+
+  // Ground grid + shadow plane sit under the model (at the bottom of its box
+  // along the up axis), lie perpendicular to it, and scale with the model.
+  SpatialViewerApp.prototype._placeGround = function() {
+    var gi = this._groundInfo;
+    if (!gi) return;
+    var z = this.upAxis === 'z', c = gi.center, b = gi.box, m = gi.maxDim;
+    if (this.gridHelper) {
+      this.gridHelper.rotation.set(z ? Math.PI / 2 : 0, 0, 0);
+      this.gridHelper.scale.setScalar(Math.max(m * 2, 1) / 50);
+      if (z) this.gridHelper.position.set(c.x, c.y, b.min.z - m * 0.0005);
+      else this.gridHelper.position.set(c.x, b.min.y - m * 0.0005, c.z);
+    }
+    if (this.shadowCatcher) {
+      this.shadowCatcher.rotation.set(z ? 0 : -Math.PI / 2, 0, 0);
+      if (z) this.shadowCatcher.position.set(c.x, c.y, b.min.z - m * 0.002);
+      else this.shadowCatcher.position.set(c.x, b.min.y - m * 0.002, c.z);
+      this.shadowCatcher.scale.set(m * 8, m * 8, 1);
+    }
+  };
+
+  SpatialViewerApp.prototype._placeKeyLight = function() {
+    var c = this._groundInfo.center, m = this._groundInfo.maxDim;
+    if (this.upAxis === 'z') this.keyLight.position.set(c.x + m * 0.9, c.y + m * 0.7, c.z + m * 1.8);
+    else this.keyLight.position.set(c.x + m * 0.9, c.y + m * 1.8, c.z + m * 0.7);
+    this.keyLight.target.position.copy(c);
+    this.keyLight.target.updateMatrixWorld();
+  };
+
   var TONE_MAP = {
     aces: 'ACESFilmicToneMapping',
     reinhard: 'ReinhardToneMapping',
@@ -385,6 +467,7 @@
       var u = sr && sr.mesh && sr.mesh.material && sr.mesh.material.uniforms;
       if (u && u.exposure) u.exposure.value = s.exposure;
     });
+    this._applySplatSettings();
 
     // Pixel ratio
     var ratio = s.hiDpi ? Math.min(window.devicePixelRatio, 2) : 1;
@@ -420,6 +503,17 @@
       mats.forEach(function(mm) { if (mm && 'wireframe' in mm) mm.wireframe = wf; });
     });
 
+    // Point clouds: diameter multiplier (plain Points via material.size, LOD
+    // nodes via a shared shader uniform) and the LOD point budget.
+    var ps = s.pointSize > 0 ? s.pointSize : 1;
+    this._pointScaleU = this._pointScaleU || { value: 1 };
+    this._pointScaleU.value = ps;
+    this.pointBudget = Math.round((s.pointBudget > 0 ? s.pointBudget : 4) * 1e6);
+    (this.modelMeshObjects || []).forEach(function(m) {
+      var mat = m && m.isPoints && m.material;
+      if (mat && mat.userData && mat.userData.baseSize) mat.size = mat.userData.baseSize * ps;
+    });
+
     // Ground grid + background
     if (this.gridHelper) this.gridHelper.visible = !!s.grid;
     if (this.scene) {
@@ -438,26 +532,21 @@
       cam.left = -d; cam.right = d; cam.top = d; cam.bottom = -d;
       cam.near = maxDim * 0.01; cam.far = maxDim * 12;
       cam.updateProjectionMatrix();
-      this.keyLight.position.set(center.x + maxDim * 0.9, center.y + maxDim * 1.8, center.z + maxDim * 0.7);
-      this.keyLight.target.position.copy(center);
-      this.keyLight.target.updateMatrixWorld();
     }
-    if (this.shadowCatcher) {
-      this.shadowCatcher.position.set(center.x, box.min.y - maxDim * 0.002, center.z);
-      this.shadowCatcher.scale.set(maxDim * 8, maxDim * 8, 1);
-    }
+    this._groundInfo = { box: box.clone(), center: center.clone(), maxDim: maxDim };
+    this._placeGround();
+    if (this.keyLight) this._placeKeyLight();
   };
-
   // Frame the model in view (same maths as the initial load).
   SpatialViewerApp.prototype.fitToView = function() {
     if (!this.modelObject) return;
-    var box = new THREE.Box3().setFromObject(this.modelObject);
+    var box = this._robustObjectBox(this.modelObject);
     if (box.isEmpty()) return;
     var center = box.getCenter(new THREE.Vector3());
     var size = box.getSize(new THREE.Vector3());
     var maxDim = Math.max(size.x, size.y, size.z) || 10;
     this.controls.target.copy(center);
-    this.camera.position.set(center.x + maxDim * 1.5, center.y + maxDim * 1.2, center.z + maxDim * 1.5);
+    this.camera.position.copy(center).add(this._viewOffset(maxDim));
     this.camera.lookAt(center);
     this.controls.update();
   };
@@ -526,6 +615,51 @@
     }, 3000);
   };
 
+  // Gaussian-splatting render options -> the splat shaders' uniforms. Also
+  // called when a splat is created (settings may predate it).
+  SpatialViewerApp.prototype._applySplatSettings = function() {
+    var s = this.renderSettings;
+    if (!s) return;
+    (this._splatRenderers || []).forEach(function(sr) {
+      var u = sr && sr.mesh && sr.mesh.material && sr.mesh.material.uniforms;
+      if (!u) return;
+      if (u.opacity) u.opacity.value = s.splatOpacity > 0 ? s.splatOpacity : 1;
+      if (u.uSplatScale) u.uSplatScale.value = s.splatSize > 0 ? s.splatSize : 1;
+      if (u.uMinAlpha) u.uMinAlpha.value = s.splatMinAlpha > 0 ? s.splatMinAlpha : 0;
+      if (u.uShDegree) u.uShDegree.value = Number(s.splatSh);
+      if (u.uShFlip) {
+        if (s.splatShFix && sr.needsShFlip) u.uShFlip.value.set(1, -1, -1);
+        else u.uShFlip.value.set(1, 1, 1);
+      }
+    });
+    this._updateRenderSections();
+  };
+
+  // The Render tab is split into sections; the ones for a kind of layer the
+  // model does not contain are hidden. Everything stays visible until the
+  // model has content, so nothing is hidden by a half-loaded scene.
+  SpatialViewerApp.prototype._updateRenderSections = function() {
+    var objs = this.modelMeshObjects || [];
+    var hasSplat = !!(this._splatRenderers && this._splatRenderers.length);
+    var hasPoints = !!(this._pointLODs && this._pointLODs.length);
+    var hasMesh = false;
+    objs.forEach(function(m) {
+      if (m.isPoints) hasPoints = true;
+      else if (m.isMesh) {
+        var mat = Array.isArray(m.material) ? m.material[0] : m.material;
+        var isSplat = mat && mat.uniforms && mat.uniforms.focal;
+        if (!isSplat) hasMesh = true;
+      }
+    });
+    var anything = hasSplat || hasPoints || hasMesh;
+    var show = { mesh: hasMesh, points: hasPoints, splat: hasSplat };
+    var secs = document.querySelectorAll('[data-render-section]');
+    for (var i = 0; i < secs.length; i++) {
+      var k = secs[i].getAttribute('data-render-section');
+      secs[i].style.display = (!anything || show[k]) ? '' : 'none';
+    }
+  };
+
   // Reflect renderSettings into the Render panel's inputs.
   SpatialViewerApp.prototype._syncRenderPanel = function() {
     var s = this.renderSettings;
@@ -540,6 +674,19 @@
     check('rqHiDpi', s.hiDpi);
     check('rqWireframe', s.wireframe);
     check('rqGrid', s.grid);
+    set('rqPointSize', s.pointSize);
+    set('rqPointBudget', s.pointBudget);
+    var psv = document.getElementById('rqPointSizeVal'); if (psv) psv.textContent = Number(s.pointSize).toFixed(2);
+    var pbv = document.getElementById('rqPointBudgetVal'); if (pbv) pbv.textContent = Number(s.pointBudget).toFixed(1);
+    set('rqSplatOpacity', s.splatOpacity);
+    set('rqSplatSize', s.splatSize);
+    set('rqSplatMinAlpha', s.splatMinAlpha);
+    set('rqSplatSh', String(s.splatSh));
+    check('rqSplatShFix', s.splatShFix);
+    var sov = document.getElementById('rqSplatOpacityVal'); if (sov) sov.textContent = Number(s.splatOpacity).toFixed(2);
+    var ssv = document.getElementById('rqSplatSizeVal'); if (ssv) ssv.textContent = Number(s.splatSize).toFixed(2);
+    var smv = document.getElementById('rqSplatMinAlphaVal'); if (smv) smv.textContent = Number(s.splatMinAlpha).toFixed(2);
+    var upSel = document.getElementById('rqUp'); if (upSel && this.upAxis) upSel.value = this.upAxis;
     var ev = document.getElementById('rqExposureVal'); if (ev) ev.textContent = Number(s.exposure).toFixed(2);
     var lv = document.getElementById('rqLightVal'); if (lv) lv.textContent = Number(s.light).toFixed(1);
     var btn = document.getElementById('btnWireframe');
@@ -571,6 +718,29 @@
     bind('rqHiDpi', 'hiDpi', 'check');
     bind('rqWireframe', 'wireframe', 'check');
     bind('rqGrid', 'grid', 'check');
+    bind('rqPointSize', 'pointSize', 'range');
+    bind('rqPointBudget', 'pointBudget', 'range');
+    bind('rqSplatOpacity', 'splatOpacity', 'range');
+    bind('rqSplatSize', 'splatSize', 'range');
+    bind('rqSplatMinAlpha', 'splatMinAlpha', 'range');
+    bind('rqSplatSh', 'splatSh', 'select');
+    bind('rqSplatShFix', 'splatShFix', 'check');
+
+    // Up axis is a property of the model, not a global render setting: kept
+    // per model in this browser, and the view is re-framed when it changes.
+    var upSel = document.getElementById('rqUp');
+    if (upSel) upSel.addEventListener('change', function() {
+      try { window.localStorage.setItem(self._upStoreKey(), upSel.value); } catch (e) {}
+      self._setUpAxis(upSel.value);
+      var gi = self._groundInfo;
+      if (gi) {
+        self.controls.target.copy(gi.center);
+        self.camera.position.copy(gi.center).add(self._viewOffset(gi.maxDim));
+        self.camera.lookAt(gi.center);
+        self.controls.update();
+        self._homeView = { position: self.camera.position.clone(), target: self.controls.target.clone() };
+      }
+    });
 
     var reset = document.getElementById('rqReset');
     if (reset) reset.addEventListener('click', function() {

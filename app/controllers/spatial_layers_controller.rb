@@ -4,7 +4,7 @@ class SpatialLayersController < ApplicationController
   before_action :find_project_by_project_id
   before_action :authorize
   before_action :find_model
-  before_action :find_layer, only: %i[update destroy file]
+  before_action :find_layer, only: %i[update destroy file octree]
   before_action :relax_csp_for_3d_viewer, only: :file
 
   # Direct files can carry blob:/data: (glTF textures); see SpatialModelsController.
@@ -38,7 +38,9 @@ class SpatialLayersController < ApplicationController
                     status: :unprocessable_entity
     end
 
-    kind = params[:kind].presence_in(SpatialLayer::KINDS) || SpatialLayer.kind_for(format)
+    kind = params[:kind].presence_in(SpatialLayer::KINDS)
+    kind ||= SpatialLayer.sniff_ply_kind(file) if format == "ply"
+    kind ||= SpatialLayer.kind_for(format)
     title = params[:title].presence || File.basename(file.original_filename.to_s, ".*")
 
     layer = @spatial_model.spatial_layers.new(
@@ -51,6 +53,7 @@ class SpatialLayersController < ApplicationController
       attachment = Attachment.new(container: layer, author: User.current, file:, description: title)
       if attachment.save
         layer.reload.enqueue_conversion(force: true)
+        layer.enqueue_octree(force: true) unless layer.needs_conversion?
         render json: { success: true, layer: layer_payload(layer), warning: conversion_warning(layer) }, status: :created
       else
         layer.destroy
@@ -99,6 +102,22 @@ class SpatialLayersController < ApplicationController
 
     @layer.destroy
     render json: { success: true }
+  end
+
+  # Octree files for the LOD point renderer: ?node=hierarchy | r | r0 | r03 ...
+  def octree
+    node = params[:node].to_s
+    return render_404 unless node.match?(/\A(hierarchy|r[0-7]{0,24})\z/)
+
+    name = node == "hierarchy" ? "hierarchy.json" : "#{node}.bin"
+    path = @layer.octree_dir.join(name)
+    return render_404 unless @layer.octree_ready? && path.file?
+
+    # Immutable per attachment: the URL changes with `v` when the layer is re-uploaded.
+    expires_in 1.day, public: false
+    send_file path.to_s,
+              type: node == "hierarchy" ? "application/json" : "application/octet-stream",
+              disposition: "inline"
   end
 
   def file
@@ -153,6 +172,14 @@ class SpatialLayersController < ApplicationController
     end
   end
 
+  # Base URL of the LOD octree once it is built, else nil (the viewer then falls
+  # back to loading the whole LAS).
+  def octree_url_for(layer)
+    return nil unless layer.octree_ready?
+
+    octree_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer, v: layer.file_attachment.id)
+  end
+
   def layer_payload(layer)
     {
       id: layer.id,
@@ -163,7 +190,8 @@ class SpatialLayersController < ApplicationController
       visible: layer.visible,
       url: file_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer),
       conversion: layer.conversion_payload,
-      file_size: (layer.needs_conversion? && layer.converted_file_ready? ? layer.converted_file_path.size : layer.file_attachment&.filesize)
+      file_size: (layer.needs_conversion? && layer.converted_file_ready? ? layer.converted_file_path.size : layer.file_attachment&.filesize),
+      octree_url: octree_url_for(layer)
     }
   end
 end

@@ -17,7 +17,7 @@
       // shN), so a conformant .sog always has what true-splat rendering needs.
       parseSOG(buffer, self._splatPointCap()).then(function(data) {
         self.onModelLoaded(self._buildTrueSplats(data.positions, data.cov6, data.colors,
-          data.sh1, data.sh2, data.sh3, data.sh4, data.sh5, data.sh6, data.sh7, data.sh8));
+          data.sh1, data.sh2, data.sh3, data.sh4, data.sh5, data.sh6, data.sh7, data.sh8, undefined, true));
       }).catch(function(err) {
         console.error('[SpatialViewer] .sog parse failed:', err);
         self._parseError('gaussian splat (.sog) unreadable: ' + (err && err.message || err));
@@ -28,6 +28,16 @@
       self._parseGltf(buffer);
     } else if (format === 'obj') {
       self.onModelLoaded(new THREE.OBJLoader().parse(new TextDecoder('utf-8').decode(buffer)));
+    } else if (format === 'ply' && self._loadingLayerId != null &&
+               (self._loadingLayerKind === 'mesh' || self._loadingLayerKind === 'pointcloud')) {
+      // A .ply the user (or the upload-time header sniff) declared as a plain
+      // triangle mesh or point cloud: no Gaussian-splat interpretation.
+      try {
+        self.onModelLoaded(self._buildPlyObject(buffer, self._loadingLayerKind));
+      } catch (e) {
+        console.error('[SpatialViewer] PLY parse failed:', e);
+        self._parseError('.ply unreadable: ' + (e && e.message || e));
+      }
     } else if (format === 'ply' || format === 'gaussian_splat' || format === 'splat' || format === 'ksplat') {
       // Try true-splat data first (scale_*/rot_*/opacity/f_dc_* -- a 3DGS-
       // trained .ply); parseSplatPLY returns null (not an error) when those
@@ -40,7 +50,7 @@
 
       if (splatData) {
         self.onModelLoaded(self._buildTrueSplats(splatData.positions, splatData.cov6, splatData.colors,
-          splatData.sh1, splatData.sh2, splatData.sh3, splatData.sh4, splatData.sh5, splatData.sh6, splatData.sh7, splatData.sh8));
+          splatData.sh1, splatData.sh2, splatData.sh3, splatData.sh4, splatData.sh5, splatData.sh6, splatData.sh7, splatData.sh8, undefined, true));
       } else {
         var plyGeom = new THREE.PLYLoader().parse(buffer);
         var plyPos = plyGeom.getAttribute('position').array;
@@ -62,6 +72,32 @@
       self.hideLoader();
       self.createDemoModel();
     }
+  };
+
+  // Build a mesh or a point cloud from a .ply. A "mesh" .ply without any
+  // faces degrades to a point cloud rather than rendering nothing.
+  SpatialViewerApp.prototype._buildPlyObject = function(buffer, kind) {
+    var geom = new THREE.PLYLoader().parse(buffer);
+    var pos = geom.getAttribute('position');
+    if (!pos) throw new Error('no vertex positions');
+    var hasColor = geom.hasAttribute('color');
+    if (kind === 'mesh' && geom.index && geom.index.count > 0) {
+      if (!geom.hasAttribute('normal')) geom.computeVertexNormals();
+      geom.computeBoundingSphere();
+      var mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
+        color: hasColor ? 0xffffff : 0xb8c0cc,
+        vertexColors: hasColor,
+        metalness: 0.1, roughness: 0.85,
+        side: THREE.DoubleSide
+      }));
+      var group = new THREE.Group();
+      group.add(mesh);
+      return group;
+    }
+    return this._buildPointCloud({
+      positions: pos.array,
+      colors: hasColor ? geom.getAttribute('color').array : null
+    });
   };
 
   // ---- Zipped model bundles (OBJ/MTL/textures, multi-file glTF) ----------

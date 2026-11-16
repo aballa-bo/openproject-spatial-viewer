@@ -29,11 +29,64 @@
     return size;
   };
 
+  // Per-axis percentile bounds of a point set (sampled, so cheap on millions
+  // of points). A handful of stray far-away points (scanner noise, outliers)
+  // otherwise inflate the true bounding box, which drags the orbit centre
+  // into empty space and wrecks point sizing and zoom limits.
+  function robustBoundsXYZ(positions, lo, hi) {
+    var count = positions.length / 3;
+    var step = Math.max(1, Math.floor(count / 200000));
+    var n = Math.ceil(count / step);
+    var ax = new Float32Array(n), ay = new Float32Array(n), az = new Float32Array(n);
+    var k = 0;
+    for (var i = 0; i < count; i += step) {
+      ax[k] = positions[i * 3]; ay[k] = positions[i * 3 + 1]; az[k] = positions[i * 3 + 2]; k++;
+    }
+    function pct(a, f) { var s = a.subarray(0, k).sort(); return s[Math.min(k - 1, Math.max(0, Math.floor(f * (k - 1))))]; }
+    return new THREE.Box3(
+      new THREE.Vector3(pct(ax, lo), pct(ay, lo), pct(az, lo)),
+      new THREE.Vector3(pct(ax, hi), pct(ay, hi), pct(az, hi)));
+  }
+
+  // Typical neighbour spacing of a point cloud, from how many points share
+  // an occupied cell of a 128^3 grid over the robust box. Assumes surface-like
+  // data (scans), where spacing ~ cell / sqrt(points per occupied cell); the
+  // old bbox-volume formula over-estimated it badly for thin/planar clouds
+  // and produced huge points.
+  function estimatePointSpacing(positions, box) {
+    var count = positions.length / 3;
+    var size = box.getSize(new THREE.Vector3());
+    var maxDim = Math.max(size.x, size.y, size.z);
+    if (!(maxDim > 0) || count < 2) return 0;
+    var G = 128, cell = maxDim / G;
+    var step = Math.max(1, Math.floor(count / 200000));
+    var seen = new Set(), sampled = 0;
+    for (var i = 0; i < count; i += step) {
+      var x = positions[i * 3], y = positions[i * 3 + 1], z = positions[i * 3 + 2];
+      if (x < box.min.x || x > box.max.x || y < box.min.y || y > box.max.y || z < box.min.z || z > box.max.z) continue;
+      var ix = Math.min(G - 1, Math.floor((x - box.min.x) / cell));
+      var iy = Math.min(G - 1, Math.floor((y - box.min.y) / cell));
+      var iz = Math.min(G - 1, Math.floor((z - box.min.z) / cell));
+      seen.add((ix * G + iy) * G + iz);
+      sampled++;
+    }
+    if (!seen.size) return 0;
+    var perCell = (sampled / seen.size) * step;   // scale the sample back up to the full cloud
+    return cell / Math.sqrt(Math.max(1, perCell));
+  }
+
   SpatialViewerApp.prototype._buildPointCloud = function(data) {
     var geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(data.positions), 3));
     geom.computeBoundingBox();
-    var size = this._adaptivePointSize(geom, data.positions.length / 3);
+
+    var robust = robustBoundsXYZ(data.positions, 0.005, 0.995);
+    var rsize = robust.getSize(new THREE.Vector3());
+    var r = this.modelRadius || Math.max(rsize.x, rsize.y, rsize.z, 1e-3);
+    var spacing = estimatePointSpacing(data.positions, robust);
+    var size = spacing > 0
+      ? Math.min(r * 0.03, Math.max(r * 0.0003, spacing * 1.6))
+      : this._adaptivePointSize(geom, data.positions.length / 3);
 
     var mat;
     if (data.colors) {
@@ -42,8 +95,34 @@
     } else {
       mat = new THREE.PointsMaterial({ size: size, color: 0x9aa7b4, sizeAttenuation: true });
     }
+    mat.userData.baseSize = size;
+    // Round points instead of GL's default squares.
+    mat.onBeforeCompile = function(shader) {
+      shader.fragmentShader = shader.fragmentShader.replace(
+        'void main() {',
+        'void main() {\n\tvec2 _pc = gl_PointCoord - 0.5;\n\tif (dot(_pc, _pc) > 0.25) discard;\n');
+    };
     geom.computeBoundingSphere();
-    return new THREE.Points(geom, mat);
+    var pts = new THREE.Points(geom, mat);
+    pts.userData.robustBox = robust;
+    return pts;
+  };
+
+  // Bounding box used for framing the camera: like Box3.setFromObject, but
+  // point clouds contribute their outlier-trimmed box (see robustBoundsXYZ).
+  SpatialViewerApp.prototype._robustObjectBox = function(object) {
+    var box = new THREE.Box3(), tmp = new THREE.Box3();
+    object.updateMatrixWorld(true);
+    object.traverse(function(c) {
+      if (c.isPoints && c.userData && c.userData.robustBox) {
+        tmp.copy(c.userData.robustBox).applyMatrix4(c.matrixWorld);
+        box.union(tmp);
+      } else if (c.isMesh || c.isPoints) {
+        tmp.setFromObject(c);
+        if (!tmp.isEmpty()) box.union(tmp);
+      }
+    });
+    return box.isEmpty() ? new THREE.Box3().setFromObject(object) : box;
   };
 
   // Max Gaussians/vertices actually submitted to the GPU for a splat-kind
@@ -189,11 +268,13 @@
     '  vec4 mvPosition = modelViewMatrix * vec4(center, 1.0);',
     '  float zc = mvPosition.z;',
     '  if (zc > -0.05) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }', // behind/at the camera: clip it
+    '  if (colorOpacity.a < uMinAlpha) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }', // "hide faint splats" control
     '  mat3 Vrk = mat3(',
     '    covA.x, covA.y, covA.z,',
     '    covA.y, covB.x, covB.y,',
     '    covA.z, covB.y, covB.z',
     '  );',
+    '  Vrk *= uSplatScale * uSplatScale;', // "Splat size" control: scales every Gaussian's extent
     '  mat3 W = mat3(modelViewMatrix);',
     '  mat3 J = mat3(',
     '    focal.x / -zc, 0.0, 0.0,',
@@ -239,17 +320,19 @@
     // camera, matching the reference's `dir = pos - campos` (both built-in
     // uniforms three.js provides to every ShaderMaterial).
     '  vec3 worldCenter = (modelMatrix * vec4(center, 1.0)).xyz;',
-    '  vec3 dir = normalize(worldCenter - cameraPosition);',
+    '  vec3 dir = normalize(worldCenter - cameraPosition) * uShFlip;', // uShFlip: see _buildTrueSplats (SH live in the pre-flip file frame)
     '  float dx = dir.x, dy = dir.y, dz = dir.z;',
     '  float dxx = dx * dx, dyy = dy * dy, dzz = dz * dz;',
     '  float dxy = dx * dy, dyz = dy * dz, dxz = dx * dz;',
+    '  float shD1 = step(0.5, uShDegree);', // view-dependent colour: 0 = off, 1 = degree 1, 2 = degree 1+2
+    '  float shD2 = step(1.5, uShDegree);',
     '  vec3 col = 0.28209479177387814 * colorOpacity.rgb',
-    '    + 0.4886025119029199 * (-dy * sh1 + dz * sh2 - dx * sh3)',
-    '    + 1.0925484305920792 * dxy * sh4',
+    '    + shD1 * 0.4886025119029199 * (-dy * sh1 + dz * sh2 - dx * sh3)',
+    '    + shD2 * (1.0925484305920792 * dxy * sh4',
     '    - 1.0925484305920792 * dyz * sh5',
     '    + 0.31539156525252005 * (2.0 * dzz - dxx - dyy) * sh6',
     '    - 1.0925484305920792 * dxz * sh7',
-    '    + 0.5462742152960396 * (dxx - dyy) * sh8',
+    '    + 0.5462742152960396 * (dxx - dyy) * sh8)',
     '    + 0.5;',
     // Selection highlight (see _updateSelectionSpotlight): splat color is
     // baked-in SH, never relit by a real THREE.Light, so the spotlight's
@@ -293,6 +376,10 @@
     'uniform float uSelRadius;',
     'uniform float uSelFalloff;',
     'uniform float uSelActive;',
+    'uniform float uSplatScale;',
+    'uniform float uMinAlpha;',
+    'uniform float uShDegree;',
+    'uniform vec3 uShFlip;',
     'varying vec4 vColor;',
     'varying vec2 vPos;',
     'void main() {'
@@ -437,7 +524,11 @@
         uSelCenter: { value: new THREE.Vector3() },
         uSelRadius: { value: 0 },
         uSelFalloff: { value: 1 },
-        uSelActive: { value: 0 }
+        uSelActive: { value: 0 },
+        uSplatScale: { value: 1.0 },
+        uMinAlpha: { value: 0.0 },
+        uShDegree: { value: 2.0 },
+        uShFlip: { value: new THREE.Vector3(1, 1, 1) }
       },
       vertexShader: SPLAT_VERTEX_SHADER,
       fragmentShader: SPLAT_FRAGMENT_SHADER,
@@ -509,6 +600,7 @@
           // fresh multi-megabyte order array per resort (see
           // splat_sort_worker.js's 'release' message).
           if (ev.data && ev.data.type === 'order') self._pendingOrder = new Uint32Array(ev.data.order);
+          else if (ev.data && ev.data.type === 'unchanged') self._workerUnchanged = true;
         };
         this._worker.onerror = function(err) {
           console.warn('[SpatialViewer] splat sort worker failed, falling back to main-thread sort:', err && err.message);
@@ -606,6 +698,8 @@
   // step -- see maybeResort below for why.
   SplatRenderer.prototype._requestWorkerSort = function(camera) {
     this._workerBusy = true;
+    this._workerUnchanged = false;
+    this._busySince = (window.performance && performance.now) ? performance.now() : Date.now();
     var dir = this._sortDirection(camera);
     var p = camera.position;
     // Remembered so maybeResort can tell, once the reply lands, whether it
@@ -647,6 +741,8 @@
     var moved = !this._lastSeenPos ||
       this._lastSeenPos.distanceToSquared(p) > this._moveEpsSq ||
       (1 - Math.abs(this._lastSeenQuat.dot(q))) > 1e-6;
+    // Watchdog: never stay "busy" for good if a reply is somehow lost.
+    if (this._workerBusy && now - (this._busySince || 0) > 1500) this._workerBusy = false;
 
     if (moved) {
       this._lastSeenPos = (this._lastSeenPos || new THREE.Vector3()).copy(p);
@@ -684,16 +780,23 @@
         var dirNow = this._sortDirection(camera);
         var stale = !this._requestedPos ||
           this._requestedPos.distanceToSquared(p) > this._moveEpsSq ||
-          (1 - Math.abs(this._requestedDir.dot(dirNow))) > 1e-6;
+          (1 - this._requestedDir.dot(dirNow)) > 1e-6;   // signed: opposite directions ARE different views
         if (stale && !this._workerBusy) {
           this._requestWorkerSort(camera);
         } else {
           this._dirty = false;
         }
       } else if (!this._workerBusy) {
-        // Nothing computed yet for this view (e.g. the very first frame) --
-        // ask once; re-checked next tick once the reply lands.
-        this._requestWorkerSort(camera);
+        if (this._workerUnchanged) {
+          // The worker says the view is the one it last sorted for and that
+          // order has already been applied: nothing left to do.
+          this._workerUnchanged = false;
+          this._dirty = false;
+        } else {
+          // Nothing computed yet for this view (e.g. the very first frame) --
+          // ask once; re-checked next tick once the reply lands.
+          this._requestWorkerSort(camera);
+        }
       }
       return;
     }
@@ -789,6 +892,10 @@
     'uniform float uSelRadius;',
     'uniform float uSelFalloff;',
     'uniform float uSelActive;',
+    'uniform float uSplatScale;',
+    'uniform float uMinAlpha;',
+    'uniform float uShDegree;',
+    'uniform vec3 uShFlip;',
     'varying vec4 vColor;',
     'varying vec2 vPos;',
     // Exact texel-center UV for a row-major, index = row*texSize.x + col
@@ -889,6 +996,10 @@
         uSelRadius: { value: 0 },
         uSelFalloff: { value: 1 },
         uSelActive: { value: 0 },
+        uSplatScale: { value: 1.0 },
+        uMinAlpha: { value: 0.0 },
+        uShDegree: { value: 2.0 },
+        uShFlip: { value: new THREE.Vector3(1, 1, 1) },
         texSize: { value: new THREE.Vector2(W, H) },
         texCenter: { value: texCenter },
         texCovA: { value: texCovA },
@@ -968,8 +1079,10 @@
   SplatRendererTex.prototype._RESORT_MIN_INTERVAL_MS = 80;
 
   SplatRendererTex.prototype.maybeResort = function(camera) {
-    if (this._workerBusy) return;
     var now = (window.performance && performance.now) ? performance.now() : Date.now();
+    // Watchdog: never stay "busy" for good if a reply is somehow lost.
+    if (this._workerBusy && now - (this._busySince || 0) > 1500) this._workerBusy = false;
+    if (this._workerBusy) return;
     if (this._lastResortRequestAt && (now - this._lastResortRequestAt) < this._RESORT_MIN_INTERVAL_MS) return;
     var p = camera.position, q = camera.quaternion;
     var moved = !this._lastSeenPos ||
@@ -980,6 +1093,7 @@
     this._lastSeenQuat = (this._lastSeenQuat || new THREE.Quaternion()).copy(q);
     this._lastResortRequestAt = now;
     this._workerBusy = true;
+    this._busySince = now;
     var dir = this._sortDirection(camera);
     this._worker.postMessage({
       type: 'camera',
@@ -1009,7 +1123,7 @@
   // background resort to feed it), falling back to the original
   // SplatRenderer (which has its own, separate WebGL1-safe worker-or-not
   // fallback already) when either is missing.
-  SpatialViewerApp.prototype._buildTrueSplats = function(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear) {
+  SpatialViewerApp.prototype._buildTrueSplats = function(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear, shFlip) {
     var splat;
     var canUseTex = !!(window.Worker && this.renderer && this.renderer.capabilities && this.renderer.capabilities.isWebGL2);
     if (canUseTex) {
@@ -1023,8 +1137,14 @@
     if (!splat) {
       splat = new SplatRenderer(positions, cov6, colors, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, colorSpaceLinear);
     }
+    // .sog / 3DGS .ply splats are rotated 180 deg about X at load (see
+    // parseSOG/parseSplatPLY) but their spherical-harmonic coefficients stay
+    // in the file's own frame, so the view direction fed to them has to be
+    // flipped the same way (see the "colour axis correction" render option).
+    splat.needsShFlip = !!shFlip;
     this._splatRenderers = this._splatRenderers || [];
     this._splatRenderers.push(splat);
+    try { this._applySplatSettings(); } catch (e) { console.warn('[SpatialViewer] splat settings failed:', e); }
     return splat.mesh;
   };
 

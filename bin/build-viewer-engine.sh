@@ -26,6 +26,7 @@ FRAGMENTS="
 22_splat_rendering.js
 23_parsers.js
 24_finalize.js
+25_point_lod.js
 30_interaction_lasso.js
 40_annotations.js
 50_ui_vr_ar.js

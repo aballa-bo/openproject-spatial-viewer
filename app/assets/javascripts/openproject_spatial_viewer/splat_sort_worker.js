@@ -14,6 +14,10 @@
 //        used to adaptively size depth buckets later.
 //   -> {type:'camera', position:{x,y,z}, direction:{x,y,z}}
 //        Sent whenever the camera moves meaningfully. Triggers a resort.
+//   <- {type:'unchanged'}
+//        Reply when the camera moved less than the epsilon below, so no new
+//        order was computed (the main thread still needs an answer to clear
+//        its "request in flight" flag).
 //   <- {type:'order', order: ArrayBuffer (Uint32, transferred)}
 //        Posted back after every resort actually performed (camera deltas
 //        under ~0.001 in position/direction are treated as "unchanged" and
@@ -161,13 +165,18 @@
   }
 
   function maybeResort() {
-    if (!pendingPos || !pendingDir || !centers) return;
+    if (!pendingPos || !pendingDir || !centers) { self.postMessage({ type: 'unchanged' }); return; }
     var px = pendingPos.x, py = pendingPos.y, pz = pendingPos.z;
     var dx = pendingDir.x, dy = pendingDir.y, dz = pendingDir.z;
     var eps = 0.001;
     if (isFinite(lastPos.x) &&
         Math.abs(px - lastPos.x) < eps && Math.abs(py - lastPos.y) < eps && Math.abs(pz - lastPos.z) < eps &&
         Math.abs(dx - lastDir.x) < eps && Math.abs(dy - lastDir.y) < eps && Math.abs(dz - lastDir.z) < eps) {
+      // Must still answer: the main thread marks itself "busy" when it sends a
+      // request and only clears that on a reply. Staying silent here left it
+      // busy forever, so the depth order froze at the last view and any later
+      // rotation showed splats blended in the wrong order.
+      self.postMessage({ type: 'unchanged' });
       return;
     }
     lastPos.x = px; lastPos.y = py; lastPos.z = pz;

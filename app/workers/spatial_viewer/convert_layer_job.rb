@@ -27,6 +27,7 @@ module SpatialViewer
         ::SpatialViewer::IfcConverter.new(layer).call
       when "laz", "e57"
         ::SpatialViewer::PointCloudConverter.new(layer).call
+        layer.reload.enqueue_octree
       end
     rescue ::SpatialViewer::IfcConverter::ConversionError,
            ::SpatialViewer::PointCloudConverter::ConversionError => e
