@@ -13,8 +13,9 @@ byte.
 
 Matrix convention: CloudCompare's, column vectors, p' = M p, in metres.
 The translation is converted to the file's length unit (mm, m, ...).
-A uniform scale other than 1 cannot be stored in IFC placements and is
-refused.
+A uniform scale cannot be stored in IFC placements, so it is applied by
+redefining the project's length unit (1 unit = scale x the old one), which
+rescales the whole model; the translation is converted accordingly.
 
 CLI:
   transform_ifc.py model.ifc --matrix "<pasted text>" [-o out.ifc] [--invert]
@@ -29,7 +30,7 @@ import sys
 _NUM = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 _ENT = re.compile(
     r'^[ \t]*#(\d+)[ \t]*=[ \t]*(IFCLOCALPLACEMENT|IFCAXIS2PLACEMENT3D|'
-    r'IFCCARTESIANPOINT|IFCDIRECTION|IFCSIUNIT)[ \t]*\((.*?)\)[ \t]*;',
+    r'IFCCARTESIANPOINT|IFCDIRECTION|IFCSIUNIT|IFCCONVERSIONBASEDUNIT)[ \t]*\((.*?)\)[ \t]*;',
     re.I | re.M | re.S)
 _PREFIX = {'EXA': 1e18, 'PETA': 1e15, 'TERA': 1e12, 'GIGA': 1e9, 'MEGA': 1e6,
            'KILO': 1e3, 'HECTO': 1e2, 'DECA': 10.0, 'DECI': 0.1,
@@ -83,23 +84,21 @@ def parse_matrix(text):
     return m
 
 
-def decompose(m, tol=1e-3):
+def decompose(m):
+    """Split into (R, s, t): rotation, uniform scale, translation (metres)."""
     a = [row[:3] for row in m[:3]]
     det = det3(a)
     if det <= 0:
         raise ValueError("The matrix contains a reflection (det <= 0).")
     s = det ** (1.0 / 3)
-    if abs(s - 1) > tol:
-        raise ValueError(
-            "The matrix has a scale of %.5f. IFC placements cannot carry a "
-            "scale: use a rigid (rotation + translation) matrix." % s)
     r = [[x / s for x in row] for row in a]
     rt = [[r[j][i] for j in range(3)] for i in range(3)]
     err = max(abs(v - (1.0 if i == j else 0.0))
               for i, row in enumerate(mm(r, rt)) for j, v in enumerate(row))
     if err > 1e-4:
-        raise ValueError("The 3x3 part is not a pure rotation (error %.2g)." % err)
-    return r, [m[i][3] for i in range(3)]
+        raise ValueError("The 3x3 part is not a rotation times a uniform "
+                         "scale (error %.2g)." % err)
+    return r, s, [m[i][3] for i in range(3)]
 
 
 # ---------- IFC handling ----------
@@ -125,16 +124,43 @@ def length_unit_in_metres(text):
     return 1.0
 
 
+def _scale_unit(text, ents, sc, next_id):
+    """Point IFCUNITASSIGNMENT's length unit at a conversion-based unit of
+    `sc` times the original SI length unit. Returns (text, new entity lines)."""
+    m = re.search(r'(IFCUNITASSIGNMENT\s*\(\()(.*?)(\)\)\s*;)', text, re.I | re.S)
+    if not m:
+        raise ValueError("No IFCUNITASSIGNMENT found: cannot apply a scale.")
+    refs = re.findall(r'#(\d+)', m.group(2))
+    si = [int(r) for r in refs if int(r) in ents and ents[int(r)][0] == 'IFCSIUNIT'
+          and '.LENGTHUNIT.' in ents[int(r)][1].upper()]
+    if not si:
+        raise ValueError("The file's length unit is not a plain SI unit "
+                         "(e.g. it uses inches): cannot apply a scale.")
+    d, mw, cu = next_id, next_id + 1, next_id + 2
+    body = re.sub(r'#%d\b' % si[0], '#%d' % cu, m.group(2))
+    text = text[:m.start()] + m.group(1) + body + m.group(3) + text[m.end():]
+    return text, [
+        "#%d=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);" % d,
+        "#%d=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(%r),#%d);" % (mw, float(sc), si[0]),
+        "#%d=IFCCONVERSIONBASEDUNIT(#%d,.LENGTHUNIT.,'SCALED',#%d);" % (cu, d, mw)]
+
+
 def transform_ifc(inp, out, matrix, invert=False, log=print):
-    r, t = decompose(matrix)
+    r, sc, t = decompose(matrix)
     if invert:
-        inv = invert_rigid(matrix)
-        r, t = [row[:3] for row in inv[:3]], [inv[i][3] for i in range(3)]
+        rt = [[r[j][i] for j in range(3)] for i in range(3)]
+        t = [-v / sc for v in mv(rt, t)]
+        r, sc = rt, 1.0 / sc
     with open(inp, 'r', encoding='latin-1', newline='') as f:
         text = f.read()
     unit = length_unit_in_metres(text)
-    log("File length unit: %g m (translation converted accordingly)" % unit)
-    t = [v / unit for v in t]
+    scaled = abs(sc - 1) > 1e-6
+    # IFC placements cannot hold a scale. A uniform scale is applied instead by
+    # redefining the project's length unit (1 unit = sc * old unit): every
+    # length in the file (geometry, radii, extrusions...) is rescaled at once.
+    unit_new = unit * sc
+    log("File length unit: %g m%s" % (unit, ("; new unit %g m (scale %.6f)" % (unit_new, sc)) if scaled else ""))
+    t = [v / unit_new for v in t]
 
     ents = {}
     for m in _ENT.finditer(text):
@@ -148,6 +174,12 @@ def transform_ifc(inp, out, matrix, invert=False, log=print):
         parts = args.split(',', 1)
         if parts[0].strip() == '$':
             roots.append(eid)
+    ua = re.search(r'IFCUNITASSIGNMENT\s*\(\((.*?)\)\)', text, re.I | re.S)
+    if ua and any(int(r) in ents and ents[int(r)][0] == 'IFCCONVERSIONBASEDUNIT'
+                  and '.LENGTHUNIT.' in ents[int(r)][1].upper()
+                  for r in re.findall(r'#(\d+)', ua.group(1))):
+        raise ValueError("The file's length unit is a conversion-based unit "
+                         "(inches, or already scaled by this tool): not supported.")
     if not roots:
         raise ValueError("No root IfcLocalPlacement found: is this a valid IFC?")
     log("Root placements to transform: %d" % len(roots))
@@ -181,6 +213,9 @@ def transform_ifc(inp, out, matrix, invert=False, log=print):
 
     for (a, b), new in sorted(repl, reverse=True):
         text = text[:a] + new + text[b:]
+    if scaled:
+        text, extra = _scale_unit(text, ents, sc, next_id)
+        new_ents += extra
     end = [m.start() for m in re.finditer(r'^[ \t]*ENDSEC[ \t]*;', text, re.M | re.I)][-1]
     nl_ch = '\r\n' if '\r\n' in text[:2000] else '\n'
     text = text[:end] + nl_ch.join(new_ents) + nl_ch + text[end:]

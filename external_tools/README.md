@@ -82,5 +82,7 @@ matrix; the result is saved next to the input as `<name>_transformed.ifc`.
 
 Only the root placements (usually the IfcSite) are rewritten, so the geometry
 is untouched and the rest of the file is copied as is. The translation is
-converted to the file's length unit. A scale other than 1 is refused (IFC
-placements cannot store it). CLI: `transform_ifc.py model.ifc --matrix-file m.txt [--invert] [-o out.ifc]`.
+converted to the file's length unit. IFC placements cannot store a scale, so a
+uniform scale in the matrix is applied by redefining the project's length unit
+(1 unit = scale x the old one), which rescales the whole model. Files whose
+length unit is not plain SI (inches, or already scaled) are refused in that case. CLI: `transform_ifc.py model.ifc --matrix-file m.txt [--invert] [-o out.ifc]`.
