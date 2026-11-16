@@ -73,3 +73,14 @@ transformed one.
   already quantised, so the loss is of the same order); colours, opacity and
   sizes are kept.
 - Only binary little-endian, uncompressed 3DGS `.ply` files are supported.
+
+## transform_ifc.py
+
+Applies a CloudCompare rotation/translation matrix to an IFC file (standard
+library only). Run `python transform_ifc.py`, choose the IFC and paste the 4x4
+matrix; the result is saved next to the input as `<name>_transformed.ifc`.
+
+Only the root placements (usually the IfcSite) are rewritten, so the geometry
+is untouched and the rest of the file is copied as is. The translation is
+converted to the file's length unit. A scale other than 1 is refused (IFC
+placements cannot store it). CLI: `transform_ifc.py model.ifc --matrix-file m.txt [--invert] [-o out.ifc]`.
