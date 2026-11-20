@@ -67,7 +67,7 @@
     hiDpi: true,          // render at devicePixelRatio (vs 1)
     wireframe: false,
     grid: true,
-    pointSize: 1.0,       // multiplier on point-cloud point diameter
+    pointSize: 0.25,      // multiplier on point-cloud point diameter
     pointBudget: 4,       // max points drawn at once, in millions (LOD point clouds)
     splatOpacity: 1.0,    // multiplier on every Gaussian's opacity
     splatSize: 1.0,       // multiplier on every Gaussian's extent
@@ -539,7 +539,8 @@
   // Frame the model in view (same maths as the initial load).
   SpatialViewerApp.prototype.fitToView = function() {
     if (!this.modelObject) return;
-    var box = this._robustObjectBox(this.modelObject);
+    var box = this._referenceBox();
+    if (box.isEmpty()) box = this._robustObjectBox(this.modelObject);
     if (box.isEmpty()) return;
     var center = box.getCenter(new THREE.Vector3());
     var size = box.getSize(new THREE.Vector3());
@@ -548,6 +549,7 @@
     this.camera.position.copy(center).add(this._viewOffset(maxDim));
     this.camera.lookAt(center);
     this.controls.update();
+    this._rescaleForFlat();
   };
 
   SpatialViewerApp.prototype.goHome = function() {
@@ -555,6 +557,7 @@
     this.camera.position.copy(this._homeView.position);
     this.controls.target.copy(this._homeView.target);
     this.controls.update();
+    this._rescaleForFlat();
   };
 
   // "Set as start view" — persist the current camera position + orbit target
@@ -750,6 +753,7 @@
       if (u.uSplatScale) u.uSplatScale.value = s.splatSize > 0 ? s.splatSize : 1;
       if (u.uMinAlpha) u.uMinAlpha.value = s.splatMinAlpha > 0 ? s.splatMinAlpha : 0;
       if (u.uShDegree) u.uShDegree.value = Number(s.splatSh);
+      if (u.uMaxRadius) u.uMaxRadius.value = self._xrMode === 'vr' ? 160 : 1024;
       if (u.uDepthMode) u.uDepthMode.value = Number(s.splatDepth) ? 1 : 0;
       if (u.uDepthK) u.uDepthK.value = s.splatDepthRange > 0 ? s.splatDepthRange : 1;
       if (u.uShFlip) {

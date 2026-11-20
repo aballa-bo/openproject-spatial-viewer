@@ -25,15 +25,31 @@
         a.addEventListener('click', function(e) {
           e.preventDefault();
           var v = a.dataset.view, t = self.controls.target;
-          if (v === 'top') self.camera.position.set(t.x, t.y + 20, t.z);
-          if (v === 'front') self.camera.position.set(t.x, t.y, t.z + 20);
-          if (v === 'right') self.camera.position.set(t.x + 20, t.y, t.z);
-          if (v === 'iso') self.camera.position.set(t.x + 15, t.y + 15, t.z + 15);
+          // Keep the current viewing distance so the framing (and, with
+          // perspective off, the scale) does not jump.
+          var d = self.camera.position.distanceTo(t) || 20;
+          if (v === 'top') self.camera.position.set(t.x, t.y + d, t.z);
+          if (v === 'rear') self.camera.position.set(t.x, t.y - d, t.z);
+          if (v === 'front') self.camera.position.set(t.x, t.y, t.z + d);
+          if (v === 'right') self.camera.position.set(t.x + d, t.y, t.z);
+          if (v === 'left') self.camera.position.set(t.x - d, t.y, t.z);
+          if (v === 'iso') self.camera.position.set(t.x + d * 0.577, t.y + d * 0.577, t.z + d * 0.577);
           self.controls.update();
           viewsMenu.classList.remove('show');
         });
       });
     }
+
+    var perspBtn = document.getElementById('btnPerspective');
+    if (perspBtn) perspBtn.addEventListener('click', function() {
+      // _setPerspective(on): currently flat -> turn perspective on, and vice versa.
+      self._setPerspective(!!self._perspectiveOff);
+      var on = !self._perspectiveOff;
+      perspBtn.classList.toggle('active', on);
+      perspBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      perspBtn.title = on ? 'Perspective on (click for a flat, parallel-projection view)' : 'Perspective off (click to restore perspective)';
+      perspBtn.innerHTML = '<i class="' + (on ? 'sv-icon-perspective' : 'sv-icon-grid') + '"></i>';
+    });
 
     var navMenuBtn = document.getElementById('btnNavMenu');
     var navMenu = document.getElementById('navDropdownMenu');
@@ -62,6 +78,17 @@
       });
     });
     this._renderSavedViews();
+
+    // GLOBAL options accordion (Layers tab), same triangle as the layer rows.
+    var gTog = document.getElementById('globalToggle'), gBody = document.getElementById('globalBody');
+    if (gTog && gBody) {
+      gTog.addEventListener('click', function() {
+        var open = gBody.style.display === 'none';
+        gBody.style.display = open ? '' : 'none';
+        gTog.innerHTML = open ? '&#9662;' : '&#9656;';
+        gTog.setAttribute('aria-expanded', open ? 'true' : 'false');
+      });
+    }
 
     var mapBtn = document.getElementById('btnMap');
     var mapPanel = document.getElementById('svMapPanel');
@@ -155,6 +182,71 @@
     this.initAR();
   };
 
+  // Perspective off = (near-)orthographic view. A real OrthographicCamera would
+  // break everything that reads the perspective projection (splat shader,
+  // point LOD, zoom-to-cursor, raycasts), so instead the same camera is "dolly
+  // zoomed": a very narrow field of view from proportionally farther away,
+  // which gives the same framing with practically parallel projection.
+  var FLAT_FOV = 1.5;
+  SpatialViewerApp.prototype._setPerspective = function(on) {
+    var cam = this.camera, tgt = this.controls && this.controls.target;
+    if (!cam || !tgt) return;
+    var off = !on;
+    if (off === !!this._perspectiveOff) return;
+    var fovFrom = cam.fov, fovTo = off ? FLAT_FOV : (this._perspFov || 50);
+    if (off) this._perspFov = cam.fov;
+    var t = function(f) { return Math.tan(THREE.MathUtils.degToRad(f) / 2); };
+    var dir = cam.position.clone().sub(tgt);
+    var d = dir.length() || 1;
+    dir.normalize().multiplyScalar(d * t(fovFrom) / t(fovTo));
+    cam.fov = fovTo;
+    cam.position.copy(tgt).add(dir);
+    this._perspectiveOff = off;
+    cam.updateProjectionMatrix();
+    this.controls.update();
+    if (this._updateClip) this._updateClip(true);
+  };
+
+  // After a jump that places the camera for a normal perspective view (Fit,
+  // Home), push it back to the distance the flat (narrow-FOV) camera needs.
+  SpatialViewerApp.prototype._rescaleForFlat = function() {
+    if (!this._perspectiveOff || !this._perspFov) return;
+    var cam = this.camera, tgt = this.controls.target;
+    var t = function(f) { return Math.tan(THREE.MathUtils.degToRad(f) / 2); };
+    var dir = cam.position.clone().sub(tgt);
+    cam.position.copy(tgt).add(dir.multiplyScalar(t(this._perspFov) / t(cam.fov)));
+    this.controls.update();
+    if (this._updateClip) this._updateClip(true);
+  };
+
+  // Lighter rendering while in VR (two eyes, high resolution, no foveation).
+  // Heavy Gaussian-splat scenes are fill-rate bound: drop the view-dependent
+  // colour, hide the faintest splats, cap the on-screen size of any single
+  // splat (giant splats are what causes the worst overdraw), switch shadows
+  // off. The previous settings come back when the session ends.
+  SpatialViewerApp.prototype._applyVRProfile = function(on) {
+    var s = this.renderSettings;
+    if (!s) return;
+    if (on) {
+      if (!this._preVRSettings) {
+        this._preVRSettings = {
+          splatSh: s.splatSh, splatMinAlpha: s.splatMinAlpha, shadows: s.shadows, hiDpi: s.hiDpi,
+          pointBudget: s.pointBudget
+        };
+      }
+      s.splatSh = 0;
+      s.splatMinAlpha = Math.max(Number(s.splatMinAlpha) || 0, 0.1);
+      s.shadows = 'off';
+      s.hiDpi = false;
+      s.pointBudget = Math.min(Number(s.pointBudget) || 4, 2);
+    } else if (this._preVRSettings) {
+      var p = this._preVRSettings;
+      Object.keys(p).forEach(function(k) { s[k] = p[k]; });
+      this._preVRSettings = null;
+    }
+    try { this._applyRenderSettings(); this._syncRenderPanel(); } catch (e) { console.warn('[SpatialViewer] VR profile failed:', e); }
+  };
+
   // ---- WebXR / VR headsets --------------------------------------------------
   SpatialViewerApp.prototype.initVR = function() {
     var self = this;
@@ -187,6 +279,7 @@
       if (self._xrSession) self._xrSession.removeEventListener('end', onSessionEnded);
       self._xrSession = null;
       self._xrMode = null;
+      self._applyVRProfile(false);
       self._xrTurnArmed = false;
       self.xrDolly.position.set(0, 0, 0);
       self.xrDolly.rotation.set(0, 0, 0);
@@ -264,6 +357,7 @@
           if (settled) return; // watchdog already fired and tore this down
           settled = true;
           clearTimeout(watchdog);
+          self._applyVRProfile(true);
           btn.disabled = false;
           btn.classList.add('active');
           btn.title = 'Exit VR';

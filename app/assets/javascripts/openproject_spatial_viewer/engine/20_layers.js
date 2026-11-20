@@ -81,7 +81,15 @@
     layers.forEach(function(l) { if (l.file_size > maxSize) maxSize = l.file_size; });
     if (maxSize) this.heavyMode = maxSize >= heavyMb * 1048576;
 
-    this._layerQueue = layers.filter(function(l) { return !!l.url; });
+    // Load in reference order: the first layer loaded is the one the camera,
+    // orbit centre, bounding box and tool scale are framed on, so LiDAR comes
+    // first, then IFC / photogrammetry, and Gaussian splats last (they only
+    // frame the view when nothing else could).
+    var rank = function(k) { return k === 'pointcloud' ? 0 : (k === 'ifc' || k === 'mesh') ? 1 : 2; };
+    this._layerQueue = layers.filter(function(l) { return !!l.url; })
+      .map(function(l, i) { return { l: l, i: i }; })
+      .sort(function(a, b) { return (rank(a.l.kind) - rank(b.l.kind)) || (a.i - b.i); })
+      .map(function(x) { return x.l; });
     if (!this._layerQueue.length) {
       this.showLoader('This model has no uploaded files yet — add layers from the model edit page.');
       setTimeout(function() { self.hideLoader(); self.createDemoModel(); }, 3500);
@@ -138,6 +146,33 @@
     // it falls back to the plain full download if that isn't available.
     if (l.kind === 'pointcloud' && l.octree_url) { this._loadPointOctree(l); return; }
     this.load3DModel(l.url, l.format);
+  };
+
+  // Layers the view is referenced to (camera framing, orbit centre, bounding
+  // box): the LiDAR point cloud(s) if there are any, else IFC / photogrammetry,
+  // never the Gaussian splat unless it is all there is.
+  SpatialViewerApp.prototype._referenceGroups = function() {
+    var self = this;
+    var kinds = [['pointcloud'], ['ifc', 'mesh'], ['splat']];
+    for (var i = 0; i < kinds.length; i++) {
+      var out = [];
+      Object.keys(this.layerGroups || {}).forEach(function(id) {
+        var m = self.layerMeta && self.layerMeta[id];
+        if (m && kinds[i].indexOf(m.kind) !== -1) out.push(self.layerGroups[id]);
+      });
+      if (out.length) return out;
+    }
+    return [];
+  };
+
+  SpatialViewerApp.prototype._referenceBox = function() {
+    var self = this;
+    var box = new THREE.Box3();
+    this._referenceGroups().forEach(function(g) {
+      var b = self._robustObjectBox(g);
+      if (!b.isEmpty()) box.union(b);
+    });
+    return box;
   };
 
   // Called at the end of onModelLoaded: move the just-loaded object into its

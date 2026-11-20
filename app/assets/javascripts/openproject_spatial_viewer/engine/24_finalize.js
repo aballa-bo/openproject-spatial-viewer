@@ -146,8 +146,9 @@
         this._homeView = { position: this.camera.position.clone(), target: this.controls.target.clone() };
       } catch (e) { console.warn('[SpatialViewer] shadow fit failed:', e); }
     } else {
-      // keep modelRadius representative of the biggest layer
-      this.modelRadius = Math.max(this.modelRadius || 0, maxDim);
+      // keep modelRadius representative of the biggest reference layer (a
+      // Gaussian splat never sets the scale).
+      if (this._loadingLayerKind !== 'splat') this.modelRadius = Math.max(this.modelRadius || 0, maxDim);
     }
 
     try { this._applyRenderSettings(); }

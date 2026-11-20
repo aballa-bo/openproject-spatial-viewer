@@ -307,7 +307,7 @@
     // "1024, or the viewport if smaller" cap, applied to our own already-
     // verified 3-sigma value rather than adopting their differently-scaled
     // one, to change only what needed fixing.
-    '  float maxR = min(min(viewport.x, viewport.y), 1024.0);',
+    '  float maxR = min(min(viewport.x, viewport.y), uMaxRadius);', // uMaxRadius: 1024 normally, lower in VR (overdraw)
     '  float r1 = min(sqrt(lambda1) * 3.0, maxR);',
     '  float r2 = min(sqrt(lambda2) * 3.0, maxR);',
     '  vec2 screenOffsetPx = corner.x * eig1 * r1 + corner.y * eig2 * r2;',
@@ -379,6 +379,7 @@
     'uniform float uSelActive;',
     'uniform float uSplatScale;',
     'uniform float uMinAlpha;',
+    'uniform float uMaxRadius;',
     'uniform float uShDegree;',
     'uniform vec3 uShFlip;',
     'varying vec4 vColor;',
@@ -539,6 +540,7 @@
         uSelActive: { value: 0 },
         uSplatScale: { value: 1.0 },
         uMinAlpha: { value: 0.0 },
+        uMaxRadius: { value: 1024.0 },
         uShDegree: { value: 2.0 },
         uShFlip: { value: new THREE.Vector3(1, 1, 1) },
         uDepthMode: { value: 0.0 },
@@ -929,6 +931,7 @@
     'uniform float uSelActive;',
     'uniform float uSplatScale;',
     'uniform float uMinAlpha;',
+    'uniform float uMaxRadius;',
     'uniform float uShDegree;',
     'uniform vec3 uShFlip;',
     'varying vec4 vColor;',
@@ -1034,6 +1037,7 @@
         uSelActive: { value: 0 },
         uSplatScale: { value: 1.0 },
         uMinAlpha: { value: 0.0 },
+        uMaxRadius: { value: 1024.0 },
         uShDegree: { value: 2.0 },
         uShFlip: { value: new THREE.Vector3(1, 1, 1) },
         uDepthMode: { value: 0.0 },
