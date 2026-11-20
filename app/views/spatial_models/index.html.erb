@@ -40,9 +40,6 @@
           <tr>
             <td>
               <%= link_to model.title, project_spatial_model_path(model.project, model), class: 'font-weight-bold' %>
-              <% if model.is_default? %>
-                <span class="badge -success">Default</span>
-              <% end %>
               <div class="text-muted small"><%= model.description %></div>
             </td>
             <td>

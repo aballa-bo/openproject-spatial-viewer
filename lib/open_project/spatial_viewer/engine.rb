@@ -21,7 +21,7 @@ module OpenProject
                      public: true
 
           permission :manage_spatial_models,
-                     { spatial_models: %i[new create edit update destroy set_start_view],
+                     { spatial_models: %i[new create edit update destroy set_start_view set_saved_view],
                        spatial_layers: %i[create update destroy],
                        spatial_share_links: %i[index create destroy] },
                      permissible_on: :project,

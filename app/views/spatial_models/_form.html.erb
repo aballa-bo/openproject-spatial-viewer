@@ -21,9 +21,19 @@
     <% end %>
 
     <div class="form--field">
-      <%= f.label :is_default, class: 'form--label' %>
+      <%= f.label :latitude, class: 'form--label' %>
       <div class="form--field-container">
-        <%= f.check_box :is_default, class: 'form--check-box' %>
+        <%= f.number_field :latitude, step: 'any', min: -90, max: 90, class: 'form--text-field', placeholder: 'e.g. 44.4949' %>
+      </div>
+    </div>
+
+    <div class="form--field">
+      <%= f.label :longitude, class: 'form--label' %>
+      <div class="form--field-container">
+        <%= f.number_field :longitude, step: 'any', min: -180, max: 180, class: 'form--text-field', placeholder: 'e.g. 11.3426' %>
+        <p class="form--field-instructions">
+          Optional. When both are set, the viewer offers a map of the site (Google Maps).
+        </p>
       </div>
     </div>
   </div>

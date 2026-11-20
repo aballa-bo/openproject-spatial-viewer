@@ -54,6 +54,30 @@
       self._clearStartView();
     });
 
+    document.querySelectorAll('.js-set-saved-view').forEach(function(a) {
+      a.addEventListener('click', function(e) {
+        e.preventDefault();
+        if (navMenu) navMenu.classList.remove('show');
+        self._saveViewSlot(parseInt(a.dataset.slot, 10));
+      });
+    });
+    this._renderSavedViews();
+
+    var mapBtn = document.getElementById('btnMap');
+    var mapPanel = document.getElementById('svMapPanel');
+    var mapFrame = document.getElementById('svMapFrame');
+    if (mapBtn && mapPanel && mapFrame) {
+      var setMap = function(show) {
+        mapPanel.hidden = !show;
+        mapBtn.classList.toggle('active', show);
+        // Load the map only when first opened.
+        if (show && !mapFrame.getAttribute('src')) mapFrame.setAttribute('src', mapBtn.dataset.mapSrc);
+      };
+      mapBtn.addEventListener('click', function() { setMap(mapPanel.hidden); });
+      var mapClose = document.getElementById('svMapClose');
+      if (mapClose) mapClose.addEventListener('click', function() { setMap(false); });
+    }
+
     var clearBtn = document.getElementById('toolClear');
     if (clearBtn) clearBtn.addEventListener('click', function() {
       self.clearTempMarkup();
@@ -94,13 +118,10 @@
       if (clipX) clipX.value = 50; if (clipY) clipY.value = 50; if (clipZ) clipZ.value = 50;
     });
 
-    document.querySelectorAll('.tab-btn').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
-        document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
-        btn.classList.add('active');
-        var tt = document.getElementById(btn.dataset.tab);
-        if (tt) tt.classList.add('active');
+    document.querySelectorAll('.panel-toggle').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.preventDefault();
+        self.toggleSideTab(btn.dataset.tab);
       });
     });
 

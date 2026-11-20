@@ -16,6 +16,7 @@
       .then(function(data) {
         self.projectData = data;
         self.renderAnnotationsList(data.annotations);
+        if (self._renderSavedViews) self._renderSavedViews();
         self.renderWorkPackagesList(data.work_packages);
 
         var layers = (data.layers && data.layers.length) ? data.layers.slice() : [];
@@ -272,15 +273,8 @@
   SpatialViewerApp.prototype.setLayerVisible = function(id, visible) {
     this._fadeLayer(id, !!visible);
     if (this.layerMeta[id]) this.layerMeta[id].visible = !!visible;
-    // Persist for real layers (not the legacy "model" file).
-    if (id !== 'model' && this.apiUrl && !this._embedMode) {
-      var base = this.apiUrl.replace('/api_data', '/spatial_layers/' + id);
-      fetch(base, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': this.csrfToken },
-        body: JSON.stringify({ spatial_layer: { visible: !!visible } })
-      }).catch(function() {});
-    }
+    // Session-only: the layers shown when the viewer opens are set per layer
+    // on the model's edit page ("Visible by default").
   };
 
   // Turns a layer row into an inline editor (title, delete). Persisted through

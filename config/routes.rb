@@ -7,6 +7,7 @@ OpenProject::Application.routes.draw do
         get :api_data
         get :model_file
         patch :set_start_view
+        patch :set_saved_view
         get :download_exe
       end
       resources :spatial_layers, controller: 'spatial_layers', only: [:create, :update, :destroy] do

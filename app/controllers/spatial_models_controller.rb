@@ -3,14 +3,14 @@
 class SpatialModelsController < ApplicationController
   before_action :find_project_by_project_id
   before_action :authorize
-  before_action :find_model, only: %i[show edit update destroy api_data model_file set_start_view download_exe]
+  before_action :find_model, only: %i[show edit update destroy api_data model_file set_start_view set_saved_view download_exe]
   before_action :relax_csp_for_3d_viewer, only: :show
 
   menu_item :spatial_models
   layout 'base'
 
   def index
-    @models = SpatialModel.where(project: @project).includes(:uploader, :spatial_layers).order(is_default: :desc, created_at: :desc)
+    @models = SpatialModel.where(project: @project).includes(:uploader, :spatial_layers).order(created_at: :desc)
   end
 
   def show
@@ -129,6 +129,30 @@ class SpatialModelsController < ApplicationController
     render json: { success: false, error: e.message }, status: :unprocessable_entity
   end
 
+  # Stores (or, with { clear: true }, empties) one of the four saved views.
+  def set_saved_view
+    slot = params.require(:slot).to_i
+    unless slot.between?(1, SpatialModel::SAVED_VIEW_SLOTS)
+      return render json: { success: false, error: "invalid slot" }, status: :unprocessable_entity
+    end
+
+    if ActiveModel::Type::Boolean.new.cast(params[:clear])
+      @spatial_model.clear_saved_view(slot)
+    else
+      thumbnail = params[:thumbnail].to_s
+      unless thumbnail.start_with?("data:image/jpeg;base64,") && thumbnail.bytesize <= SpatialModel::MAX_VIEW_THUMBNAIL_BYTES
+        return render json: { success: false, error: "invalid thumbnail" }, status: :unprocessable_entity
+      end
+
+      position = params.require(:position).permit(:x, :y, :z).to_h
+      target = params.require(:target).permit(:x, :y, :z).to_h
+      @spatial_model.set_saved_view(slot:, position:, target:, thumbnail:)
+    end
+    render json: { success: true, saved_views: @spatial_model.saved_views }
+  rescue ActionController::ParameterMissing => e
+    render json: { success: false, error: e.message }, status: :unprocessable_entity
+  end
+
   def api_data
     annotations_json = @spatial_model.spatial_annotations
                                      .includes(:work_package, :author, :attachments, spatial_model: :project)
@@ -232,7 +256,7 @@ class SpatialModelsController < ApplicationController
   # so every textured model fails with "Refused to connect ... Content Security
   # Policy". Allow those two schemes for the viewer page.
   def relax_csp_for_3d_viewer
-    append_content_security_policy_directives(connect_src: %w[blob: data:])
+    append_content_security_policy_directives(connect_src: %w[blob: data:], frame_src: %w[https://www.google.com])
   end
 
   # nil for formats that render directly; otherwise the current server-side
@@ -311,6 +335,6 @@ class SpatialModelsController < ApplicationController
   end
 
   def model_params
-    params.require(:spatial_model).permit(:title, :description, :is_default)
+    params.require(:spatial_model).permit(:title, :description, :latitude, :longitude)
   end
 end

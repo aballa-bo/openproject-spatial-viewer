@@ -31,8 +31,8 @@
           <i class="icon-op-view-threed"></i> Views <i class="icon-arrow-down1"></i>
         </button>
         <div class="toolbar-dropdown-menu" id="viewsDropdownMenu">
-          <a href="#" data-view="top">Top View</a>
-          <a href="#" data-view="front">Front View</a>
+          <a href="#" data-view="top">Front View</a>
+          <a href="#" data-view="front">Top View</a>
           <a href="#" data-view="right">Right View</a>
           <a href="#" data-view="iso">Isometric (3D Iso)</a>
         </div>
@@ -51,6 +51,9 @@
           <div class="toolbar-dropdown-menu" id="navDropdownMenu">
             <a href="#" id="btnSetStartView"><i class="icon-milestone"></i> Set as start view</a>
             <a href="#" id="btnClearStartView"><i class="icon-delete"></i> Clear start view</a>
+            <% (1..4).each do |n| %>
+              <a href="#" class="js-set-saved-view" data-slot="<%= n %>"><i class="icon-milestone"></i> Set view <%= n %></a>
+            <% end %>
           </div>
         <% end %>
       </div>
@@ -60,21 +63,28 @@
       <button type="button" class="toolbar-btn tool-btn" id="toolLasso" title="Lasso / Region Selection on Mesh" aria-label="Lasso selection" data-tool="lasso">
         <i class="sv-icon-lasso"></i>
       </button>
-      <button type="button" class="toolbar-btn tool-btn" id="toolMeasure" title="Measure 3D Distance" data-tool="measure">
-        <i class="icon-ruler"></i> Measure
+      <button type="button" class="toolbar-btn tool-btn" id="toolMeasure" title="Measure 3D Distance" aria-label="Measure" data-tool="measure">
+        <i class="sv-icon-measure"></i>
       </button>
       <button type="button" class="toolbar-btn text-danger" id="toolClear" title="Clear Active Drawing">
         <i class="icon-delete"></i>
       </button>
+      <div class="saved-views" id="savedViews" data-can-set="<%= @can_set_start_view ? '1' : '0' %>"></div>
     </div>
 
     <div class="toolbar-section">
       <button type="button" class="toolbar-btn" id="btnWireframe" title="Toggle Wireframe">
         <i class="icon-view-model"></i>
       </button>
-      <button type="button" class="toolbar-btn" id="btnAnnotationLabels" title="Show / hide annotation label cards">
-        <i class="icon-flag"></i> Labels
+      <button type="button" class="toolbar-btn" id="btnAnnotationLabels" title="Show / hide annotation label cards" aria-label="Labels">
+        <i class="icon-flag"></i>
       </button>
+      <% if @spatial_model.location? && !@embed %>
+        <button type="button" class="toolbar-btn" id="btnMap" title="Show the site on a map" aria-label="Map"
+                data-map-src="https://www.google.com/maps?q=<%= @spatial_model.latitude.to_f %>,<%= @spatial_model.longitude.to_f %>&z=17&output=embed">
+          <i class="icon-location"></i>
+        </button>
+      <% end %>
       <button type="button" class="toolbar-btn" id="btnVR" title="Enter VR" style="display: none;">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true" focusable="false">
           <path d="M21 6H3a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h5.2a2 2 0 0 0 1.7-.9l1.3-2c.3-.45.95-.45 1.25 0l1.3 2a2 2 0 0 0 1.7.9H21a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zM7.5 14A2.5 2.5 0 1 1 10 11.5 2.5 2.5 0 0 1 7.5 14zm9 0a2.5 2.5 0 1 1 2.5-2.5 2.5 2.5 0 0 1-2.5 2.5z"/>
@@ -84,9 +94,13 @@
       <button type="button" class="toolbar-btn" id="btnAR" title="Enter AR (on-site, annotations only)" style="display: none;">
         <i class="icon-location"></i> AR
       </button>
-      <button type="button" class="toolbar-btn" id="btnSidePanelToggle" title="Toggle Side Panel">
-        <i class="icon-task"></i> Info (<span id="annotationCountHeader"><%= @annotations.count %></span>)
-      </button>
+      <span class="panel-toggle-group" role="group" aria-label="Side panels">
+        <button type="button" class="toolbar-btn panel-toggle" data-tab="annotationsTab" title="3D Annotations" aria-label="3D Annotations"><i class="sv-icon-postit"></i></button>
+        <button type="button" class="toolbar-btn panel-toggle" data-tab="workPackagesTab" title="Work Packages" aria-label="Work Packages"><i class="icon-work-packages"></i></button>
+        <button type="button" class="toolbar-btn panel-toggle" id="tabBtnLayers" data-tab="layerPanel" title="Layers" aria-label="Layers" style="display: none;"><i class="sv-icon-layers"></i></button>
+        <button type="button" class="toolbar-btn panel-toggle" data-tab="renderPanel" title="Render quality" aria-label="Render quality"><i class="icon-settings2"></i></button>
+        <button type="button" class="toolbar-btn panel-toggle" data-tab="slicingPanel" title="3D Section Planes" aria-label="3D Section Planes"><i class="icon-cut"></i></button>
+      </span>
       <% if @unity_player_available %>
         <a href="<%= download_exe_project_spatial_model_path(@project, @spatial_model) %>" class="toolbar-btn" title="Download a standalone Windows app (Unity) with this model">
           <i class="icon-download"></i> Download as .exe
@@ -97,6 +111,12 @@
 
   <div class="spatial-main-container">
     <div class="spatial-viewport" id="spatialViewport">
+      <% if @spatial_model.location? && !@embed %>
+        <div class="sv-map-panel" id="svMapPanel" hidden>
+          <button type="button" class="sv-map-close" id="svMapClose" title="Close map" aria-label="Close map">&times;</button>
+          <iframe id="svMapFrame" title="Map" loading="lazy" referrerpolicy="no-referrer-when-downgrade" allowfullscreen></iframe>
+        </div>
+      <% end %>
       <div class="viewer-loader" id="viewerLoader">
         <div class="spinner"></div>
         <div class="loader-text" id="loaderText">Loading 3D model...</div>
@@ -138,14 +158,6 @@
     </div>
 
     <div class="spatial-side-panel" id="spatialSidePanel">
-      <div class="side-panel-tabs">
-        <button type="button" class="tab-btn active" data-tab="annotationsTab" title="3D Annotations"><i class="icon-notes"></i></button>
-        <button type="button" class="tab-btn" data-tab="workPackagesTab" title="Work Packages"><i class="icon-work-packages"></i></button>
-        <button type="button" class="tab-btn" id="tabBtnLayers" data-tab="layerPanel" title="Layers" style="display: none;"><i class="sv-icon-layers"></i></button>
-        <button type="button" class="tab-btn" data-tab="renderPanel" title="Render quality"><i class="icon-settings2"></i></button>
-        <button type="button" class="tab-btn" data-tab="slicingPanel" title="3D Section Planes"><i class="icon-cut"></i></button>
-      </div>
-
       <div class="tab-content active" id="annotationsTab">
         <div class="annotations-list" id="annotationsList"></div>
       </div>
@@ -245,6 +257,20 @@
               <span>Hide faint splats below <b id="rqSplatMinAlphaVal">0.00</b></span>
               <input type="range" id="rqSplatMinAlpha" min="0" max="0.6" step="0.01" value="0">
             </label>
+            <label class="render-row">
+              <span>Display</span>
+              <select id="rqSplatDepth" class="form-select">
+                <option value="0">Colour</option>
+                <option value="1">Depth map (heat map)</option>
+              </select>
+            </label>
+            <div id="rqSplatDepthRow" style="display:none">
+              <label class="render-row -range">
+                <span>Depth range <b id="rqSplatDepthRangeVal">100</b>% of near&ndash;far</span>
+                <input type="range" id="rqSplatDepthRange" min="0.1" max="1" step="0.05" value="1">
+              </label>
+              <div class="sv-depth-legend" aria-hidden="true"><span>near</span><i></i><span>far</span></div>
+            </div>
             <label class="render-row">
               <span>View-dependent colour</span>
               <select id="rqSplatSh" class="form-select">

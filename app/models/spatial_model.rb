@@ -16,6 +16,10 @@ class SpatialModel < ApplicationRecord
   validates :uploader, presence: true
   validates :model_format, inclusion: { in: %w[gltf glb obj gaussian_splat ply splat ksplat sog ifc] }
 
+  validates :latitude, numericality: { greater_than_or_equal_to: -90, less_than_or_equal_to: 90 }, allow_nil: true
+  validates :longitude, numericality: { greater_than_or_equal_to: -180, less_than_or_equal_to: 180 }, allow_nil: true
+  validate :location_is_complete
+
   scope :defaults, -> { where(is_default: true) }
 
   # Formats that cannot be rendered directly by the WebGL viewer and are
@@ -104,6 +108,35 @@ class SpatialModel < ApplicationRecord
     update_column(:settings, merged) # rubocop:disable Rails/SkipsModelValidations
   end
 
+  def location?
+    latitude.present? && longitude.present?
+  end
+
+  SAVED_VIEW_SLOTS = 4
+  MAX_VIEW_THUMBNAIL_BYTES = 120_000
+
+  # Up to four named camera views (slots 1..4), each with a small JPEG
+  # thumbnail (data URL). Array of SAVED_VIEW_SLOTS entries, nil = empty slot.
+  def saved_views
+    list = (settings || {})["saved_views"]
+    list = [] unless list.is_a?(Array)
+    Array.new(SAVED_VIEW_SLOTS) { |i| list[i].is_a?(Hash) ? list[i] : nil }
+  end
+
+  def set_saved_view(slot:, position:, target:, thumbnail:)
+    views = saved_views
+    views[slot - 1] = {
+      "position" => vec3_attrs(position), "target" => vec3_attrs(target), "thumbnail" => thumbnail
+    }
+    update_column(:settings, (settings || {}).merge("saved_views" => views)) # rubocop:disable Rails/SkipsModelValidations
+  end
+
+  def clear_saved_view(slot)
+    views = saved_views
+    views[slot - 1] = nil
+    update_column(:settings, (settings || {}).merge("saved_views" => views)) # rubocop:disable Rails/SkipsModelValidations
+  end
+
   def converted_file_ready?
     return false unless needs_conversion? && model_attachment.present?
 
@@ -155,6 +188,12 @@ class SpatialModel < ApplicationRecord
     FileUtils.rm_rf(conversion_dir.to_s) if id.present?
   rescue StandardError => e
     Rails.logger.warn("[SpatialViewer] Could not remove converted files for ##{id}: #{e.message}")
+  end
+
+  def location_is_complete
+    return if latitude.present? == longitude.present?
+
+    errors.add(:base, "Latitude and longitude must be filled in together")
   end
 
   def vec3_attrs(h)

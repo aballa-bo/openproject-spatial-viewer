@@ -23,7 +23,28 @@
     var line = new THREE.Line(geom, mat);
     line.computeLineDistances();
     this.tempMarkupGroup.add(line);
-    this.openAnnotationModal({ type: 'measurement', points: [{x:ptA.x,y:ptA.y,z:ptA.z},{x:ptB.x,y:ptB.y,z:ptB.z}], dist: dist });
+    // Result only: a small modal, no work package is created. The dashed line
+    // stays on screen until the dialog is dismissed.
+    var self = this;
+    var back = document.createElement('div');
+    back.className = 'sv-measure-backdrop';
+    back.innerHTML = '<div class="sv-measure-modal" role="dialog" aria-modal="true">' +
+      '<div class="sv-measure-label">Distance</div>' +
+      '<div class="sv-measure-value"></div>' +
+      '<button type="button" class="button -primary">OK</button></div>';
+    back.querySelector('.sv-measure-value').textContent = dist + ' m';
+    var close = function() {
+      if (back.parentNode) back.parentNode.removeChild(back);
+      self.tempMarkupGroup.remove(line);
+      geom.dispose(); mat.dispose();
+      document.removeEventListener('keydown', onKey, true);
+    };
+    var onKey = function(e) { if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); close(); } };
+    back.addEventListener('click', function(e) { if (e.target === back) close(); });
+    back.querySelector('button').addEventListener('click', close);
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(back);
+    back.querySelector('button').focus();
   };
 
   SpatialViewerApp.prototype.captureSnapshot = function() {
@@ -146,11 +167,7 @@
       sp.style.width = '0px';
     }
 
-    var btn = document.getElementById('btnSidePanelToggle');
-    if (btn) {
-      if (open) btn.classList.add('active');
-      else btn.classList.remove('active');
-    }
+    syncPanelButtons();
     if (app) {
       app._panelOpen = open;
       if (app._resizeHandler) app._resizeHandler();
@@ -160,6 +177,37 @@
       ' (display=' + cs.display + ', width=' + cs.width + ')');
   }
 
+  // Toolbar toggles: a button is lit iff the panel is open AND it is the tab
+  // currently shown, so the five stay mutually exclusive and in sync.
+  function syncPanelButtons() {
+    var open = isSidePanelOpen();
+    var act = document.querySelector('.tab-content.active');
+    var id = act ? act.id : null;
+    document.querySelectorAll('.panel-toggle').forEach(function(b) {
+      b.classList.toggle('active', open && b.dataset.tab === id);
+    });
+  }
+
+  function activateTab(id) {
+    document.querySelectorAll('.tab-content').forEach(function(c) {
+      c.classList.toggle('active', c.id === id);
+    });
+  }
+
+  // Always shows the given tab (opening the panel if needed).
+  SpatialViewerApp.prototype.showSideTab = function(id) {
+    activateTab(id);
+    if (isSidePanelOpen()) syncPanelButtons();
+    else setSidePanelOpen(true, this._panelWidth);
+  };
+
+  // Toolbar click: second press on the tab being shown hides the panel.
+  SpatialViewerApp.prototype.toggleSideTab = function(id) {
+    var act = document.querySelector('.tab-content.active');
+    if (isSidePanelOpen() && act && act.id === id) setSidePanelOpen(false);
+    else this.showSideTab(id);
+  };
+
   SpatialViewerApp.prototype._initSidePanel = function() {
     var self = this;
     var sp = document.getElementById('spatialSidePanel');
@@ -167,18 +215,6 @@
     this.sidePanel = sp;
     this._panelWidth = panelWidthPref();
     setSidePanelOpen(isSidePanelOpen(), this._panelWidth);
-
-    // Bind once, and deliberately NOT through the app instance: the handler
-    // only talks to the DOM, so a stale viewer instance cannot break it.
-    var btn = document.getElementById('btnSidePanelToggle');
-    if (btn && btn.dataset.spatialToggleBound !== '1') {
-      btn.dataset.spatialToggleBound = '1';
-      btn.addEventListener('click', function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        setSidePanelOpen(!isSidePanelOpen());
-      });
-    }
 
     if (!sp.querySelector('.side-panel-resizer')) {
       var grip = document.createElement('div');
@@ -467,8 +503,7 @@
         }
         var c = document.getElementById('annotationCountHeader');
         if (c) c.innerText = self.projectData.annotations.length;
-        var annTab = document.querySelector('.tab-btn[data-tab="annotationsTab"]');
-        if (annTab) annTab.click();
+    XX
       } else {
         alert('Save error: ' + (result.errors || []).join(', '));
       }
@@ -1431,8 +1466,7 @@
     if (panel) panel.classList.remove('detailing');
     this._setLassoHighlight(null);
     this._selectedLassoAnnotation = null;
-    var annTab = document.querySelector('.tab-btn[data-tab="annotationsTab"]');
-    if (annTab) annTab.click();
+    this.showSideTab('annotationsTab');
   };
 
   // Persist the updated annotation into projectData + refresh the views.

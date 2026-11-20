@@ -73,6 +73,8 @@
     splatSize: 1.0,       // multiplier on every Gaussian's extent
     splatMinAlpha: 0.0,   // hide Gaussians whose own opacity is below this
     splatSh: 2,           // view-dependent colour: 0 off, 1 degree 1, 2 degree 1+2
+    splatDepth: 0,        // 1 = depth heat map instead of colour
+    splatDepthRange: 1,   // fraction of the near-far span the ramp covers
     splatShFix: true      // flip the SH view direction like the splat itself is flipped at load
   };
   var RENDER_STORE_KEY = 'spatialViewer.render';
@@ -607,6 +609,127 @@
       .catch(function() { window.alert('Network error while clearing the start view.'); });
   };
 
+  // ---- Saved views (slots 1..4) -------------------------------------------
+  SpatialViewerApp.prototype._savedViews = function() {
+    var st = this.projectData && this.projectData.settings;
+    var v = st && st.saved_views;
+    return Array.isArray(v) ? v : [];
+  };
+
+  // Small JPEG of the current camera view, cropped to the thumbnail ratio.
+  SpatialViewerApp.prototype._captureViewThumb = function() {
+    var src = this.renderer.domElement;
+    this.renderer.render(this.scene, this.camera);
+    var W = 192, H = 120, c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    var sw = src.width, sh = src.height, r = W / H, cw = sw, ch = sw / r;
+    if (ch > sh) { ch = sh; cw = sh * r; }
+    var ctx = c.getContext('2d');
+    ctx.fillStyle = '#222'; ctx.fillRect(0, 0, W, H);
+    ctx.drawImage(src, (sw - cw) / 2, (sh - ch) / 2, cw, ch, 0, 0, W, H);
+    return c.toDataURL('image/jpeg', 0.7);
+  };
+
+  SpatialViewerApp.prototype._patchSavedView = function(body, errMsg, done) {
+    var self = this;
+    if (!this.apiUrl) return;
+    fetch(this.apiUrl.replace('/api_data', '/set_saved_view'), {
+      method: 'PATCH',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': this.csrfToken },
+      body: JSON.stringify(body)
+    })
+      .then(function(r) { return r.json().catch(function() { return {}; }); })
+      .then(function(res) {
+        if (!res || !res.success) { window.alert(errMsg); return; }
+        if (self.projectData) {
+          self.projectData.settings = self.projectData.settings || {};
+          self.projectData.settings.saved_views = res.saved_views;
+        }
+        self._renderSavedViews();
+        if (done) done();
+      })
+      .catch(function() { window.alert('Network error: ' + errMsg); });
+  };
+
+  SpatialViewerApp.prototype._saveViewSlot = function(slot) {
+    var pos = this.camera.position, tgt = this.controls.target;
+    var self = this;
+    this._patchSavedView({
+      slot: slot,
+      position: { x: pos.x, y: pos.y, z: pos.z },
+      target: { x: tgt.x, y: tgt.y, z: tgt.z },
+      thumbnail: this._captureViewThumb()
+    }, 'Could not save view ' + slot + '.', function() {
+      self._flashTooltip('View ' + slot + ' saved.');
+    });
+  };
+
+  SpatialViewerApp.prototype._clearViewSlot = function(slot) {
+    this._patchSavedView({ slot: slot, clear: true }, 'Could not clear view ' + slot + '.');
+  };
+
+  SpatialViewerApp.prototype._goToSavedView = function(slot) {
+    var v = this._savedViews()[slot - 1];
+    if (!v || !v.position || !v.target) return;
+    var self = this;
+    var p0 = this.camera.position.clone(), t0 = this.controls.target.clone();
+    var p1 = new THREE.Vector3(v.position.x, v.position.y, v.position.z);
+    var t1 = new THREE.Vector3(v.target.x, v.target.y, v.target.z);
+    var k = 0;
+    (function step() {
+      k = Math.min(1, k + 0.06);
+      self.camera.position.lerpVectors(p0, p1, k);
+      self.controls.target.lerpVectors(t0, t1, k);
+      self.controls.update();
+      if (k < 1) requestAnimationFrame(step);
+    })();
+  };
+
+  SpatialViewerApp.prototype._renderSavedViews = function() {
+    var self = this;
+    var box = document.getElementById('savedViews');
+    if (!box) return;
+    var canSet = box.dataset.canSet === '1';
+    var views = this._savedViews();
+    box.innerHTML = '';
+    // Viewers who cannot set views only see the ones that exist.
+    if (!canSet && !views.some(function(v) { return v; })) return;
+    for (var i = 1; i <= 4; i++) {
+      (function(slot) {
+        var v = views[slot - 1];
+        if (!v && !canSet) return;
+        var cell = document.createElement('div');
+        cell.className = 'saved-view' + (v ? '' : ' empty');
+        if (v) {
+          cell.setAttribute('role', 'button');
+          cell.title = 'View ' + slot;
+          var img = document.createElement('img');
+          img.src = v.thumbnail; img.alt = 'View ' + slot;
+          cell.appendChild(img);
+          var num = document.createElement('span');
+          num.className = 'saved-view-num'; num.textContent = slot;
+          cell.appendChild(num);
+          if (canSet) {
+            var x = document.createElement('span');
+            x.className = 'saved-view-clear'; x.textContent = '\u00d7'; x.title = 'Clear view ' + slot;
+            x.addEventListener('click', function(e) { e.stopPropagation(); self._clearViewSlot(slot); });
+            cell.appendChild(x);
+          }
+          cell.addEventListener('click', function() { self._goToSavedView(slot); });
+        } else {
+          var add = document.createElement('button');
+          add.type = 'button'; add.className = 'saved-view-add';
+          add.textContent = '+'; add.title = 'Save the current view as view ' + slot;
+          add.setAttribute('aria-label', 'Save current view as view ' + slot);
+          add.addEventListener('click', function() { self._saveViewSlot(slot); });
+          cell.appendChild(add);
+        }
+        box.appendChild(cell);
+      })(i);
+    }
+  };
+
   // Brief status message reusing the drawing tooltip box.
   SpatialViewerApp.prototype._flashTooltip = function(text) {
     this.showTooltip(text);
@@ -628,11 +751,17 @@
       if (u.uSplatScale) u.uSplatScale.value = s.splatSize > 0 ? s.splatSize : 1;
       if (u.uMinAlpha) u.uMinAlpha.value = s.splatMinAlpha > 0 ? s.splatMinAlpha : 0;
       if (u.uShDegree) u.uShDegree.value = Number(s.splatSh);
+      if (u.uDepthMode) u.uDepthMode.value = Number(s.splatDepth) ? 1 : 0;
+      if (u.uDepthK) u.uDepthK.value = s.splatDepthRange > 0 ? s.splatDepthRange : 1;
       if (u.uShFlip) {
         if (s.splatShFix && sr.needsShFlip) u.uShFlip.value.set(1, -1, -1);
         else u.uShFlip.value.set(1, 1, 1);
       }
     });
+    var dRow = document.getElementById('rqSplatDepthRow');
+    if (dRow) dRow.style.display = Number(s.splatDepth) ? '' : 'none';
+    var dVal = document.getElementById('rqSplatDepthRangeVal');
+    if (dVal) dVal.textContent = Math.round(Number(s.splatDepthRange) * 100);
     this._updateRenderSections();
   };
 
@@ -683,6 +812,10 @@
     set('rqSplatSize', s.splatSize);
     set('rqSplatMinAlpha', s.splatMinAlpha);
     set('rqSplatSh', String(s.splatSh));
+    set('rqSplatDepth', String(s.splatDepth));
+    set('rqSplatDepthRange', s.splatDepthRange);
+    var sdv = document.getElementById('rqSplatDepthRangeVal'); if (sdv) sdv.textContent = Math.round(Number(s.splatDepthRange) * 100);
+    var sdr = document.getElementById('rqSplatDepthRow'); if (sdr) sdr.style.display = Number(s.splatDepth) ? '' : 'none';
     check('rqSplatShFix', s.splatShFix);
     var sov = document.getElementById('rqSplatOpacityVal'); if (sov) sov.textContent = Number(s.splatOpacity).toFixed(2);
     var ssv = document.getElementById('rqSplatSizeVal'); if (ssv) ssv.textContent = Number(s.splatSize).toFixed(2);
@@ -725,6 +858,8 @@
     bind('rqSplatSize', 'splatSize', 'range');
     bind('rqSplatMinAlpha', 'splatMinAlpha', 'range');
     bind('rqSplatSh', 'splatSh', 'select');
+    bind('rqSplatDepth', 'splatDepth', 'select');
+    bind('rqSplatDepthRange', 'splatDepthRange', 'range');
     bind('rqSplatShFix', 'splatShFix', 'check');
 
     // Up axis is a property of the model, not a global render setting: kept

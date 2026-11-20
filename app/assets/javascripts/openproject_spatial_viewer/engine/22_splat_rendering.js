@@ -346,6 +346,7 @@
     '  }',
     '  col *= selFactor;',
     '  vColor = vec4(clamp(col, 0.0, 1.0), colorOpacity.a);',
+    '  vDepth = -zc;',  // view-space distance, for the depth heat map
     '  vPos = corner * 3.0;', // corner in {-1..1} along each ellipse axis -> *3 = "how many sigma", since r1/r2 above already encode the 3-sigma extent
     '}'
   ];
@@ -382,6 +383,7 @@
     'uniform vec3 uShFlip;',
     'varying vec4 vColor;',
     'varying vec2 vPos;',
+    'varying float vDepth;',
     'void main() {'
   ].concat(SPLAT_VERTEX_MAIN_BODY).join('\n');
 
@@ -411,6 +413,14 @@
     'uniform float linearColor;',
     'varying vec4 vColor;',
     'varying vec2 vPos;',
+    'varying float vDepth;',
+    'uniform float uDepthMode;',  // 0 = colour, 1 = depth heat map
+    'uniform vec2 uDepthRange;',  // view-space near/far mapped to the ends of the ramp
+    // Jet-style ramp, red (near) -> yellow -> green -> cyan -> blue (far).
+    'vec3 depthHeat(float t) {',
+    '  float x = 1.0 - clamp(t, 0.0, 1.0);',
+    '  return clamp(vec3(1.5 - abs(4.0 * x - 3.0), 1.5 - abs(4.0 * x - 2.0), 1.5 - abs(4.0 * x - 1.0)), 0.0, 1.0);',
+    '}',
     'void main() {',
     '  float r2 = dot(vPos, vPos);',
     '  if (r2 > 9.0) discard;', // outside the 3-sigma ellipse
@@ -418,7 +428,9 @@
     '  float a = vColor.a * falloff * opacity;',
     '  if (a < 0.01) discard;',
     '  vec3 outColor = clamp(vColor.rgb * exposure, 0.0, 1.0);',
-    '  if (linearColor > 0.5) {',
+    '  if (uDepthMode > 0.5) {',
+    '    outColor = depthHeat((vDepth - uDepthRange.x) / max(uDepthRange.y - uDepthRange.x, 1e-4));',
+    '  } else if (linearColor > 0.5) {',
     '    vec3 lo = outColor * 12.92;',
     '    vec3 hi = 1.055 * pow(outColor, vec3(1.0 / 2.4)) - 0.055;',
     '    outColor = mix(lo, hi, step(vec3(0.0031308), outColor));',
@@ -528,7 +540,10 @@
         uSplatScale: { value: 1.0 },
         uMinAlpha: { value: 0.0 },
         uShDegree: { value: 2.0 },
-        uShFlip: { value: new THREE.Vector3(1, 1, 1) }
+        uShFlip: { value: new THREE.Vector3(1, 1, 1) },
+        uDepthMode: { value: 0.0 },
+        uDepthK: { value: 1.0 },
+        uDepthRange: { value: new THREE.Vector2(0.1, 100) }
       },
       vertexShader: SPLAT_VERTEX_SHADER,
       fragmentShader: SPLAT_FRAGMENT_SHADER,
@@ -805,6 +820,25 @@
     this._dirty = false;
   };
 
+  // Depth heat-map range: the span of view-space distances the splat cloud
+  // occupies from this camera (bounding sphere), shrunk from the far end by
+  // uDepthK so a few distant outliers do not flatten the whole ramp.
+  var _depthCenter = null;
+  function updateDepthRange(mesh, camera) {
+    var u = mesh.material.uniforms;
+    if (!u.uDepthMode || u.uDepthMode.value < 0.5) return;
+    var bs = mesh.geometry && mesh.geometry.boundingSphere;
+    if (!bs) return;
+    if (!_depthCenter) _depthCenter = new THREE.Vector3();
+    mesh.updateMatrixWorld();
+    _depthCenter.copy(bs.center).applyMatrix4(mesh.matrixWorld);
+    var sc = mesh.matrixWorld.getMaxScaleOnAxis();
+    var r = bs.radius * sc;
+    var d = camera.position.distanceTo(_depthCenter);
+    var near = Math.max(0.05, d - r), far = d + r;
+    u.uDepthRange.value.set(near, near + (far - near) * u.uDepthK.value);
+  }
+
   // projCamera (optional) supplies the projection matrix used for the
   // focal/viewport uniforms -- normally the same as camera, but during a
   // WebXR session the caller passes one eye's sub-camera here instead (see
@@ -821,6 +855,7 @@
       pc.projectionMatrix.elements[5] * viewportH * 0.5
     );
     u.viewport.value.set(viewportW, viewportH);
+    updateDepthRange(this.mesh, camera);
     this.maybeResort(camera);
   };
 
@@ -898,6 +933,7 @@
     'uniform vec3 uShFlip;',
     'varying vec4 vColor;',
     'varying vec2 vPos;',
+    'varying float vDepth;',
     // Exact texel-center UV for a row-major, index = row*texSize.x + col
     // layout -- texture2D at an exact texel center with NEAREST filtering
     // reliably returns that one texel, independent of texture size.
@@ -1000,6 +1036,9 @@
         uMinAlpha: { value: 0.0 },
         uShDegree: { value: 2.0 },
         uShFlip: { value: new THREE.Vector3(1, 1, 1) },
+        uDepthMode: { value: 0.0 },
+        uDepthK: { value: 1.0 },
+        uDepthRange: { value: new THREE.Vector2(0.1, 100) },
         texSize: { value: new THREE.Vector2(W, H) },
         texCenter: { value: texCenter },
         texCovA: { value: texCovA },
@@ -1111,6 +1150,7 @@
       pc.projectionMatrix.elements[5] * viewportH * 0.5
     );
     u.viewport.value.set(viewportW, viewportH);
+    updateDepthRange(this.mesh, camera);
     this.maybeResort(camera);
   };
 

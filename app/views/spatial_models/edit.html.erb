@@ -17,7 +17,7 @@
   <h2><%= t('spatial_viewer.layers_title', default: 'Model layers') %></h2>
   <p class="text-muted">
     <%= t('spatial_viewer.layers_help',
-          default: 'Upload each format of this model as a separate layer — IFC, mesh (obj/glb/gltf, .zip if it has textures), point cloud (las/laz/e57, or .ply), gaussian splatting (ply/splat/sog) — a .ply can be a mesh, a point cloud or a splat. Every file must already be in the same scale and coordinate system. In the 3D viewer you can then show or hide each layer.') %>
+          default: 'Upload each format of this model as a separate layer — IFC, mesh (obj/glb/gltf, .zip if it has textures), point cloud (las/laz/e57, or .ply), gaussian splatting (ply/splat/sog) — a .ply can be a mesh, a point cloud or a splat. Every file must already be in the same scale and coordinate system. In the 3D viewer you can then show or hide each layer; the layers ticked "Visible by default" are the ones shown when the viewer opens.') %>
   </p>
 
   <% legacy = @spatial_model.model_attachment %>
@@ -29,6 +29,7 @@
         <th>Format</th>
         <th>Size</th>
         <th>Status</th>
+        <th title="Layers ticked here are shown when the viewer opens">Visible by default</th>
         <th class="generic-table--actions-header"></th>
       </tr>
     </thead>
@@ -40,6 +41,7 @@
           <td><span class="badge -primary"><%= @spatial_model.model_format.upcase %></span></td>
           <td class="text-muted small"><%= @spatial_model.formatted_size %></td>
           <td class="text-muted small">legacy file — re-upload it as a layer to manage it here</td>
+          <td></td>
           <td></td>
         </tr>
       <% end %>
@@ -56,6 +58,7 @@
               ready
             <% end %>
           </td>
+          <td><input type="checkbox" class="layer-default-visible" <%= 'checked' if layer.visible %> aria-label="Visible by default"></td>
           <td class="buttons">
             <button type="button" class="button -transparent icon icon-delete text-danger layer-delete" title="Remove layer"></button>
           </td>

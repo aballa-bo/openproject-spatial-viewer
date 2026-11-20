@@ -31,6 +31,7 @@
         '<td></td><td></td><td><span class="badge -primary"></span></td>' +
         '<td class="text-muted small"></td>' +
         '<td class="layer-status text-muted small"></td>' +
+        '<td><input type="checkbox" class="layer-default-visible" checked aria-label="Visible by default"></td>' +
         '<td class="buttons"><button type="button" class="button -transparent icon icon-delete text-danger layer-delete" title="Remove layer"></button></td>';
       tr.children[0].textContent = layer.title;
       tr.children[1].textContent = layer.kind;
@@ -38,6 +39,7 @@
       tr.children[3].textContent = layer.file_size ? (layer.file_size / 1048576).toFixed(2) + ' MB' : '';
       rows.appendChild(tr);
       bindDelete(tr);
+      bindDefaultVisible(tr);
       refreshStatus(tr, layer);
     }
 
@@ -67,6 +69,27 @@
         .catch(function () { setTimeout(function () { pollStatus(tr); }, 15000); });
     }
 
+    function bindDefaultVisible(tr) {
+      var box = tr.querySelector('.layer-default-visible');
+      if (!box) return;
+      box.addEventListener('change', function () {
+        var want = box.checked;
+        box.disabled = true;
+        fetch(baseUrl + '/' + tr.dataset.layerId, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+          credentials: 'same-origin',
+          body: JSON.stringify({ spatial_layer: { visible: want } })
+        })
+          .then(function (r) { return r.json().catch(function () { return {}; }); })
+          .then(function (res) {
+            box.disabled = false;
+            if (!(res && res.success)) { box.checked = !want; window.alert('Could not save the setting.'); }
+          })
+          .catch(function () { box.disabled = false; box.checked = !want; });
+      });
+    }
+
     function bindDelete(tr) {
       var del = tr.querySelector('.layer-delete');
       if (!del) return;
@@ -89,6 +112,7 @@
 
     Array.prototype.forEach.call(rows.querySelectorAll('tr[data-layer-id]'), function (tr) {
       bindDelete(tr);
+      bindDefaultVisible(tr);
       if ((tr.querySelector('.layer-status') || {}).textContent &&
           /pending|processing|converting/i.test(tr.querySelector('.layer-status').textContent)) {
         setTimeout(function () { pollStatus(tr); }, 4000);
