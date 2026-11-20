@@ -177,7 +177,8 @@ class SpatialModelsController < ApplicationController
       settings: @spatial_model.settings,
       annotations: annotations_json,
       work_packages: work_packages_json,
-      can_annotate: User.current.allowed_in_project?(:create_spatial_annotations, @project)
+      can_annotate: User.current.allowed_in_project?(:create_spatial_annotations, @project),
+      can_manage: User.current.allowed_in_project?(:manage_spatial_models, @project)
     }
   end
 
@@ -211,6 +212,7 @@ class SpatialModelsController < ApplicationController
         id: layer.id,
         title: layer.title,
         kind: layer.kind,
+        position: layer.position,
         source_format: layer.source_format,
         format: layer.viewer_format,
         visible: layer.visible,

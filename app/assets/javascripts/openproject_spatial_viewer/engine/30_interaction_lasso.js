@@ -362,12 +362,36 @@
     });
   };
 
-  SpatialViewerApp.prototype._raycastAt = function(clientX, clientY) {
+  // What a lasso may select, given the layers currently shown:
+  //   1. the photogrammetric mesh, if one is visible;
+  //   2. otherwise the IFC, if one is visible;
+  //   3. point-cloud (lidar) points ONLY when the point cloud is the only kind
+  //      of layer on screen;
+  //   4. Gaussian splats ONLY when the splat is the only kind on screen.
+  // A splat (or scan) shown together with a mesh/IFC is never selected: the
+  // lasso goes through it onto the surface behind. Anything else -- e.g. a
+  // point cloud shown together with a splat -- is ambiguous, so nothing is
+  // selectable (the user is told to show one of them alone).
+  SpatialViewerApp.prototype._selectionTargets = function() {
+    var vis = this._visibleRaycastTargets();
+    var by = { mesh: [], ifc: [], pointcloud: [], splat: [] };
+    vis.forEach(function(m) {
+      var k = m.userData && m.userData.layerKind;
+      if (k && by[k]) by[k].push(m);
+    });
+    if (by.mesh.length) return by.mesh;
+    if (by.ifc.length) return by.ifc;
+    var kinds = ['pointcloud', 'splat'].filter(function(k) { return by[k].length; });
+    if (kinds.length === 1) return by[kinds[0]];
+    return [];
+  };
+
+  SpatialViewerApp.prototype._raycastAt = function(clientX, clientY, selection) {
     var rect = this.canvas.getBoundingClientRect();
     this.mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
     this.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.mouse, this.camera);
-    var intersects = this.raycaster.intersectObjects(this._visibleRaycastTargets(), true);
+    var intersects = this.raycaster.intersectObjects(selection ? this._selectionTargets() : this._visibleRaycastTargets(), true);
     if (!intersects.length) return null;
 
     // Prefer the nearest FRONT-facing hit over the raw nearest one.
@@ -488,6 +512,10 @@
     if (this.currentTool === 'orbit' || e.button !== 0) return;
 
     var isLasso = this.currentTool === 'lasso';
+    if (isLasso && !this._selectionTargets().length && this._visibleRaycastTargets().length) {
+      this.showTooltip('Nothing to select here: show the photogrammetry or IFC layer, or show only the point cloud (or only the splat).');
+      return;
+    }
 
     // The lasso needs no surface hit to start — it is a screen gesture.
     var hit = isLasso ? null : this.getIntersection(e);
@@ -749,7 +777,7 @@
     var anyHit = false;
     for (var i = 0; i < count; i++) {
       var p = path[Math.min(n - 1, Math.floor(i * stride))];
-      var hit = this._raycastAt(rect.left + p.x, rect.top + p.y); // also aims this.raycaster.ray at this pixel
+      var hit = this._raycastAt(rect.left + p.x, rect.top + p.y, true); // also aims this.raycaster.ray at this pixel
       if (hit) { pts[i] = this._surfacePoint(hit); anyHit = true; }
       else { pts[i] = null; planeFallback[i] = this.raycaster.ray.intersectPlane(plane, new THREE.Vector3()); }
     }
@@ -856,7 +884,7 @@
         var px = minX + gx * stepX;
         var idx = gy * cols + gx;
         if (!pointInPolygon(px, py, poly)) { grid[idx] = null; continue; }
-        var hit = this._raycastAt(rect.left + px, rect.top + py);
+        var hit = this._raycastAt(rect.left + px, rect.top + py, true);
         if (hit) { grid[idx] = hit.point.clone(); any = true; } else { grid[idx] = null; }
       }
     }

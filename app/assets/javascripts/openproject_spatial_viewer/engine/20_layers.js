@@ -38,6 +38,11 @@
 
   SpatialViewerApp.prototype._startLayerLoading = function(layers) {
     var self = this;
+    // An IFC layer that coexists with non-IFC layers is shown Z-up like them
+    // (see onModelLoaded); an IFC-only model keeps the glTF Y-up convention.
+    this._ifcSharesFrameWithScans =
+      layers.some(function(l) { return l.kind === 'ifc'; }) &&
+      layers.some(function(l) { return l.kind && l.kind !== 'ifc'; });
     // The currently hovered mesh part (if any) is about to be torn down
     // with the rest of the old layer -- drop the hover state (and its
     // cloned material / halo mesh) before that happens, not after.
@@ -62,6 +67,8 @@
     this._layerTotal = layers.length;
     this._layerIndex = 0;
     layers.forEach(function(l) { self.layerMeta[l.id] = l; });
+    // Display order (object keys can't carry it: integer-like ids sort numerically).
+    this._layerOrder = layers.map(function(l) { return String(l.id); });
 
     var heavyMb = parseInt(this.container.dataset.heavyModelMb, 10) || 40;
     var maxSize = 0;
@@ -276,6 +283,100 @@
     }
   };
 
+  // Turns a layer row into an inline editor (title, delete). Persisted through
+  // SpatialLayersController#update / #destroy.
+  // Moves a real layer one step up/down the list and saves the new order
+  // (spatial_layers.position = index among the real layers).
+  SpatialViewerApp.prototype._moveLayer = function(id, dir) {
+    var self = this;
+    var real = (this._layerOrder || []).filter(function(i) { return i !== 'model' && self.layerMeta[i]; });
+    var from = real.indexOf(String(id)), to = from + dir;
+    if (from < 0 || to < 0 || to >= real.length) return;
+    var other = real[to];
+    real[to] = real[from]; real[from] = other;
+    // Keep the legacy "model" entry (if any) first, then the real layers.
+    this._layerOrder = (this.layerMeta['model'] ? ['model'] : []).concat(real);
+    this._buildLayerPanel();
+
+    var chain = Promise.resolve();
+    real.forEach(function(lid, idx) {
+      if (self.layerMeta[lid].position === idx) return;
+      self.layerMeta[lid].position = idx;
+      var url = self.apiUrl.replace('/api_data', '/spatial_layers/' + lid);
+      chain = chain.then(function() {
+        return fetch(url, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': self.csrfToken },
+          body: JSON.stringify({ spatial_layer: { position: idx } })
+        });
+      });
+    });
+    chain.catch(function() { self.showTooltip('Could not save the layer order.'); });
+  };
+
+  SpatialViewerApp.prototype._editLayerRow = function(id, row) {
+    var self = this;
+    var m = this.layerMeta[id];
+    var base = this.apiUrl.replace('/api_data', '/spatial_layers/' + id);
+    var send = function(method, body) {
+      return fetch(base, {
+        method: method,
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-Token': self.csrfToken },
+        body: body ? JSON.stringify(body) : null
+      }).then(function(r) { return r.json().catch(function() { return {}; }); });
+    };
+
+    row.innerHTML = '';
+    row.classList.add('layer-row-editing');
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'form-input layer-row-input';
+    input.value = m.title || '';
+    input.maxLength = 255;
+
+    var mkBtn = function(label, cls, title) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'button -small ' + (cls || '');
+      b.textContent = label;
+      if (title) b.title = title;
+      return b;
+    };
+    var save = mkBtn('Save', '-primary');
+    var cancel = mkBtn('Cancel');
+    var del = mkBtn('Delete', 'text-danger', 'Delete this layer and its file');
+
+    save.addEventListener('click', function() {
+      var title = input.value.trim();
+      if (!title) { input.focus(); return; }
+      save.disabled = true;
+      send('PATCH', { spatial_layer: { title: title } }).then(function(res) {
+        if (!res || !res.success) { save.disabled = false; alert('Save failed: ' + ((res && res.errors) || ['unknown error']).join(', ')); return; }
+        m.title = res.layer ? res.layer.title : title;
+        self._buildLayerPanel();
+      }).catch(function(err) { save.disabled = false; alert('Network error: ' + err); });
+    });
+    cancel.addEventListener('click', function() { self._buildLayerPanel(); });
+    input.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') save.click();
+      else if (e.key === 'Escape') cancel.click();
+    });
+    del.addEventListener('click', function() {
+      if (!window.confirm('Delete layer "' + (m.title || id) + '" and its file? This cannot be undone.')) return;
+      del.disabled = true;
+      send('DELETE').then(function(res) {
+        if (!res || !res.success) { del.disabled = false; alert('Delete failed.'); return; }
+        self.loadProjectData(); // reload the remaining layers
+      }).catch(function(err) { del.disabled = false; alert('Network error: ' + err); });
+    });
+
+    var actions = document.createElement('div');
+    actions.className = 'layer-row-actions';
+    actions.appendChild(save); actions.appendChild(cancel); actions.appendChild(del);
+    row.appendChild(input); row.appendChild(actions);
+    input.focus(); input.select();
+  };
+
   SpatialViewerApp.prototype._buildLayerPanel = function() {
     var self = this;
     var panel = document.getElementById('layerPanel'); // now a tab-content div, see show.html.erb
@@ -284,7 +385,13 @@
     if (!panel || !list) return;
 
     var ids = Object.keys(this.layerMeta || {});
-    if (ids.length <= 1) { if (btn) btn.style.display = 'none'; return; }
+    if (this._layerOrder) {
+      var ordered = this._layerOrder.filter(function(i) { return self.layerMeta[i]; });
+      ids.forEach(function(i) { if (ordered.indexOf(i) < 0) ordered.push(i); });
+      ids = ordered;
+    }
+    var canManage = !!(this.projectData && this.projectData.can_manage) && !this._embedMode;
+    if (ids.length <= 1 && !(canManage && ids.length && ids[0] !== 'model')) { if (btn) btn.style.display = 'none'; return; }
     if (btn) btn.style.display = '';
 
     list.innerHTML = '';
@@ -316,7 +423,31 @@
         setEyeState(next);
       });
 
-      row.appendChild(span); row.appendChild(tag); row.appendChild(eyeBtn);
+      row.appendChild(span); row.appendChild(tag);
+      // Edit (rename / delete) -- real layers only; the legacy "model" file
+      // takes its title from the model itself.
+      if (canManage && id !== 'model') {
+        var editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'layer-row-eye';
+        editBtn.title = 'Edit layer';
+        editBtn.innerHTML = '<i class="icon-edit"></i>';
+        editBtn.addEventListener('click', function() { self._editLayerRow(id, row); });
+        var mkMove = function(dir) {
+          var b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'layer-row-eye';
+          b.title = dir < 0 ? 'Move up' : 'Move down';
+          b.textContent = dir < 0 ? '\u25B2' : '\u25BC';
+          b.style.fontSize = '0.7rem';
+          b.addEventListener('click', function() { self._moveLayer(id, dir); });
+          return b;
+        };
+        row.appendChild(mkMove(-1));
+        row.appendChild(mkMove(1));
+        row.appendChild(editBtn);
+      }
+      row.appendChild(eyeBtn);
       list.appendChild(row);
     });
   };

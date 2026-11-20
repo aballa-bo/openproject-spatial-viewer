@@ -53,6 +53,15 @@
 
     this.modelObject = object;
     this.scene.add(object);
+    // IfcConvert writes glTF Y-up -- (x, y, z)_ifc -> (x, z, -y) -- while scans,
+    // photogrammetry meshes and splats are shown in the frame they were
+    // uploaded in (Z-up for survey data). When an IFC shares a model with such
+    // layers, undo the glTF conversion so it sits in the same frame as them
+    // (and as the IFC file itself, which is what transform_ifc.py edits).
+    if (this._loadingLayerKind === 'ifc' && this._ifcSharesFrameWithScans) {
+      object.rotation.x = Math.PI / 2;
+      object.updateMatrixWorld(true);
+    }
 
     this._bvhReady = false; // rebuild BVH for the new geometry on next tool use
     this._setLassoHighlight(null); // any old highlight references the old geometry
@@ -113,7 +122,7 @@
     // the same coordinate system, so we keep the user's current viewpoint.
     if (!this._framed) {
       this._framed = true;
-      this._resolveUpAxis(this._loadingLayerKind);   // Z-up for scans, else Y-up
+      this._resolveUpAxis(this._ifcSharesFrameWithScans ? 'pointcloud' : this._loadingLayerKind);   // Z-up for scans, else Y-up
       this.modelRadius = maxDim;
       this.surfaceOffset = 0;
       if (this.raycaster) this.raycaster.params.Points.threshold = maxDim * 0.01;
