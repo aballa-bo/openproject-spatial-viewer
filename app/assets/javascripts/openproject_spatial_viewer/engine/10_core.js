@@ -74,7 +74,7 @@
     splatMinAlpha: 0.0,   // hide Gaussians whose own opacity is below this
     splatSh: 2,           // view-dependent colour: 0 off, 1 degree 1, 2 degree 1+2
     splatDepth: 0,        // 1 = depth heat map instead of colour
-    splatDepthRange: 1,   // fraction of the near-far span the ramp covers
+    splatDepthRange: 0.1, // ramp covers 0 .. this fraction of the farthest distance
     splatShFix: true      // flip the SH view direction like the splat itself is flipped at load
   };
   var RENDER_STORE_KEY = 'spatialViewer.render';
@@ -499,12 +499,8 @@
     // open re-dims to the new slider value instead of undoing the dim.
     this._applySelectionDim(!!this._selectionLit);
 
-    // Wireframe
-    var wf = !!s.wireframe;
-    (this.modelMeshObjects || []).forEach(function(m) {
-      var mats = Array.isArray(m.material) ? m.material : [m.material];
-      mats.forEach(function(mm) { if (mm && 'wireframe' in mm) mm.wireframe = wf; });
-    });
+    // Wireframe and opacity are per layer (see _applyLayerOptions).
+    if (this._applyAllLayerOptions) this._applyAllLayerOptions();
 
     // Point clouds: diameter multiplier (plain Points via material.size, LOD
     // nodes via a shared shader uniform) and the LOD point budget.
@@ -744,10 +740,13 @@
   SpatialViewerApp.prototype._applySplatSettings = function() {
     var s = this.renderSettings;
     if (!s) return;
+    var self = this;
     (this._splatRenderers || []).forEach(function(sr) {
       var u = sr && sr.mesh && sr.mesh.material && sr.mesh.material.uniforms;
       if (!u) return;
-      if (u.opacity) u.opacity.value = s.splatOpacity > 0 ? s.splatOpacity : 1;
+      var lid = self._layerIdOf(sr.mesh);
+      var layerOp = lid != null ? self._layerOpt(lid).opacity : 1;
+      if (u.opacity) u.opacity.value = (s.splatOpacity > 0 ? s.splatOpacity : 1) * layerOp;
       if (u.uSplatScale) u.uSplatScale.value = s.splatSize > 0 ? s.splatSize : 1;
       if (u.uMinAlpha) u.uMinAlpha.value = s.splatMinAlpha > 0 ? s.splatMinAlpha : 0;
       if (u.uShDegree) u.uShDegree.value = Number(s.splatSh);
@@ -786,6 +785,7 @@
     var secs = document.querySelectorAll('[data-render-section]');
     for (var i = 0; i < secs.length; i++) {
       var k = secs[i].getAttribute('data-render-section');
+      if (k === 'general') continue;
       secs[i].style.display = (!anything || show[k]) ? '' : 'none';
     }
   };
@@ -887,8 +887,11 @@
     // Toolbar wireframe button mirrors the panel checkbox.
     var wfBtn = document.getElementById('btnWireframe');
     if (wfBtn) wfBtn.addEventListener('click', function() {
+      // Toolbar shortcut: wireframe on/off for every layer at once.
       self.renderSettings.wireframe = !self.renderSettings.wireframe;
+      Object.keys(self.layerMeta || {}).forEach(function(id) { self._layerOpt(id).wireframe = self.renderSettings.wireframe; });
       self._applyRenderSettings();
+      if (self._buildLayerPanel) self._buildLayerPanel();
     });
 
     var homeBtn = document.getElementById('btnHome');

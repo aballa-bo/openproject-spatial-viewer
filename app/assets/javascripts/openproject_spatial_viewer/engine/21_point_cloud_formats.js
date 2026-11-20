@@ -80,7 +80,7 @@
   // Download the model, streaming for progress. Returns { buffer } / { pending }.
   SpatialViewerApp.prototype._downloadModel = function(url, format) {
     var self = this;
-    self.showLoader('Downloading 3D model (' + format.toUpperCase() + ')...');
+    self.showLoader('Downloading' + self._loaderName() + ' (' + format.toUpperCase() + ')...');
 
     return fetch(url, { credentials: 'same-origin' }).then(function(response) {
       if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -150,7 +150,7 @@
           chunks.push(r.value);
           loaded += r.value.length;
           var pct = total ? Math.round(loaded / total * 100) + '% ' : '';
-          self.showLoader('Downloading model: ' + pct + '(' + (loaded / 1048576).toFixed(1) + ' MB)');
+          self.showLoader('Downloading' + self._loaderName() + ': ' + pct + '(' + (loaded / 1048576).toFixed(1) + ' MB)');
           return read();
         });
       }

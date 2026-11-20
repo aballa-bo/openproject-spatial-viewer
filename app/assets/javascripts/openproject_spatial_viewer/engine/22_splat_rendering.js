@@ -820,9 +820,10 @@
     this._dirty = false;
   };
 
-  // Depth heat-map range: the span of view-space distances the splat cloud
-  // occupies from this camera (bounding sphere), shrunk from the far end by
-  // uDepthK so a few distant outliers do not flatten the whole ramp.
+  // Depth heat-map range: 0 (the camera) up to uDepthK of the farthest
+  // distance the splat cloud reaches from this camera (bounding sphere). The
+  // cloud's far end is dominated by distant outliers, so the ramp only covers
+  // the first fraction of it (10% by default) to keep near detail readable.
   var _depthCenter = null;
   function updateDepthRange(mesh, camera) {
     var u = mesh.material.uniforms;
@@ -835,8 +836,7 @@
     var sc = mesh.matrixWorld.getMaxScaleOnAxis();
     var r = bs.radius * sc;
     var d = camera.position.distanceTo(_depthCenter);
-    var near = Math.max(0.05, d - r), far = d + r;
-    u.uDepthRange.value.set(near, near + (far - near) * u.uDepthK.value);
+    u.uDepthRange.value.set(0, (d + r) * u.uDepthK.value);
   }
 
   // projCamera (optional) supplies the projection matrix used for the

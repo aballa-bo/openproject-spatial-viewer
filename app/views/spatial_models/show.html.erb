@@ -97,8 +97,7 @@
       <span class="panel-toggle-group" role="group" aria-label="Side panels">
         <button type="button" class="toolbar-btn panel-toggle" data-tab="annotationsTab" title="3D Annotations" aria-label="3D Annotations"><i class="sv-icon-postit"></i></button>
         <button type="button" class="toolbar-btn panel-toggle" data-tab="workPackagesTab" title="Work Packages" aria-label="Work Packages"><i class="icon-work-packages"></i></button>
-        <button type="button" class="toolbar-btn panel-toggle" id="tabBtnLayers" data-tab="layerPanel" title="Layers" aria-label="Layers" style="display: none;"><i class="sv-icon-layers"></i></button>
-        <button type="button" class="toolbar-btn panel-toggle" data-tab="renderPanel" title="Render quality" aria-label="Render quality"><i class="icon-settings2"></i></button>
+        <button type="button" class="toolbar-btn panel-toggle" id="tabBtnLayers" data-tab="layerPanel" title="Layers &amp; display options" aria-label="Layers"><i class="sv-icon-layers"></i></button>
         <button type="button" class="toolbar-btn panel-toggle" data-tab="slicingPanel" title="3D Section Planes" aria-label="3D Section Planes"><i class="icon-cut"></i></button>
       </span>
       <% if @unity_player_available %>
@@ -171,14 +170,9 @@
           _initRenderPanel's settings bindings, the clip-plane slider
           bindings) so no JS besides the open/close wiring itself changed. %>
       <div class="tab-content" id="layerPanel">
-        <div class="slicing-body" id="layerList"></div>
-      </div>
-
-      <div class="tab-content" id="renderPanel">
         <div class="slicing-body">
-
-          <%# Sections: General applies to everything; the others only appear when
-              the model has a layer of that kind (see _updateRenderSections). %>
+          <%# General options (apply to the whole scene), then the layer list. Each
+              layer row expands to its own display options (see _buildLayerPanel). %>
           <div class="render-section" data-render-section="general">
             <div class="render-section-title">General</div>
             <label class="render-row">
@@ -211,10 +205,7 @@
             </label>
             <label class="render-row -check"><input type="checkbox" id="rqHiDpi"> High-resolution (HiDPI)</label>
             <label class="render-row -check"><input type="checkbox" id="rqGrid"> Ground grid</label>
-          </div>
-
-          <div class="render-section" data-render-section="mesh">
-            <div class="render-section-title">Meshes &amp; photogrammetry</div>
+                      <div class="render-section-title" style="margin-top:10px">Lighting</div>
             <label class="render-row">
               <span>Shadows</span>
               <select id="rqShadows" class="form-select">
@@ -228,27 +219,26 @@
               <input type="range" id="rqLight" min="0.1" max="3" step="0.1" value="1">
             </label>
             <label class="render-row -check"><input type="checkbox" id="rqEnv"> Environment (sky) light</label>
-            <label class="render-row -check"><input type="checkbox" id="rqWireframe"> Wireframe</label>
           </div>
 
-          <div class="render-section" data-render-section="points">
+          <div id="layerList"></div>
+
+          <%# Per-kind option blocks: moved into the first layer of that kind by
+              _buildLayerPanel; parked here when not in use. %>
+          <div id="renderStash" hidden>
+            <div class="render-section" data-render-section="points">
             <div class="render-section-title">Point clouds</div>
             <label class="render-row -range">
               <span>Point size <b id="rqPointSizeVal">1.00</b>&times;</span>
-              <input type="range" id="rqPointSize" min="0.25" max="4" step="0.05" value="1">
+              <input type="range" id="rqPointSize" min="0.1" max="4" step="0.05" value="1">
             </label>
             <label class="render-row -range">
               <span>Point budget <b id="rqPointBudgetVal">4.0</b> M points</span>
               <input type="range" id="rqPointBudget" min="0.5" max="12" step="0.5" value="4">
             </label>
           </div>
-
-          <div class="render-section" data-render-section="splat">
+            <div class="render-section" data-render-section="splat">
             <div class="render-section-title">Gaussian splatting</div>
-            <label class="render-row -range">
-              <span>Opacity <b id="rqSplatOpacityVal">1.00</b>&times;</span>
-              <input type="range" id="rqSplatOpacity" min="0.1" max="2" step="0.05" value="1">
-            </label>
             <label class="render-row -range">
               <span>Splat size <b id="rqSplatSizeVal">1.00</b>&times;</span>
               <input type="range" id="rqSplatSize" min="0.2" max="2" step="0.05" value="1">
@@ -266,8 +256,8 @@
             </label>
             <div id="rqSplatDepthRow" style="display:none">
               <label class="render-row -range">
-                <span>Depth range <b id="rqSplatDepthRangeVal">100</b>% of near&ndash;far</span>
-                <input type="range" id="rqSplatDepthRange" min="0.1" max="1" step="0.05" value="1">
+                <span>Depth range: 0 &ndash; <b id="rqSplatDepthRangeVal">10</b>% of max distance</span>
+                <input type="range" id="rqSplatDepthRange" min="0.01" max="1" step="0.01" value="0.1">
               </label>
               <div class="sv-depth-legend" aria-hidden="true"><span>near</span><i></i><span>far</span></div>
             </div>
@@ -282,6 +272,7 @@
             <label class="render-row -check" title="The viewer rotates splats by 180&deg; about X when loading them; this applies the same rotation to the direction used for the view-dependent colour.">
               <input type="checkbox" id="rqSplatShFix"> Colour axis correction
             </label>
+          </div>
           </div>
 
           <button type="button" class="button -small" id="rqReset">Reset to defaults</button>

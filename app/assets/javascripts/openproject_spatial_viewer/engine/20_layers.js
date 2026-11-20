@@ -37,6 +37,11 @@
 
   // ---- Multi-layer loading (IFC / mesh / point cloud / splat) -----------
 
+  // " \u201cLayer name\u201d" suffix for loader messages ('' outside layer loading).
+  SpatialViewerApp.prototype._loaderName = function() {
+    return this._loadingLayerTitle ? ' \u201c' + this._loadingLayerTitle + '\u201d' : '';
+  };
+
   SpatialViewerApp.prototype._startLayerLoading = function(layers) {
     var self = this;
     // An IFC layer that coexists with non-IFC layers is shown Z-up like them
@@ -106,6 +111,7 @@
 
     var l = this._layerQueue.shift();
     this._loadingLayerId = l.id;
+    this._loadingLayerTitle = l.title || String(l.id);
     this._layerIndex++;
     this.showLoader('Loading layer ' + this._layerIndex + '/' + this._layerTotal + ': ' + (l.title || l.id) + '…');
 
@@ -164,6 +170,7 @@
       });
       this._allLayerMeshes = (this._allLayerMeshes || []).concat(this._lastLayerMeshes || []);
       this.modelMeshObjects = this._allLayerMeshes;
+      this._applyLayerOptions(id);
       if (meta.visible !== false) this._fadeLayer(id, true, 320);
     }
     this.modelObject = null;
@@ -192,6 +199,7 @@
 
   // Cross-fade a layer in / out (opacity ramp on all its materials).
   SpatialViewerApp.prototype._fadeLayer = function(id, show, ms) {
+    var self = this;
     var g = this.layerGroups && this.layerGroups[id];
     if (!g) return;
     ms = ms || 380;
@@ -209,6 +217,7 @@
             depthWrite: (m.depthWrite !== false)
           };
         }
+        m.userData._layerOp = self._layerOpt(id).opacity;
         mats.push(m);
       });
     });
@@ -233,14 +242,16 @@
       var e = t * t * (3 - 2 * t);            // smoothstep
       var k = f.show ? e : (1 - e);
       f.mats.forEach(function(m) {
-        m.opacity = ((m.userData._fadeOrig && m.userData._fadeOrig.opacity) || 1) * k;
+        var lo = (m.userData._layerOp == null) ? 1 : m.userData._layerOp;
+        m.opacity = ((m.userData._fadeOrig && m.userData._fadeOrig.opacity) || 1) * lo * k;
       });
       if (t >= 1) {
         f.mats.forEach(function(m) {
           var o = m.userData._fadeOrig || { opacity: 1, transparent: false, depthWrite: true };
-          m.opacity = o.opacity;
-          m.transparent = o.transparent;
-          m.depthWrite = o.depthWrite;
+          var lo = (m.userData._layerOp == null) ? 1 : m.userData._layerOp;
+          m.opacity = o.opacity * lo;
+          m.transparent = o.transparent || lo < 1;
+          m.depthWrite = o.depthWrite && lo >= 1;
         });
         if (!f.show) f.group.visible = false;
         delete fades[id];
@@ -371,6 +382,58 @@
     input.focus(); input.select();
   };
 
+  // ---- Per-layer display options (opacity, wireframe) ---------------------
+  SpatialViewerApp.prototype._layerOpt = function(id) {
+    this._layerOpts = this._layerOpts || {};
+    if (!this._layerOpts[id]) this._layerOpts[id] = { opacity: 1, wireframe: false };
+    return this._layerOpts[id];
+  };
+
+  // The id of the layer an object belongs to (its ancestor group "layer:<id>").
+  SpatialViewerApp.prototype._layerIdOf = function(obj) {
+    for (var o = obj; o; o = o.parent) {
+      if (o.name && o.name.indexOf('layer:') === 0) return o.name.slice(6);
+    }
+    return null;
+  };
+
+  SpatialViewerApp.prototype._applyLayerOptions = function(id) {
+    var g = this.layerGroups && this.layerGroups[id];
+    if (!g) return;
+    var o = this._layerOpt(id);
+    var fading = !!(this._layerFades && this._layerFades[id]);
+    g.traverse(function(obj) {
+      if (!obj.material) return;
+      (Array.isArray(obj.material) ? obj.material : [obj.material]).forEach(function(m) {
+        if (!m) return;
+        if (!m.userData._fadeOrig) {
+          m.userData._fadeOrig = {
+            opacity: (m.opacity == null ? 1 : m.opacity),
+            transparent: !!m.transparent,
+            depthWrite: (m.depthWrite !== false)
+          };
+        }
+        m.userData._layerOp = o.opacity;
+        // Splat/shader materials draw their own quads; wireframe is for meshes.
+        if (!m.isShaderMaterial && 'wireframe' in m) m.wireframe = !!o.wireframe;
+        if (!fading) {
+          var f = m.userData._fadeOrig;
+          m.opacity = f.opacity * o.opacity;
+          m.transparent = f.transparent || o.opacity < 1;
+          m.depthWrite = f.depthWrite && o.opacity >= 1;
+          m.needsUpdate = true;
+        }
+      });
+    });
+    // Splat layers take their opacity from a uniform.
+    if (this._applySplatSettings) this._applySplatSettings();
+  };
+
+  SpatialViewerApp.prototype._applyAllLayerOptions = function() {
+    var self = this;
+    Object.keys(this.layerGroups || {}).forEach(function(id) { self._applyLayerOptions(id); });
+  };
+
   SpatialViewerApp.prototype._buildLayerPanel = function() {
     var self = this;
     var panel = document.getElementById('layerPanel'); // now a tab-content div, see show.html.erb
@@ -385,14 +448,50 @@
       ids = ordered;
     }
     var canManage = !!(this.projectData && this.projectData.can_manage) && !this._embedMode;
-    if (ids.length <= 1 && !(canManage && ids.length && ids[0] !== 'model')) { if (btn) btn.style.display = 'none'; return; }
+    // The tab also carries the general display options, so it is always shown.
     if (btn) btn.style.display = '';
+
+    // Park the per-kind option blocks before the list is rebuilt (they live
+    // inside layer rows while in use and would be destroyed with them).
+    var stash = document.getElementById('renderStash');
+    var kindBlock = {};
+    ['points', 'splat'].forEach(function(k) {
+      var n = document.querySelector('[data-render-section="' + k + '"]');
+      if (n) { kindBlock[k] = n; if (stash && n.parentNode !== stash) stash.appendChild(n); }
+    });
+    var kindOwner = {}; // block kind -> first layer id of that kind
+    var kindCount = { points: 0, splat: 0 };
+    ids.forEach(function(i) {
+      var k = (self.layerMeta[i] || {}).kind === 'pointcloud' ? 'points' : ((self.layerMeta[i] || {}).kind === 'splat' ? 'splat' : null);
+      if (!k) return;
+      kindCount[k]++;
+      if (!kindOwner[k]) kindOwner[k] = i;
+    });
+    this._layerExpanded = this._layerExpanded || {};
 
     list.innerHTML = '';
     ids.forEach(function(id) {
       var m = self.layerMeta[id];
+      var item = document.createElement('div');
+      item.className = 'layer-item';
       var row = document.createElement('div');
       row.className = 'layer-row';
+
+      // Disclosure triangle: right = options hidden, down = shown.
+      var tri = document.createElement('button');
+      tri.type = 'button';
+      tri.className = 'layer-row-toggle';
+      tri.title = 'Display options';
+      var opts = document.createElement('div');
+      opts.className = 'layer-options';
+      var setOpen = function(open) {
+        self._layerExpanded[id] = open;
+        tri.textContent = open ? '\u25BE' : '\u25B8';
+        tri.setAttribute('aria-expanded', open ? 'true' : 'false');
+        opts.style.display = open ? '' : 'none';
+      };
+      tri.addEventListener('click', function() { setOpen(!self._layerExpanded[id]); });
+      row.appendChild(tri);
 
       var span = document.createElement('span');
       span.className = 'layer-row-name';
@@ -442,7 +541,58 @@
         row.appendChild(editBtn);
       }
       row.appendChild(eyeBtn);
-      list.appendChild(row);
+      item.appendChild(row);
+
+      // ---- display options of this layer ----
+      var lo = self._layerOpt(id);
+      var opRow = document.createElement('label');
+      opRow.className = 'render-row -range';
+      var opLabel = document.createElement('span');
+      opLabel.appendChild(document.createTextNode('Opacity '));
+      var opVal = document.createElement('b');
+      opVal.textContent = Math.round(lo.opacity * 100) + '%';
+      opLabel.appendChild(opVal);
+      var opIn = document.createElement('input');
+      opIn.type = 'range'; opIn.min = '0.05'; opIn.max = '1'; opIn.step = '0.05'; opIn.value = String(lo.opacity);
+      opIn.addEventListener('input', function() {
+        lo.opacity = parseFloat(opIn.value);
+        opVal.textContent = Math.round(lo.opacity * 100) + '%';
+        self._applyLayerOptions(id);
+      });
+      opRow.appendChild(opLabel); opRow.appendChild(opIn);
+      opts.appendChild(opRow);
+
+      if (m.kind === 'mesh' || m.kind === 'ifc') {
+        var wfRow = document.createElement('label');
+        wfRow.className = 'render-row -check';
+        var wfIn = document.createElement('input');
+        wfIn.type = 'checkbox'; wfIn.checked = !!lo.wireframe;
+        wfIn.addEventListener('change', function() {
+          lo.wireframe = wfIn.checked;
+          self._applyLayerOptions(id);
+        });
+        wfRow.appendChild(wfIn);
+        wfRow.appendChild(document.createTextNode(' Wireframe'));
+        opts.appendChild(wfRow);
+      }
+
+      var bk = m.kind === 'pointcloud' ? 'points' : (m.kind === 'splat' ? 'splat' : null);
+      if (bk && kindOwner[bk] === id && kindBlock[bk]) {
+        opts.appendChild(kindBlock[bk]);
+        var t = kindBlock[bk].querySelector('.render-section-title');
+        if (t) t.style.display = 'none';
+        var note = kindBlock[bk].querySelector('.layer-kind-note');
+        if (!note) {
+          note = document.createElement('p');
+          note.className = 'layer-kind-note text-muted small';
+          kindBlock[bk].insertBefore(note, kindBlock[bk].firstChild);
+        }
+        note.textContent = kindCount[bk] > 1 ? 'These settings apply to all layers of this type.' : '';
+        note.style.display = kindCount[bk] > 1 ? '' : 'none';
+      }
+      item.appendChild(opts);
+      setOpen(!!self._layerExpanded[id]);
+      list.appendChild(item);
     });
   };
 

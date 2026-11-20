@@ -7,7 +7,7 @@
 
   SpatialViewerApp.prototype._parseModel = function(buffer, format) {
     var self = this;
-    self.showLoader('Parsing 3D geometry...');
+    self.showLoader('Parsing' + self._loaderName() + '...');
 
     // .sog is itself a zip (meta.json + WebP textures) -- must be checked
     // before the generic isZipBuffer/_parseBundle branch below, which would
@@ -109,7 +109,7 @@
 
   SpatialViewerApp.prototype._parseBundle = function(buffer) {
     var self = this;
-    self.showLoader('Unpacking model archive…');
+    self.showLoader('Unpacking' + self._loaderName() + '…');
     self._revokeBundleUrls();
 
     unzipBuffer(buffer).then(function(files) {
@@ -585,7 +585,7 @@
     }
 
     function mainThreadParse(buf) {
-      self.showLoader('Parsing 3D geometry (the page may briefly freeze)...');
+      self.showLoader('Parsing' + self._loaderName() + ' (the page may briefly freeze)...');
       var parsed = false;
       try {
         new THREE.GLTFLoader().parse(buf, '',
@@ -677,7 +677,7 @@
       finish(recoverAndFallback);
     };
 
-    self.showLoader('Parsing 3D geometry in the background...');
+    self.showLoader('Parsing' + self._loaderName() + ' in the background...');
     worker.postMessage(
       { type: 'parse', buffer: buffer, bundleUrl: '/assets/openproject_spatial_viewer/vendor.bundle.js' },
       [buffer]
@@ -783,7 +783,7 @@
    */
   SpatialViewerApp.prototype.extractIfcGeometry = function(text) {
     var self = this;
-    self.showLoader('Extracting IFC geometry...');
+    self.showLoader('Extracting geometry of' + self._loaderName() + '...');
 
     // Extract all IFCCARTESIANPOINT((x,y,z)) coordinates
     var regex = /IFCCARTESIANPOINT\s*\(\s*\(\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*\)\s*\)/gi;
