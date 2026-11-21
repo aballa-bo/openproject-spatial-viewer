@@ -468,7 +468,7 @@
     // intensity" control to multiply there.
     (this._splatRenderers || []).forEach(function(sr) {
       var u = sr && sr.mesh && sr.mesh.material && sr.mesh.material.uniforms;
-      if (u && u.exposure) u.exposure.value = s.exposure;
+      if (u && u.exposure) u.exposure.value = s.exposure; // x layer exposure: see _applySplatSettings
     });
     this._applySplatSettings();
 
@@ -749,6 +749,7 @@
       if (!u) return;
       var lid = self._layerIdOf(sr.mesh);
       var layerOp = lid != null ? self._layerOpt(lid).opacity : 1;
+      if (u.exposure) u.exposure.value = (s.exposure == null ? 1 : s.exposure) * (lid != null ? (self._layerOpt(lid).exposure || 1) : 1);
       if (u.opacity) u.opacity.value = (s.splatOpacity > 0 ? s.splatOpacity : 1) * layerOp;
       if (u.uSplatScale) u.uSplatScale.value = s.splatSize > 0 ? s.splatSize : 1;
       if (u.uMinAlpha) u.uMinAlpha.value = s.splatMinAlpha > 0 ? s.splatMinAlpha : 0;

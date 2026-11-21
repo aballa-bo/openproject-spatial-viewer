@@ -27,11 +27,15 @@
     function addRow(layer) {
       var tr = document.createElement('tr');
       tr.dataset.layerId = layer.id;
+      tr.dataset.kind = layer.kind;
+      tr.dataset.title = layer.title;
       tr.innerHTML =
         '<td></td><td></td><td><span class="badge -primary"></span></td>' +
         '<td class="text-muted small"></td>' +
         '<td class="layer-status text-muted small"></td>' +
         '<td><input type="checkbox" class="layer-default-visible" checked aria-label="Visible by default"></td>' +
+        '<td>' + (layer.kind === 'splat' ? '<select class="layer-selection-layer" aria-label="Selection layer"></select>' : '') + '</td>' +
+        '<td>' + (layer.kind === 'pointcloud' ? '<input type="number" class="layer-scale" value="1" min="0.000001" step="any" style="width:6rem" aria-label="Scale">' : '') + '</td>' +
         '<td class="buttons"><button type="button" class="button -transparent icon icon-delete text-danger layer-delete" title="Remove layer"></button></td>';
       tr.children[0].textContent = layer.title;
       tr.children[1].textContent = layer.kind;
@@ -40,6 +44,9 @@
       rows.appendChild(tr);
       bindDelete(tr);
       bindDefaultVisible(tr);
+      bindSelectionLayer(tr);
+      bindScale(tr);
+      refreshSelects();
       refreshStatus(tr, layer);
     }
 
@@ -90,6 +97,76 @@
       });
     }
 
+    // Splat rows carry a dropdown of the model's mesh/IFC layers.
+    function refreshSelects() {
+      var opts = [];
+      Array.prototype.forEach.call(rows.querySelectorAll('tr[data-layer-id]'), function (tr) {
+        if (tr.dataset.kind === 'mesh' || tr.dataset.kind === 'ifc') {
+          opts.push({ id: tr.dataset.layerId, label: tr.dataset.title + ' (' + tr.dataset.kind + ')' });
+        }
+      });
+      Array.prototype.forEach.call(rows.querySelectorAll('.layer-selection-layer'), function (sel) {
+        var cur = sel.value || sel.dataset.current || '';
+        sel.innerHTML = '';
+        var none = document.createElement('option');
+        none.value = ''; none.textContent = '\u2014 none \u2014';
+        sel.appendChild(none);
+        opts.forEach(function (o) {
+          var op = document.createElement('option');
+          op.value = o.id; op.textContent = o.label;
+          sel.appendChild(op);
+        });
+        sel.value = opts.some(function (o) { return o.id === cur; }) ? cur : '';
+        sel.dataset.current = sel.value;
+      });
+    }
+
+    function bindScale(tr) {
+      var inp = tr.querySelector('.layer-scale');
+      if (!inp) return;
+      inp.dataset.current = inp.value;
+      inp.addEventListener('change', function () {
+        var v = parseFloat(inp.value), prev = inp.dataset.current;
+        if (!(v > 0)) { inp.value = prev; return; }
+        inp.disabled = true;
+        fetch(baseUrl + '/' + tr.dataset.layerId, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+          credentials: 'same-origin',
+          body: JSON.stringify({ spatial_layer: { scale: v } })
+        })
+          .then(function (r) { return r.json().catch(function () { return {}; }); })
+          .then(function (res) {
+            inp.disabled = false;
+            if (res && res.success) inp.dataset.current = String(v);
+            else { inp.value = prev; window.alert('Could not save the scale.'); }
+          })
+          .catch(function () { inp.disabled = false; inp.value = prev; });
+      });
+    }
+
+    function bindSelectionLayer(tr) {
+      var sel = tr.querySelector('.layer-selection-layer');
+      if (!sel) return;
+      sel.addEventListener('change', function () {
+        var want = sel.value, prev = sel.dataset.current || '';
+        sel.disabled = true;
+        fetch(baseUrl + '/' + tr.dataset.layerId, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+          credentials: 'same-origin',
+          body: JSON.stringify({ spatial_layer: { selection_layer_id: want } })
+        })
+          .then(function (r) { return r.json().catch(function () { return {}; }); })
+          .then(function (res) {
+            sel.disabled = false;
+            if (res && res.success) sel.dataset.current = want;
+            else { sel.value = prev; window.alert('Could not save the setting.'); }
+          })
+          .catch(function () { sel.disabled = false; sel.value = prev; });
+      });
+    }
+
     function bindDelete(tr) {
       var del = tr.querySelector('.layer-delete');
       if (!del) return;
@@ -103,7 +180,7 @@
         })
           .then(function (r) { return r.json().catch(function () { return {}; }); })
           .then(function (res) {
-            if (res && res.success) tr.remove();
+            if (res && res.success) { tr.remove(); refreshSelects(); }
             else { del.disabled = false; window.alert('Could not remove the layer.'); }
           })
           .catch(function () { del.disabled = false; });
@@ -113,6 +190,8 @@
     Array.prototype.forEach.call(rows.querySelectorAll('tr[data-layer-id]'), function (tr) {
       bindDelete(tr);
       bindDefaultVisible(tr);
+      bindSelectionLayer(tr);
+      bindScale(tr);
       if ((tr.querySelector('.layer-status') || {}).textContent &&
           /pending|processing|converting/i.test(tr.querySelector('.layer-status').textContent)) {
         setTimeout(function () { pollStatus(tr); }, 4000);

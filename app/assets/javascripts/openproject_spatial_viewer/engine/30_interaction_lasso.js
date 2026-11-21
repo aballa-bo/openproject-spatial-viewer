@@ -173,6 +173,26 @@
     this.controls.target.copy(this.camera.position).addScaledVector(fwd, depth);
   };
 
+  // Distance from the camera to the surface straight ahead (screen centre),
+  // refreshed at most every 250 ms and smoothed. Navigation speed follows this,
+  // not the model size or the orbit-target distance (the target can be far
+  // behind or in front of what you are actually looking at). null when nothing
+  // pickable is ahead (e.g. only a splat is shown).
+  SpatialViewerApp.prototype._surfaceDepthAhead = function(force) {
+    var now = (window.performance && performance.now) ? performance.now() : Date.now();
+    if (!force && this._navDepthT && now - this._navDepthT < 250) return this._navDepthS || null;
+    this._navDepthT = now;
+    var rect = this.canvas.getBoundingClientRect();
+    var p = rect.width ? this._pickWorldPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) : null;
+    if (p) {
+      var dd = p.distanceTo(this.camera.position);
+      this._navDepthS = this._navDepthS ? this._navDepthS * 0.4 + dd * 0.6 : dd;
+    } else {
+      this._navDepthS = null;
+    }
+    return this._navDepthS || null;
+  };
+
   // Wheel: dolly toward the world point under the cursor. Both the camera and
   // the orbit target are scaled about that point, so it stays pinned on screen
   // and there is always distance left to cover — no "stuck" zoom.
@@ -190,15 +210,23 @@
     var pivot = this._pickWorldPoint(e.clientX, e.clientY);
     if (!pivot) {
       // no surface under the cursor: use the plane through the orbit target
-      var n = this.camera.getWorldDirection(new THREE.Vector3()).negate();
-      var plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n, this.controls.target);
-      pivot = this.raycaster.ray.intersectPlane(plane, new THREE.Vector3());
-      if (!pivot) return;
+      // no surface under the cursor: use the depth of the surface ahead if
+      // known, else the plane through the orbit target
+      var ahead = this._surfaceDepthAhead();
+      if (ahead) {
+        pivot = this.raycaster.ray.at(ahead, new THREE.Vector3());
+      } else {
+        var n = this.camera.getWorldDirection(new THREE.Vector3()).negate();
+        var plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n, this.controls.target);
+        pivot = this.raycaster.ray.intersectPlane(plane, new THREE.Vector3());
+        if (!pivot) return;
+      }
     }
 
     // deltaMode 1 = lines, 0 = pixels; normalise to roughly one "notch" = 1.
     var notches = e.deltaY / (e.deltaMode === 1 ? 3 : 100);
-    var factor = Math.pow(1.18, notches);   // <1 zoom in, >1 zoom out
+    notches = Math.max(-2.5, Math.min(2.5, notches)); // accelerated wheels/trackpads
+    var factor = Math.pow(1.08, notches);   // <1 zoom in, >1 zoom out
 
     var camOff = this.camera.position.clone().sub(pivot);
     var tgtOff = this.controls.target.clone().sub(pivot);
@@ -245,9 +273,21 @@
 
     // Scale by the current viewing distance too, so keys stay usable whether
     // you are far out or nosed up against a wall.
+    // Speed is proportional to the distance of the surface ahead: fast when
+    // far from everything, slowing smoothly as you approach (never through it).
     var d = this.camera.position.distanceTo(this.controls.target) || 1;
-    var reach = Math.min(this.modelRadius || 10, d * 1.5) || 10;
-    var speed = reach * (this._navShift ? 2.4 : 0.8);
+    var mr = this.modelRadius || 10;
+    var ahead = this._surfaceDepthAhead();
+    var reach = ahead ? ahead : (Math.min(mr, d * 1.5) || 10);
+    // Moving only backwards: the surface ahead says nothing about what is
+    // behind, so don't slow down for it.
+    if (ks && !kw) reach = Math.max(reach, Math.min(mr, d * 1.5) || 10);
+    reach = Math.min(mr * 2, reach);
+    var speed = reach * (this._navShift ? 0.9 : 0.3);
+    // Minimum speed (world units / s): slowing near a surface must never
+    // become a standstill -- you can always keep going (and pass through).
+    var minSpeed = mr * (this._navShift ? 0.04 : 0.02);
+    if (speed < minSpeed) speed = minSpeed;
     n.move.normalize().multiplyScalar(speed * dt);
 
     this.camera.position.add(n.move);
@@ -319,14 +359,16 @@
   // Build BVH bounds trees for the model meshes (once). Synchronous: a one-time
   // freeze of up to ~1-2 s on very large models, triggered when a tool that
   // needs surface raycasts is first used.
-  SpatialViewerApp.prototype._ensureBVH = function() {
-    if (this._bvhReady) return;
+  // `group` (optional): build only the meshes of that layer group.
+  SpatialViewerApp.prototype._ensureBVH = function(group) {
+    if (!group && this._bvhReady) return;
     installBVH(); // in case the library finished loading after initThree
     if (!THREE.__bvhInstalled) return; // library not ready yet — retry next call
-    this._bvhReady = true;
+    if (!group) this._bvhReady = true;
     if (!this.modelMeshObjects) return;
 
     var todo = this.modelMeshObjects.filter(function(m) {
+      if (group && m.userData.layerVisibilityGroup !== group) return false;
       if (!m.isMesh || !m.geometry || m.geometry.boundsTree) return false;
       var pos = m.geometry.attributes && m.geometry.attributes.position;
       return pos && pos.count > 30 && pos.count <= 9000000;
@@ -358,7 +400,10 @@
   SpatialViewerApp.prototype._visibleRaycastTargets = function() {
     return (this.modelMeshObjects || []).filter(function(m) {
       var lg = m.userData && m.userData.layerVisibilityGroup;
-      return !lg || lg.visible !== false;
+      if (lg && lg.visible === false) return false;
+      // parts hidden from the IFC structure tree
+      for (var o = m; o && o !== lg; o = o.parent) { if (o.visible === false) return false; }
+      return true;
     });
   };
 
@@ -373,12 +418,30 @@
   // point cloud shown together with a splat -- is ambiguous, so nothing is
   // selectable (the user is told to show one of them alone).
   SpatialViewerApp.prototype._selectionTargets = function() {
-    var vis = this._visibleRaycastTargets();
+    var self = this;
+    // A layer dragged to ~0 opacity is invisible to the user, so it must not
+    // be selectable either.
+    var vis = this._visibleRaycastTargets().filter(function(m) {
+      var id = self._layerIdOf(m);
+      return !id || self._layerOpt(id).opacity > 0.02;
+    });
     var by = { mesh: [], ifc: [], pointcloud: [], splat: [] };
     vis.forEach(function(m) {
       var k = m.userData && m.userData.layerKind;
       if (k && by[k]) by[k].push(m);
     });
+    // A visible splat that names a mesh/IFC layer selects on that layer (used
+    // even though it is hidden), taking precedence over visible mesh/IFC layers.
+    var mapped = [];
+    by.splat.forEach(function(m) {
+      var id = self._layerIdOf(m), lm = id && self.layerMeta[id];
+      var tid = lm && lm.selection_layer_id;
+      if (!tid) return;
+      (self.modelMeshObjects || []).forEach(function(t) {
+        if (self._layerIdOf(t) === String(tid) && mapped.indexOf(t) < 0) mapped.push(t);
+      });
+    });
+    if (mapped.length) return mapped;
     if (by.mesh.length) return by.mesh;
     if (by.ifc.length) return by.ifc;
     var kinds = ['pointcloud', 'splat'].filter(function(k) { return by[k].length; });
@@ -509,9 +572,13 @@
         try { this._adaptOrbitPivot(e); } catch (err) { console.warn('[SpatialViewer] orbit pivot failed:', err); }
       }
     }
+    if (this.currentTool === 'area' && this._areaMode === 'poly') {
+      if (e.button === 0) { e.preventDefault(); this._polyPointer(e); }
+      return;
+    }
     if (this.currentTool === 'orbit' || e.button !== 0) return;
 
-    var isLasso = this.currentTool === 'lasso';
+    var isLasso = this.currentTool === 'lasso' || this.currentTool === 'area';
     if (isLasso && !this._selectionTargets().length && this._visibleRaycastTargets().length) {
       this.showTooltip('Nothing to select here: show the photogrammetry or IFC layer, or show only the point cloud (or only the splat).');
       return;
@@ -529,9 +596,12 @@
       if (!this.measureStartPoint) {
         this.measureStartPoint = hit.point.clone();
         this.showTooltip('Point 1 selected. Click second point to measure.');
+        this._measureDraw(null);
+        this._bindMeasureKeys();
       } else {
-        this.finishMeasurement(this.measureStartPoint, hit.point);
-        this.measureStartPoint = null;
+        var startPt = this.measureStartPoint;
+        this._cancelMeasure();
+        this.finishMeasurement(startPt, hit.point);
       }
       return;
     }
@@ -562,6 +632,14 @@
 
   SpatialViewerApp.prototype.onPointerMove = function(e) {
     this._pointerClient = { x: e.clientX, y: e.clientY };
+    if (this.currentTool === 'area' && this._areaMode === 'poly' && this._polyPts && this._polyPts.length) {
+      this._polyHover(e);
+      return;
+    }
+    if (this.currentTool === 'measure' && this.measureStartPoint) {
+      this._measureHover(e);
+      return;
+    }
     if (!this.isDrawing) {
       this._updateHoverEffects(e.clientX, e.clientY);
       return;
@@ -575,7 +653,7 @@
   };
 
   SpatialViewerApp.prototype._sampleDrawPoint = function(clientX, clientY) {
-    if (this.currentTool === 'lasso') return this._sampleLassoScreen(clientX, clientY);
+    if (this.currentTool === 'lasso' || this.currentTool === 'area') return this._sampleLassoScreen(clientX, clientY);
     return this._sampleDrawSurface(clientX, clientY);
   };
 
@@ -690,7 +768,7 @@
     } catch (ignore) {}
     this._activePointerId = null;
 
-    if (this.currentTool === 'lasso') return this._finishLasso();
+    if (this.currentTool === 'lasso' || this.currentTool === 'area') return this._finishLasso();
 
     var pts = this.currentDrawingPoints || [];
     if (pts.length < 2) { this.clearTempMarkup(); return; }
@@ -702,12 +780,202 @@
     });
   };
 
+  // Area tool (free-hand): planar area of the region under the lasso x the
+  // LiDAR layer's scale, shown in a modal. No work package is created.
+  SpatialViewerApp.prototype._finishAreaMeasure = function() {
+    var self = this, fg = this._lastLassoGrid;
+    var done = function() {
+      self._clearLassoOverlay();
+      self._setLassoHighlight(null);
+      self.lassoScreenPath = null;
+      self._lastLassoGrid = null;
+    };
+    if (!fg) { done(); this.showTooltip('No surface under the selection: show the layer to measure and try again.'); return; }
+    // Planar area: magnitude of the vector area of the patch, i.e. the area of
+    // its projection on the plane it lies in -- it does not follow the relief.
+    var pos = triangulateLassoGrid(fg.grid, fg.rows, fg.cols);
+    var a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), sum = new THREE.Vector3();
+    for (var i = 0; i + 8 < pos.length; i += 9) {
+      a.set(pos[i], pos[i + 1], pos[i + 2]);
+      b.set(pos[i + 3], pos[i + 4], pos[i + 5]);
+      c.set(pos[i + 6], pos[i + 7], pos[i + 8]);
+      sum.add(b.sub(a).cross(c.sub(a)).multiplyScalar(0.5));
+    }
+    var total = sum.length();
+    total *= this._measureScale();
+    this._openResultModal('Area', total.toFixed(2) + ' m\u00B2', done);
+  };
+
+  // ---- Measure tool: the first point and a line to the cursor ---------------
+  SpatialViewerApp.prototype._measureDraw = function(cursor) {
+    var start = this.measureStartPoint;
+    this._clearMeasurePreview();
+    if (!start) return;
+    var grp = new THREE.Group();
+    var col = 0xf59e0b;
+    var dot = new THREE.Points(new THREE.BufferGeometry().setFromPoints([start]),
+      new THREE.PointsMaterial({ color: col, size: 10, sizeAttenuation: false, depthTest: false, transparent: true }));
+    dot.renderOrder = 1000;
+    grp.add(dot);
+    if (cursor) {
+      var line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([start, cursor]),
+        new THREE.LineBasicMaterial({ color: col, depthTest: false, transparent: true }));
+      line.renderOrder = 999;
+      grp.add(line);
+    }
+    this._measurePrev = grp;
+    this.tempMarkupGroup.add(grp);
+  };
+
+  SpatialViewerApp.prototype._clearMeasurePreview = function() {
+    var g = this._measurePrev;
+    if (!g) return;
+    this.tempMarkupGroup.remove(g);
+    g.traverse(function(n) {
+      if (n.geometry) n.geometry.dispose();
+      if (n.material && n.material.dispose) n.material.dispose();
+    });
+    this._measurePrev = null;
+  };
+
+  SpatialViewerApp.prototype._measureHover = function(e) {
+    var self = this;
+    this._measureCursor = { x: e.clientX, y: e.clientY };
+    if (this._measureRaf) return;
+    this._measureRaf = requestAnimationFrame(function() {
+      self._measureRaf = 0;
+      var c = self._measureCursor;
+      if (!c || !self.measureStartPoint) return;
+      var hit = self._raycastAt(c.x, c.y);
+      self._measureDraw(hit ? hit.point : null);
+    });
+  };
+
+  SpatialViewerApp.prototype._cancelMeasure = function() {
+    this.measureStartPoint = null;
+    if (this._measureRaf) { cancelAnimationFrame(this._measureRaf); this._measureRaf = 0; }
+    this._clearMeasurePreview();
+  };
+
+  SpatialViewerApp.prototype._bindMeasureKeys = function() {
+    var self = this;
+    if (this._measureKeyBound) return;
+    this._measureKeyBound = true;
+    document.addEventListener('keydown', function(ev) {
+      if (self.measureStartPoint && ev.key === 'Escape') self._cancelMeasure();
+    }, true);
+  };
+
+  // ---- Area tool, polygon mode ---------------------------------------------
+  // Left click adds a vertex. Moving the cursor over (or next to) the FIRST
+  // vertex turns it red and larger; clicking then closes the figure. The lines
+  // between the vertices so far (and to the cursor) are shown while drawing.
+  // Esc cancels, Backspace removes the last vertex. The area is planar (see
+  // _finishPolygon).
+  var POLY_CLOSE_PX = 14;
+
+  // Is the pointer (client px) over / next to the first vertex?
+  SpatialViewerApp.prototype._polyNearFirst = function(clientX, clientY) {
+    var pts = this._polyPts;
+    if (!pts || pts.length < 3) return false;
+    var rect = this.canvas.getBoundingClientRect();
+    var v = pts[0].clone().project(this.camera);
+    if (v.z > 1) return false;
+    var sx = rect.left + (v.x * 0.5 + 0.5) * rect.width;
+    var sy = rect.top + (-v.y * 0.5 + 0.5) * rect.height;
+    var dx = clientX - sx, dy = clientY - sy;
+    return dx * dx + dy * dy <= POLY_CLOSE_PX * POLY_CLOSE_PX;
+  };
+
+  SpatialViewerApp.prototype._polyPointer = function(e) {
+    var self = this;
+    if (e.button !== 0) return;
+    if (this._polyNearFirst(e.clientX, e.clientY)) return this._finishPolygon();
+    if (!this._selectionTargets().length && this._visibleRaycastTargets().length) {
+      this.showTooltip('Nothing to measure on here: show the photogrammetry or IFC layer, or show only the point cloud (or only the splat).');
+      return;
+    }
+    var hit = this._raycastAt(e.clientX, e.clientY, true);
+    if (!hit) return;
+    this._polyPts = this._polyPts || [];
+    this._polyPts.push(hit.point.clone());
+    this._polyDraw(null, false);
+    if (!this._polyKeyBound) {
+      this._polyKeyBound = true;
+      document.addEventListener('keydown', function(ev) {
+        if (!self._polyPts || !self._polyPts.length) return;
+        if (ev.key === 'Escape') { self._cancelPolygon(); }
+        else if (ev.key === 'Backspace') { ev.preventDefault(); self._polyPts.pop(); self._polyDraw(null, false); if (!self._polyPts.length) self._cancelPolygon(); }
+      }, true);
+    }
+  };
+
+  SpatialViewerApp.prototype._polyHover = function(e) {
+    var self = this;
+    this._polyCursor = { x: e.clientX, y: e.clientY };
+    if (this._polyRaf) return;
+    this._polyRaf = requestAnimationFrame(function() {
+      self._polyRaf = 0;
+      var c = self._polyCursor;
+      if (!c || !self._polyPts || !self._polyPts.length) return;
+      var near = self._polyNearFirst(c.x, c.y);
+      var hit = near ? null : self._raycastAt(c.x, c.y, true);
+      // near the first vertex the rubber band snaps onto it
+      self._polyDraw(near ? self._polyPts[0] : (hit ? hit.point : null), near);
+      if (self.canvas) self.canvas.style.cursor = near ? 'pointer' : '';
+    });
+  };
+
+  // Lines through the vertices so far, plus a line to the cursor (rubber band).
+  // The first vertex is red and larger while `nearFirst` (click closes).
+  SpatialViewerApp.prototype._polyDraw = function(cursor, nearFirst) {
+    var pts = this._polyPts || [];
+    this.clearTempMarkup();
+    if (!pts.length) return;
+    this._updateOutline(cursor ? pts.concat([cursor]) : pts, false);
+    var mk = function(list, color, size) {
+      var g = new THREE.BufferGeometry().setFromPoints(list);
+      var m = new THREE.PointsMaterial({ color: color, size: size, sizeAttenuation: false, depthTest: false, transparent: true });
+      var o = new THREE.Points(g, m);
+      o.renderOrder = 1000;
+      return o;
+    };
+    var col = new THREE.Color(this.activeColor);
+    if (pts.length > 1) this.tempMarkupGroup.add(mk(pts.slice(1), col, 8));
+    this.tempMarkupGroup.add(nearFirst ? mk([pts[0]], new THREE.Color(0xe53935), 16) : mk([pts[0]], col, 8));
+  };
+
+  SpatialViewerApp.prototype._cancelPolygon = function() {
+    this._polyPts = [];
+    if (this._polyRaf) { cancelAnimationFrame(this._polyRaf); this._polyRaf = 0; }
+    if (this.canvas) this.canvas.style.cursor = '';
+    this.clearTempMarkup();
+  };
+
+  SpatialViewerApp.prototype._finishPolygon = function() {
+    var self = this, pts = this._polyPts.slice();
+    this._polyPts = [];
+    if (this._polyRaf) { cancelAnimationFrame(this._polyRaf); this._polyRaf = 0; }
+    if (this.canvas) this.canvas.style.cursor = '';
+    this.clearTempMarkup();
+    this._updateOutline(pts, true); // closed figure stays visible behind the result
+    // Planar area (Newell): |vector area| = area of the polygon projected on its
+    // own plane, so it never follows the relief under the vertices.
+    var sum = new THREE.Vector3(), cr = new THREE.Vector3();
+    for (var i = 0; i < pts.length; i++) {
+      sum.add(cr.crossVectors(pts[i], pts[(i + 1) % pts.length]));
+    }
+    var total = sum.length() / 2 * this._measureScale();
+    this._openResultModal('Area', total.toFixed(2) + ' m\u00B2', function() { self.clearTempMarkup(); });
+  };
+
   SpatialViewerApp.prototype._finishLasso = function() {
     var path = this.lassoScreenPath || [];
     if (path.length < 3) { this._clearLassoOverlay(); this.clearTempMarkup(); return; }
 
     this._drawLassoOverlay(path, true);
     this._buildLassoFill(path, this.activeColor, true);
+    if (this.currentTool === 'area') return this._finishAreaMeasure();
 
     // Now (once) turn a down-sampled screen ring into 3D points for storage.
     // The 2D overlay stays on screen as the outline until the form is closed.
@@ -725,6 +993,11 @@
     if (ring.length < 3) { this._clearLassoOverlay(); this.clearTempMarkup(); return; }
 
     this.currentDrawingPoints = ring;
+    var _self = this;
+    console.log('[SpatialViewer] lasso targets: ' + (this._selectionTargets().map(function(m) {
+      var id = _self._layerIdOf(m), lm = (id && _self.layerMeta[id]) || {};
+      return (lm.title || id) + ' [' + (m.userData.layerKind || '?') + ']';
+    }).filter(function(v, i, a) { return a.indexOf(v) === i; }).join(', ') || 'none'));
     console.log('[SpatialViewer] lasso: ' + path.length + ' screen points -> ' + ring.length + ' 3D points');
 
     // `points` (the ring) is what drives the selection spotlight on reload

@@ -4,7 +4,7 @@ class SpatialLayersController < ApplicationController
   before_action :find_project_by_project_id
   before_action :authorize
   before_action :find_model
-  before_action :find_layer, only: %i[update destroy file octree]
+  before_action :find_layer, only: %i[update destroy file octree hierarchy]
   before_action :relax_csp_for_3d_viewer, only: :file
 
   # Direct files can carry blob:/data: (glTF textures); see SpatialModelsController.
@@ -87,8 +87,22 @@ class SpatialLayersController < ApplicationController
       return render json: { success: false, errors: ["Not allowed"] }, status: :forbidden
     end
 
-    attrs = params.require(:spatial_layer).permit(:title, :visible, :position)
+    attrs = params.require(:spatial_layer).permit(:title, :visible, :position, :selection_layer_id, :exposure, :scale)
+    if attrs.key?(:selection_layer_id)
+      sid = attrs[:selection_layer_id].presence
+      if sid
+        target = @layer.spatial_model.spatial_layers.find_by(id: sid)
+        unless @layer.kind == "splat" && target && %w[mesh ifc].include?(target.kind)
+          return render json: { success: false, errors: ["Invalid selection layer"] }, status: :unprocessable_entity
+        end
+      end
+      attrs[:selection_layer_id] = sid
+    end
     if @layer.update(attrs)
+      if @layer.saved_change_to_scale? && @layer.kind == "pointcloud"
+        # Stored lasso areas depend on the scale: recompute them.
+        @layer.spatial_model.spatial_annotations.where(annotation_type: "lasso_selection").find_each(&:save)
+      end
       render json: { success: true, layer: layer_payload(@layer) }
     else
       render json: { success: false, errors: @layer.errors.full_messages }, status: :unprocessable_entity
@@ -118,6 +132,15 @@ class SpatialLayersController < ApplicationController
     send_file path.to_s,
               type: node == "hierarchy" ? "application/json" : "application/octet-stream",
               disposition: "inline"
+  end
+
+  # IFC spatial hierarchy for the viewer's layer tree.
+  def hierarchy
+    return render json: { error: "Not an IFC layer" }, status: :unprocessable_entity unless @layer.kind == "ifc"
+
+    render json: { objects: ::SpatialViewer::IfcHierarchy.new(@layer).call }
+  rescue ::SpatialViewer::IfcHierarchy::Error => e
+    render json: { error: e.message }, status: :unprocessable_entity
   end
 
   def file
@@ -188,6 +211,9 @@ class SpatialLayersController < ApplicationController
       source_format: layer.source_format,
       format: layer.viewer_format,
       visible: layer.visible,
+      selection_layer_id: layer.selection_layer_id,
+      exposure: layer.exposure,
+      scale: layer.scale,
       url: file_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer),
       conversion: layer.conversion_payload,
       file_size: (layer.needs_conversion? && layer.converted_file_ready? ? layer.converted_file_path.size : layer.file_attachment&.filesize),

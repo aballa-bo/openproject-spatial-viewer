@@ -30,6 +30,8 @@
         <th>Size</th>
         <th>Status</th>
         <th title="Layers ticked here are shown when the viewer opens">Visible by default</th>
+        <th title="For a Gaussian splat: the photogrammetry or IFC layer the lasso selects on when only the splat is shown">Selection layer</th>
+        <th title="LiDAR layer: distances and areas measured in the viewer are multiplied by this factor">Scale</th>
         <th class="generic-table--actions-header"></th>
       </tr>
     </thead>
@@ -43,10 +45,12 @@
           <td class="text-muted small">legacy file — re-upload it as a layer to manage it here</td>
           <td></td>
           <td></td>
+          <td></td>
+          <td></td>
         </tr>
       <% end %>
       <% @spatial_model.spatial_layers.each do |layer| %>
-        <tr data-layer-id="<%= layer.id %>">
+        <tr data-layer-id="<%= layer.id %>" data-kind="<%= layer.kind %>" data-title="<%= layer.title %>">
           <td><%= layer.title %></td>
           <td><%= layer.kind %></td>
           <td><span class="badge -primary"><%= layer.source_format.upcase %></span></td>
@@ -59,6 +63,21 @@
             <% end %>
           </td>
           <td><input type="checkbox" class="layer-default-visible" <%= 'checked' if layer.visible %> aria-label="Visible by default"></td>
+          <td>
+            <% if layer.kind == "splat" %>
+              <select class="layer-selection-layer" data-current="<%= layer.selection_layer_id %>" aria-label="Selection layer">
+                <option value="">— none —</option>
+                <% @spatial_model.spatial_layers.select { |l| %w[mesh ifc].include?(l.kind) }.each do |l| %>
+                  <option value="<%= l.id %>" <%= 'selected' if l.id == layer.selection_layer_id %>><%= l.title %> (<%= l.kind %>)</option>
+                <% end %>
+              </select>
+            <% end %>
+          </td>
+          <td>
+            <% if layer.kind == "pointcloud" %>
+              <input type="number" class="layer-scale" value="<%= layer.scale %>" min="0.000001" step="any" style="width:6rem" aria-label="Scale">
+            <% end %>
+          </td>
           <td class="buttons">
             <button type="button" class="button -transparent icon icon-delete text-danger layer-delete" title="Remove layer"></button>
           </td>

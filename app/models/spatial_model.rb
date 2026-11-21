@@ -108,6 +108,12 @@ class SpatialModel < ApplicationRecord
     update_column(:settings, merged) # rubocop:disable Rails/SkipsModelValidations
   end
 
+  # Scale applied to measured distances and areas: that of the first LiDAR
+  # (point cloud) layer, 1 when the model has none.
+  def measure_scale
+    spatial_layers.detect { |l| l.kind == "pointcloud" }&.scale || 1.0
+  end
+
   def location?
     latitude.present? && longitude.present?
   end

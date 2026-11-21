@@ -16,8 +16,21 @@
     this.openAnnotationModal(gd);
   };
 
+  // Scale of the first LiDAR layer by position (same rule as the server's
+  // SpatialModel#measure_scale).
+  SpatialViewerApp.prototype._measureScale = function() {
+    var metas = this.layerMeta || {}, best = null;
+    Object.keys(metas).forEach(function(id) {
+      var m = metas[id];
+      if (m && m.kind === 'pointcloud' && (!best || Number(m.position || 0) < Number(best.position || 0))) best = m;
+    });
+    var s = best ? Number(best.scale) : 1;
+    return s > 0 ? s : 1;
+  };
+
   SpatialViewerApp.prototype.finishMeasurement = function(ptA, ptB) {
-    var dist = ptA.distanceTo(ptB).toFixed(2);
+    // Euclidean distance x the LiDAR layer's scale (1 if there is none).
+    var dist = (ptA.distanceTo(ptB) * this._measureScale()).toFixed(2);
     var geom = new THREE.BufferGeometry().setFromPoints([ptA, ptB]);
     var mat = new THREE.LineDashedMaterial({ color: 0xf59e0b, dashSize: 0.2, gapSize: 0.1 });
     var line = new THREE.Line(geom, mat);
@@ -26,18 +39,26 @@
     // Result only: a small modal, no work package is created. The dashed line
     // stays on screen until the dialog is dismissed.
     var self = this;
+    this._openResultModal('Distance', dist + ' m', function() {
+      self.tempMarkupGroup.remove(line);
+      geom.dispose(); mat.dispose();
+    });
+  };
+
+  // Small modal with a label and a value (Esc / Enter / click to close).
+  SpatialViewerApp.prototype._openResultModal = function(label, value, onClose) {
     var back = document.createElement('div');
     back.className = 'sv-measure-backdrop';
     back.innerHTML = '<div class="sv-measure-modal" role="dialog" aria-modal="true">' +
-      '<div class="sv-measure-label">Distance</div>' +
+      '<div class="sv-measure-label"></div>' +
       '<div class="sv-measure-value"></div>' +
       '<button type="button" class="button -primary">OK</button></div>';
-    back.querySelector('.sv-measure-value').textContent = dist + ' m';
+    back.querySelector('.sv-measure-label').textContent = label;
+    back.querySelector('.sv-measure-value').textContent = value;
     var close = function() {
       if (back.parentNode) back.parentNode.removeChild(back);
-      self.tempMarkupGroup.remove(line);
-      geom.dispose(); mat.dispose();
       document.removeEventListener('keydown', onKey, true);
+      if (onClose) onClose();
     };
     var onKey = function(e) { if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); close(); } };
     back.addEventListener('click', function(e) { if (e.target === back) close(); });
@@ -503,7 +524,6 @@
         }
         var c = document.getElementById('annotationCountHeader');
         if (c) c.innerText = self.projectData.annotations.length;
-    XX
       } else {
         alert('Save error: ' + (result.errors || []).join(', '));
       }

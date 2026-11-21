@@ -42,6 +42,9 @@
       <button type="button" class="toolbar-btn active" id="btnPerspective" title="Perspective on (click for a flat, parallel-projection view)" aria-label="Toggle perspective" aria-pressed="true">
         <i class="sv-icon-perspective"></i>
       </button>
+      <button type="button" class="toolbar-btn" id="btnFitView" title="Fit all in view (keeps the viewing direction)" aria-label="Fit view">
+        <i class="sv-icon-fit"></i>
+      </button>
     </div>
 
     <div class="toolbar-section toolbar-tools-group">
@@ -71,6 +74,15 @@
       <button type="button" class="toolbar-btn tool-btn" id="toolMeasure" title="Measure 3D Distance" aria-label="Measure" data-tool="measure">
         <i class="sv-icon-measure"></i>
       </button>
+      <span class="tool-split">
+        <button type="button" class="toolbar-btn tool-btn" id="toolArea" title="Measure area — hold for polygon / free-hand" aria-label="Measure area" data-tool="area">
+          <i class="sv-icon-area"></i>
+        </button>
+        <div class="tool-popup" id="areaModes" style="display:none;">
+          <button type="button" class="toolbar-btn" data-area-mode="poly" title="Polygon: click to add vertices, click the first point to close" aria-label="Polygon area"><i class="sv-icon-poly"></i></button>
+          <button type="button" class="toolbar-btn" data-area-mode="free" title="Free-hand region" aria-label="Free-hand area"><i class="sv-icon-freeshape"></i></button>
+        </div>
+      </span>
       <button type="button" class="toolbar-btn text-danger" id="toolClear" title="Clear Active Drawing">
         <i class="icon-delete"></i>
       </button>
@@ -181,6 +193,7 @@
           <div class="render-section" data-render-section="general" id="globalSection">
             <div class="render-section-title global-head">
               <button type="button" class="layer-row-toggle" id="globalToggle" title="Global options" aria-expanded="false">&#9656;</button>
+              <i class="sv-kind-icon -settings" aria-hidden="true"></i>
               <span>Global</span>
             </div>
             <div class="global-body" id="globalBody" style="display:none">

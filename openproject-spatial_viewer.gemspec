@@ -2,7 +2,7 @@
 
 Gem::Specification.new do |s|
   s.name        = "openproject-spatial_viewer"
-  s.version     = "1.0.0"
+  s.version     = "0.1.0"
   s.authors     = ["OpenProject Customization"]
   s.email       = ["info@openproject.org"]
   s.summary     = "3D, Mesh & Gaussian Splatting Viewer for OpenProject"

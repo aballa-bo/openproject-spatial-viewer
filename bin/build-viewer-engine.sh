@@ -27,6 +27,8 @@ FRAGMENTS="
 23_parsers.js
 24_finalize.js
 25_point_lod.js
+26_ifc_tree.js
+27_layer_prefetch.js
 30_interaction_lasso.js
 40_annotations.js
 50_ui_vr_ar.js

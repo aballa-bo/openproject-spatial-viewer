@@ -14,6 +14,7 @@ OpenProject::Application.routes.draw do
         member do
           get :file
           get :octree
+          get :hierarchy
         end
       end
       resources :spatial_share_links, controller: 'spatial_share_links', only: [:index, :create, :destroy]

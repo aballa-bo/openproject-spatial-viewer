@@ -33,7 +33,10 @@
     this.showLoader('Checking 3D model...');
 
     // (6) HEAD first: learn the size before pulling the whole file.
-    fetch(url, { method: 'HEAD', credentials: 'same-origin' })
+    // A layer already downloaded (or downloading) by the prefetcher skips the
+    // HEAD check and goes straight to _downloadModel, which uses it.
+    var preDone = !!(this._prefetched && this._prefetched[url]);
+    (preDone ? Promise.reject(new Error('prefetched')) : fetch(url, { method: 'HEAD', credentials: 'same-origin' }))
       .then(function(head) {
         var ct = head.headers.get('content-type') || '';
         var lenHdr = head.headers.get('content-length');
@@ -79,6 +82,25 @@
 
   // Download the model, streaming for progress. Returns { buffer } / { pending }.
   SpatialViewerApp.prototype._downloadModel = function(url, format) {
+    var self = this;
+    var pre = this._prefetched && this._prefetched[url];
+    if (pre) {
+      delete this._prefetched[url];
+      self.showLoader('Loading' + self._loaderName() + ' (' + format.toUpperCase() + ')...');
+      return pre.promise.then(function(r) {
+        if (!r || !r.blob) return self._downloadModelNetwork(url, format);
+        if (r.total && !self._modelBytes) {
+          self._modelBytes = r.total;
+          self.heavyMode = r.total >= ((parseInt(self.container.dataset.heavyModelMb, 10) || 40) * 1048576);
+        }
+        self._modelBlob = r.blob;
+        return r.blob.arrayBuffer().then(function(b) { return { buffer: b }; });
+      });
+    }
+    return this._downloadModelNetwork(url, format);
+  };
+
+  SpatialViewerApp.prototype._downloadModelNetwork = function(url, format) {
     var self = this;
     self.showLoader('Downloading' + self._loaderName() + ' (' + format.toUpperCase() + ')...');
 
@@ -150,6 +172,7 @@
           chunks.push(r.value);
           loaded += r.value.length;
           var pct = total ? Math.round(loaded / total * 100) + '% ' : '';
+          self._layerProg(self._loadingLayerId, { state: 'download', loaded: loaded, total: total });
           self.showLoader('Downloading' + self._loaderName() + ': ' + pct + '(' + (loaded / 1048576).toFixed(1) + ' MB)');
           return read();
         });

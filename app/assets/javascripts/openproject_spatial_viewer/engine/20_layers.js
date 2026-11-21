@@ -96,6 +96,8 @@
       this._buildLayerPanel();
       return;
     }
+    this._layerProgress = {};
+    this._prefetchLayers(this._layerQueue);
     this._loadNextLayer();
   };
 
@@ -105,6 +107,8 @@
 
     if (!this._layerQueue || !this._layerQueue.length) {
       this._loadingLayerId = null;
+      this._prefetched = {};
+      if (this._pfWorker) { try { this._pfWorker.terminate(); } catch (e) {} this._pfWorker = null; }
       // fitToView / bbox helpers operate on the whole stack from here on.
       this.modelObject = this.layersRoot;
       this.hideLoader();
@@ -127,6 +131,7 @@
     if (conv && conv.status === 'error') {
       console.warn('[SpatialViewer] layer', l.id, 'conversion error:', conv.message);
       this.layerError[l.id] = 'conversion: ' + (conv.message || 'failed');
+      this._layerProg(l.id, { state: 'error' });
       return this._loadNextLayer();
     }
 
@@ -142,6 +147,8 @@
     }, 1200000);
 
     this._loadingLayerKind = l.kind;
+    var pg = (this._layerProgress || {})[l.id];
+    if (!pg || pg.state !== 'download') this._layerProg(l.id, { state: l.octree_url && l.kind === 'pointcloud' ? 'streaming' : 'processing' });
     // Big point clouds stream from a server-built octree (25_point_lod.js);
     // it falls back to the plain full download if that isn't available.
     if (l.kind === 'pointcloud' && l.octree_url) { this._loadPointOctree(l); return; }
@@ -206,6 +213,7 @@
       this._allLayerMeshes = (this._allLayerMeshes || []).concat(this._lastLayerMeshes || []);
       this.modelMeshObjects = this._allLayerMeshes;
       this._applyLayerOptions(id);
+      this._layerProg(id, { state: 'done' });
       if (meta.visible !== false) this._fadeLayer(id, true, 320);
     }
     this.modelObject = null;
@@ -227,6 +235,7 @@
     if (id == null) { this.showLoader('Error loading model: ' + msg); return; }
     this.layerError = this.layerError || {};
     this.layerError[id] = msg;
+    this._layerProg(id, { state: 'error' });
     this.modelObject = null;
     clearTimeout(this._layerWatchdog);
     this._loadNextLayer();
@@ -317,8 +326,18 @@
   };
 
   SpatialViewerApp.prototype.setLayerVisible = function(id, visible) {
-    this._fadeLayer(id, !!visible);
+    var self = this;
     if (this.layerMeta[id]) this.layerMeta[id].visible = !!visible;
+    // A heavy mesh layer shown for the first time has to build its picking
+    // structure and upload textures, which blocks the page for a while: say so
+    // and do it up front instead of on the first mouse press.
+    if (visible && this._layerNeedsWarmup(id)) {
+      this._warmLayer(id, function() {
+        if (self.layerMeta[id] && self.layerMeta[id].visible) self._fadeLayer(id, true);
+      });
+      return;
+    }
+    this._fadeLayer(id, !!visible);
     // Session-only: the layers shown when the viewer opens are set per layer
     // on the model's edit page ("Visible by default").
   };
@@ -420,7 +439,10 @@
   // ---- Per-layer display options (opacity, wireframe) ---------------------
   SpatialViewerApp.prototype._layerOpt = function(id) {
     this._layerOpts = this._layerOpts || {};
-    if (!this._layerOpts[id]) this._layerOpts[id] = { opacity: 1, wireframe: false };
+    if (!this._layerOpts[id]) {
+      var mx = this.layerMeta && this.layerMeta[id] && Number(this.layerMeta[id].exposure);
+      this._layerOpts[id] = { opacity: 1, wireframe: false, exposure: (mx > 0 ? mx : 1) };
+    }
     return this._layerOpts[id];
   };
 
@@ -449,6 +471,12 @@
           };
         }
         m.userData._layerOp = o.opacity;
+        // Per-layer exposure: scale the material colour (lit meshes, points).
+        // Splat shaders take it from their `exposure` uniform instead.
+        if (m.color && !m.isShaderMaterial) {
+          if (!m.userData._expOrig) m.userData._expOrig = m.color.clone();
+          m.color.copy(m.userData._expOrig).multiplyScalar(o.exposure == null ? 1 : o.exposure);
+        }
         // Splat/shader materials draw their own quads; wireframe is for meshes.
         if (!m.isShaderMaterial && 'wireframe' in m) m.wireframe = !!o.wireframe;
         if (!fading) {
@@ -462,6 +490,23 @@
     });
     // Splat layers take their opacity from a uniform.
     if (this._applySplatSettings) this._applySplatSettings();
+  };
+
+  // Remember the last exposure used on a layer (managers only; others keep it
+  // for the session). Debounced so dragging the slider sends one request.
+  SpatialViewerApp.prototype._saveLayerExposure = function(id) {
+    var self = this;
+    if (id === 'model' || this._embedMode || !(this.projectData && this.projectData.can_manage)) return;
+    this._expTimers = this._expTimers || {};
+    clearTimeout(this._expTimers[id]);
+    this._expTimers[id] = setTimeout(function() {
+      var url = self.apiUrl.replace('/api_data', '/spatial_layers/' + id);
+      fetch(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-Token': self.csrfToken },
+        body: JSON.stringify({ spatial_layer: { exposure: self._layerOpt(id).exposure } })
+      }).catch(function() {});
+    }, 700);
   };
 
   SpatialViewerApp.prototype._applyAllLayerOptions = function() {
@@ -527,6 +572,12 @@
       };
       tri.addEventListener('click', function() { setOpen(!self._layerExpanded[id]); });
       row.appendChild(tri);
+      // Layer type icon (photogrammetry / LiDAR / IFC / Gaussian splat).
+      var kindIcon = document.createElement('i');
+      kindIcon.className = 'sv-kind-icon -' + (m.kind || 'mesh');
+      var kindLabels = { mesh: 'Photogrammetry / mesh', pointcloud: 'LiDAR point cloud', ifc: 'IFC', splat: 'Gaussian splat' };
+      kindIcon.title = kindLabels[m.kind] || m.kind || '';
+      row.appendChild(kindIcon);
 
       var span = document.createElement('span');
       span.className = 'layer-row-name';
@@ -597,6 +648,25 @@
       opRow.appendChild(opLabel); opRow.appendChild(opIn);
       opts.appendChild(opRow);
 
+      var exRow = document.createElement('label');
+      exRow.className = 'render-row -range';
+      var exLabel = document.createElement('span');
+      exLabel.appendChild(document.createTextNode('Exposure '));
+      var exVal = document.createElement('b');
+      exVal.textContent = Number(lo.exposure).toFixed(2);
+      exLabel.appendChild(exVal);
+      var exIn = document.createElement('input');
+      exIn.type = 'range'; exIn.min = '0.2'; exIn.max = '2.5'; exIn.step = '0.05'; exIn.value = String(lo.exposure);
+      exIn.addEventListener('input', function() {
+        lo.exposure = parseFloat(exIn.value);
+        exVal.textContent = lo.exposure.toFixed(2);
+        m.exposure = lo.exposure;
+        self._applyLayerOptions(id);
+        self._saveLayerExposure(id);
+      });
+      exRow.appendChild(exLabel); exRow.appendChild(exIn);
+      opts.appendChild(exRow);
+
       if (m.kind === 'mesh' || m.kind === 'ifc') {
         var wfRow = document.createElement('label');
         wfRow.className = 'render-row -check';
@@ -624,6 +694,19 @@
         }
         note.textContent = kindCount[bk] > 1 ? 'These settings apply to all layers of this type.' : '';
         note.style.display = kindCount[bk] > 1 ? '' : 'none';
+      }
+      if (m.kind === 'ifc' && id !== 'model' && !self._embedMode) {
+        var ifcHost = document.createElement('div');
+        ifcHost.className = 'ifc-tree-host';
+        opts.appendChild(ifcHost);
+        // Fetched the first time the layer is expanded.
+        var loadTree = function() {
+          if (ifcHost.dataset.loaded) return;
+          ifcHost.dataset.loaded = '1';
+          self._buildIfcTree(id, ifcHost);
+        };
+        tri.addEventListener('click', function() { if (self._layerExpanded[id]) loadTree(); });
+        if (self._layerExpanded[id]) loadTree();
       }
       item.appendChild(opts);
       setOpen(!!self._layerExpanded[id]);

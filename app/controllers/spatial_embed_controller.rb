@@ -167,7 +167,7 @@ class SpatialEmbedController < ApplicationController
       converted = layer.needs_conversion? && layer.converted_file_ready?
       out << {
         id: layer.id, title: layer.title, kind: layer.kind, source_format: layer.source_format,
-        format: layer.viewer_format, visible: layer.visible,
+        format: layer.viewer_format, visible: layer.visible, selection_layer_id: layer.selection_layer_id, exposure: layer.exposure, scale: layer.scale,
         url: spatial_embed_layer_file_path(token: params[:token], layer_id: layer.id),
         conversion: layer.conversion_payload,
         file_size: (converted ? layer.converted_file_path.size : layer.file_attachment.filesize),

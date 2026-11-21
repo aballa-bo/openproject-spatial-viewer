@@ -8,6 +8,8 @@
         document.querySelectorAll('.tool-btn').forEach(function(b) { b.classList.remove('active'); });
         btn.classList.add('active');
         self.currentTool = btn.dataset.tool;
+        if (self._cancelPolygon) self._cancelPolygon();
+        if (self._cancelMeasure) self._cancelMeasure();
         self.controls.enabled = (self.currentTool === 'orbit');
         self.updateTooltip();
         if (self.currentTool !== 'orbit') self._ensureBVH();
@@ -15,6 +17,48 @@
     });
     var orbitBtn = document.getElementById('toolOrbit');
     if (orbitBtn) orbitBtn.classList.add('active');
+
+    // Area tool: long press opens the polygon / free-hand choice.
+    this._areaMode = this._areaMode || 'free';
+    var areaBtn = document.getElementById('toolArea'), areaMenu = document.getElementById('areaModes');
+    if (areaBtn && areaMenu) {
+      var markMode = function() {
+        areaMenu.querySelectorAll('[data-area-mode]').forEach(function(b) {
+          b.classList.toggle('-current', b.dataset.areaMode === self._areaMode);
+        });
+        areaBtn.title = 'Measure area (' + (self._areaMode === 'poly' ? 'polygon' : 'free-hand') + ') \u2014 hold to change';
+      };
+      markMode();
+      var pressTimer = null, longFired = false;
+      areaBtn.addEventListener('pointerdown', function(e) {
+        if (e.button !== 0) return;
+        longFired = false;
+        clearTimeout(pressTimer);
+        pressTimer = setTimeout(function() { longFired = true; areaMenu.style.display = ''; }, 450);
+      });
+      ['pointerup', 'pointerleave', 'pointercancel'].forEach(function(ev) {
+        areaBtn.addEventListener(ev, function() { clearTimeout(pressTimer); });
+      });
+      // A long press only opens the menu: swallow the click that follows it
+      // (capture phase, before the generic .tool-btn handler).
+      areaBtn.addEventListener('click', function(e) {
+        if (longFired) { e.stopImmediatePropagation(); e.preventDefault(); longFired = false; }
+      }, true);
+      areaBtn.addEventListener('contextmenu', function(e) { e.preventDefault(); });
+      areaMenu.querySelectorAll('[data-area-mode]').forEach(function(b) {
+        b.addEventListener('click', function() {
+          self._areaMode = b.dataset.areaMode;
+          markMode();
+          areaMenu.style.display = 'none';
+          areaBtn.click();
+        });
+      });
+      document.addEventListener('pointerdown', function(e) {
+        if (areaMenu.style.display !== 'none' && !areaMenu.contains(e.target) && e.target !== areaBtn && !areaBtn.contains(e.target)) {
+          areaMenu.style.display = 'none';
+        }
+      });
+    }
 
     var viewsBtn = document.getElementById('btnViews');
     var viewsMenu = document.getElementById('viewsDropdownMenu');
@@ -50,6 +94,9 @@
       perspBtn.title = on ? 'Perspective on (click for a flat, parallel-projection view)' : 'Perspective off (click to restore perspective)';
       perspBtn.innerHTML = '<i class="' + (on ? 'sv-icon-perspective' : 'sv-icon-grid') + '"></i>';
     });
+
+    var fitViewBtn = document.getElementById('btnFitView');
+    if (fitViewBtn) fitViewBtn.addEventListener('click', function() { self._fitKeepDirection(); });
 
     var navMenuBtn = document.getElementById('btnNavMenu');
     var navMenu = document.getElementById('navDropdownMenu');
@@ -107,6 +154,8 @@
 
     var clearBtn = document.getElementById('toolClear');
     if (clearBtn) clearBtn.addEventListener('click', function() {
+      if (self._cancelPolygon) self._cancelPolygon();
+      if (self._cancelMeasure) self._cancelMeasure();
       self.clearTempMarkup();
       self._clearLassoOverlay();
       self._setLassoHighlight(null);
@@ -203,6 +252,46 @@
     cam.position.copy(tgt).add(dir);
     this._perspectiveOff = off;
     cam.updateProjectionMatrix();
+    this.controls.update();
+    if (this._updateClip) this._updateClip(true);
+  };
+
+  // "Fit": keep the viewing direction (and up vector) and only move the camera
+  // so the whole reference bounding box is in view -- forward/back, and
+  // sideways/up/down as needed to centre it. The orbit target moves to the
+  // box centre. Works with perspective on or off (uses the current FOV).
+  SpatialViewerApp.prototype._fitKeepDirection = function(boxOverride) {
+    var cam = this.camera, tgt = this.controls && this.controls.target;
+    if (!cam || !tgt) return;
+    var box = (boxOverride && boxOverride.isBox3) ? boxOverride
+      : (this._referenceBox ? this._referenceBox() : new THREE.Box3());
+    if (box.isEmpty() && this.modelObject) box = this._robustObjectBox(this.modelObject);
+    if (box.isEmpty()) return;
+
+    var center = box.getCenter(new THREE.Vector3());
+    var fwd = tgt.clone().sub(cam.position);
+    if (fwd.lengthSq() < 1e-12) cam.getWorldDirection(fwd);
+    fwd.normalize();
+    var right = new THREE.Vector3().crossVectors(fwd, cam.up);
+    if (right.lengthSq() < 1e-12) right.set(1, 0, 0); // looking straight along "up"
+    right.normalize();
+    var up = new THREE.Vector3().crossVectors(right, fwd).normalize();
+
+    var tanV = Math.tan(THREE.MathUtils.degToRad(cam.fov) / 2);
+    var tanH = tanV * (cam.aspect || 1);
+    var min = box.min, max = box.max, v = new THREE.Vector3();
+    var dist = 0, minZ = Infinity, span = box.getSize(new THREE.Vector3()).length() || 1;
+    for (var i = 0; i < 8; i++) {
+      v.set(i & 1 ? max.x : min.x, i & 2 ? max.y : min.y, i & 4 ? max.z : min.z).sub(center);
+      var x = Math.abs(v.dot(right)), y = Math.abs(v.dot(up)), z = v.dot(fwd);
+      if (z < minZ) minZ = z;
+      dist = Math.max(dist, x / tanH - z, y / tanV - z);
+    }
+    dist = Math.max(dist * 1.08, -minZ + span * 0.02); // small margin; nearest corner stays in front
+
+    tgt.copy(center);
+    cam.position.copy(center).addScaledVector(fwd, -dist);
+    cam.lookAt(tgt);
     this.controls.update();
     if (this._updateClip) this._updateClip(true);
   };
@@ -865,7 +954,7 @@
   SpatialViewerApp.prototype.updateTooltip = function() {
     var tip = document.getElementById('drawingTooltip');
     if (!tip) return;
-    var msgs = { pin: 'Click on the surface to place a 3D pin.', draw: 'Click and drag along the surface to draw a polyline.', lasso: 'Drag around a region — the outline closes as you draw and the model surface inside it is highlighted.', measure: 'Click first point then second point to measure.' };
+    var msgs = { pin: 'Click on the surface to place a 3D pin.', draw: 'Click and drag along the surface to draw a polyline.', lasso: 'Drag around a region — the outline closes as you draw and the model surface inside it is highlighted.', measure: 'Click first point then second point to measure.', area: 'Measure area: hold the button to choose polygon (click vertices, click the first point to close) or free-hand (drag around a region).' };
     if (msgs[this.currentTool]) { tip.innerText = msgs[this.currentTool]; tip.style.display = 'block'; }
     else { tip.style.display = 'none'; }
   };

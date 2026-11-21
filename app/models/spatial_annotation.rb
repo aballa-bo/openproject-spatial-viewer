@@ -293,7 +293,9 @@ class SpatialAnnotation < ApplicationRecord
   # save, so any future change to geometry_data (e.g. redrawing the lasso)
   # automatically keeps it current without the client needing to send it.
   def compute_lasso_area
-    self.area = annotation_type == "lasso_selection" ? calculate_fill_area : nil
+    raw = annotation_type == "lasso_selection" ? calculate_fill_area : nil
+    # Area = Euclidean area x the LiDAR layer's scale (as specified).
+    self.area = raw && (raw * (spatial_model&.measure_scale || 1.0)).round(4)
   end
 
   # Prefers the exact triangulated surface patch (fill_grid); falls back to

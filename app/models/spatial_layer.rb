@@ -25,6 +25,8 @@ class SpatialLayer < ApplicationRecord
   CONVERTIBLE_FORMATS = %w[ifc laz e57].freeze
 
   validates :title, presence: true
+  validates :scale, numericality: { greater_than: 0, less_than_or_equal_to: 1_000_000 }
+  validates :exposure, numericality: { greater_than_or_equal_to: 0.1, less_than_or_equal_to: 4 }
   validates :kind, inclusion: { in: KINDS }
   validates :source_format, inclusion: { in: FORMATS }
   validates :spatial_model, presence: true

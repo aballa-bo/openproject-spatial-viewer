@@ -20,12 +20,22 @@ module OpenProject
         '/assets/openproject_spatial_viewer/vendor.bundle.js'      => "#{JS_DIR}/vendor.bundle.js",
         '/assets/openproject_spatial_viewer/vendor/mesh-bvh.js'    => "#{JS_DIR}/vendor/mesh-bvh.js",
         '/assets/openproject_spatial_viewer/viewer_engine.js'      => "#{JS_DIR}/viewer_engine.js",
-        '/assets/openproject_spatial_viewer/layer_manager.js'      => "#{JS_DIR}/layer_manager.js"
+        '/assets/openproject_spatial_viewer/layer_manager.js'      => "#{JS_DIR}/layer_manager.js",
+        '/assets/openproject_spatial_viewer/doc_lightbox.js'       => "#{JS_DIR}/doc_lightbox.js",
+        '/assets/openproject_spatial_viewer/doc_lightbox.css'      => "#{CSS_DIR}/doc_lightbox.css"
       }.freeze
 
       def view_layouts_base_html_head(context = {})
         controller = context[:controller]
         return '' unless controller
+
+        # Image lightbox on the Documents pages.
+        if defined?(::DocumentsController) && controller.is_a?(::DocumentsController)
+          vc = controller.view_context
+          return "#{vc.stylesheet_link_tag(bust('/assets/openproject_spatial_viewer/doc_lightbox.css'))}\n" \
+                 "#{vc.nonced_javascript_include_tag(bust('/assets/openproject_spatial_viewer/doc_lightbox.js'), skip_pipeline: true)}".html_safe
+        end
+
         return '' unless controller.is_a?(::SpatialModelsController) ||
                          controller.is_a?(::SpatialAnnotationsController) ||
                          controller.is_a?(::SpatialLayersController) ||

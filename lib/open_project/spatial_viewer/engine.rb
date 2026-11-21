@@ -15,7 +15,7 @@ module OpenProject
         project_module :spatial_viewer do
           permission :view_spatial_models,
                      { spatial_models: %i[index show api_data model_file download_exe],
-                       spatial_layers: %i[file octree],
+                       spatial_layers: %i[file octree hierarchy],
                        spatial_annotations: %i[index snapshot] },
                      permissible_on: :project,
                      public: true
