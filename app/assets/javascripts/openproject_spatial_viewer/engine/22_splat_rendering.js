@@ -310,6 +310,7 @@
     '  float maxR = min(min(viewport.x, viewport.y), uMaxRadius);', // uMaxRadius: 1024 normally, lower in VR (overdraw)
     '  float r1 = min(sqrt(lambda1) * 3.0, maxR);',
     '  float r2 = min(sqrt(lambda2) * 3.0, maxR);',
+    '  if (uCenterMode > 0.5) { r1 = uCenterPx; r2 = uCenterPx; }',
     '  vec2 screenOffsetPx = corner.x * eig1 * r1 + corner.y * eig2 * r2;',
     '  vec4 clip = projectionMatrix * mvPosition;',
     '  clip.xy += screenOffsetPx * (2.0 / viewport) * clip.w;',
@@ -380,6 +381,8 @@
     'uniform float uSplatScale;',
     'uniform float uMinAlpha;',
     'uniform float uMaxRadius;',
+    'uniform float uCenterMode;',
+    'uniform float uCenterPx;',
     'uniform float uShDegree;',
     'uniform vec3 uShFlip;',
     'varying vec4 vColor;',
@@ -416,6 +419,7 @@
     'varying vec2 vPos;',
     'varying float vDepth;',
     'uniform float uDepthMode;',  // 0 = colour, 1 = depth heat map
+    'uniform float uCenterMode;', // 1 = centres only: solid round dots
     'uniform vec2 uDepthRange;',  // view-space near/far mapped to the ends of the ramp
     // Jet-style ramp, red (near) -> yellow -> green -> cyan -> blue (far).
     'vec3 depthHeat(float t) {',
@@ -425,8 +429,8 @@
     'void main() {',
     '  float r2 = dot(vPos, vPos);',
     '  if (r2 > 9.0) discard;', // outside the 3-sigma ellipse
-    '  float falloff = exp(-0.5 * r2);',
-    '  float a = vColor.a * falloff * opacity;',
+    '  float falloff = (uCenterMode > 0.5) ? 1.0 : exp(-0.5 * r2);',
+    '  float a = ((uCenterMode > 0.5) ? 1.0 : vColor.a) * falloff * opacity;',
     '  if (a < 0.01) discard;',
     '  vec3 outColor = clamp(vColor.rgb * exposure, 0.0, 1.0);',
     '  if (uDepthMode > 0.5) {',
@@ -544,6 +548,8 @@
         uShDegree: { value: 2.0 },
         uShFlip: { value: new THREE.Vector3(1, 1, 1) },
         uDepthMode: { value: 0.0 },
+        uCenterMode: { value: 0.0 },
+        uCenterPx: { value: 2.0 },
         uDepthK: { value: 1.0 },
         uDepthRange: { value: new THREE.Vector2(0.1, 100) }
       },
@@ -932,6 +938,8 @@
     'uniform float uSplatScale;',
     'uniform float uMinAlpha;',
     'uniform float uMaxRadius;',
+    'uniform float uCenterMode;',
+    'uniform float uCenterPx;',
     'uniform float uShDegree;',
     'uniform vec3 uShFlip;',
     'varying vec4 vColor;',
@@ -1041,6 +1049,8 @@
         uShDegree: { value: 2.0 },
         uShFlip: { value: new THREE.Vector3(1, 1, 1) },
         uDepthMode: { value: 0.0 },
+        uCenterMode: { value: 0.0 },
+        uCenterPx: { value: 2.0 },
         uDepthK: { value: 1.0 },
         uDepthRange: { value: new THREE.Vector2(0.1, 100) },
         texSize: { value: new THREE.Vector2(W, H) },

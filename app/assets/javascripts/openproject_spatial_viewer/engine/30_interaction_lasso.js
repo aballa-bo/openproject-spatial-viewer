@@ -369,7 +369,7 @@
 
     var todo = this.modelMeshObjects.filter(function(m) {
       if (group && m.userData.layerVisibilityGroup !== group) return false;
-      if (!m.isMesh || !m.geometry || m.geometry.boundsTree) return false;
+      if (!m.isMesh || !m.geometry || m.geometry.boundsTree || m.userData._bvhPending) return false;
       var pos = m.geometry.attributes && m.geometry.attributes.position;
       return pos && pos.count > 30 && pos.count <= 9000000;
     });
@@ -401,6 +401,7 @@
     return (this.modelMeshObjects || []).filter(function(m) {
       var lg = m.userData && m.userData.layerVisibilityGroup;
       if (lg && lg.visible === false) return false;
+      if (m.userData._bvhPending) return false; // BVH still being built in a worker
       // parts hidden from the IFC structure tree
       for (var o = m; o && o !== lg; o = o.parent) { if (o.visible === false) return false; }
       return true;

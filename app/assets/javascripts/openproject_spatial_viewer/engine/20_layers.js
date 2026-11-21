@@ -66,6 +66,8 @@
     this._splatRenderers = [];
     (this._pointLODs || []).forEach(function(l) { try { l.dispose(); } catch (e) {} });
     this._pointLODs = [];
+    this._bvhGen = (this._bvhGen || 0) + 1; // results of older BVH builds are ignored
+    this._bvhPendingCount = 0;
     this._allLayerMeshes = [];
     this.modelMeshObjects = [];
     this._loadingLayerId = null;
@@ -214,6 +216,7 @@
       this.modelMeshObjects = this._allLayerMeshes;
       this._applyLayerOptions(id);
       this._layerProg(id, { state: 'done' });
+      this._buildBVHAsync(g);
       if (meta.visible !== false) this._fadeLayer(id, true, 320);
     }
     this.modelObject = null;

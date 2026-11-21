@@ -189,7 +189,7 @@
     var g = this.layerGroups && this.layerGroups[id];
     if (!g) return false;
     return (this.modelMeshObjects || []).some(function(m) {
-      if (m.userData.layerVisibilityGroup !== g || !m.isMesh || !m.geometry || m.geometry.boundsTree) return false;
+      if (m.userData.layerVisibilityGroup !== g || !m.isMesh || !m.geometry || m.geometry.boundsTree || m.userData._bvhPending) return false;
       var pos = m.geometry.attributes && m.geometry.attributes.position;
       return pos && pos.count > 30 && pos.count <= 9000000;
     });
@@ -208,7 +208,11 @@
     requestAnimationFrame(function() { requestAnimationFrame(function() { setTimeout(function() {
       var t0 = performance.now(), tBvh = 0, tTex = 0;
       try {
-        if (self._layerNeedsBVH(id)) { self._ensureBVH(g); tBvh = performance.now() - t0; }
+        if (self._layerNeedsBVH(id)) {
+          // in a worker when possible (picking on this layer is off until it is ready)
+          if (!self._buildBVHAsync(g)) self._ensureBVH(g);
+          tBvh = performance.now() - t0;
+        }
         var t1 = performance.now();
         if (self.renderer && self.renderer.initTexture) {
           g.traverse(function(o) {
@@ -257,4 +261,107 @@
         });
       }).observe({ entryTypes: ['longtask'] });
     } catch (err) {}
+  };
+
+  // ---- BVH built in Web Workers --------------------------------------------
+  // The picking tree of each mesh is built off the main thread right after its
+  // layer is loaded, so nothing is left to build (and block the page) when the
+  // layer is first shown or clicked. A mesh still being built is skipped by
+  // the raycast target list (m.userData._bvhPending) instead of falling back
+  // to a brute-force raycast. If workers are unavailable the old synchronous
+  // build (_ensureBVH) is used.
+  var BVH_WORKERS = 2;
+
+  SpatialViewerApp.prototype._bvhPool = function() {
+    if (this._bvhWorkers) return this._bvhWorkers;
+    if (!window.Worker || !window.MeshBVHLib) return null;
+    var self = this, list = [];
+    try {
+      for (var i = 0; i < BVH_WORKERS; i++) {
+        var w = new Worker('/assets/openproject_spatial_viewer/bvh_worker.js');
+        w.onmessage = function(e) { self._onBvhResult(e.data || {}); };
+        w.onerror = function() { self._bvhWorkersFailed(); };
+        list.push(w);
+      }
+    } catch (err) { return null; }
+    this._bvhWorkers = list;
+    this._bvhJobs = {};
+    this._bvhSeq = 0;
+    return list;
+  };
+
+  SpatialViewerApp.prototype._bvhWorkersFailed = function() {
+    var self = this;
+    console.warn('[SpatialViewer] BVH worker failed; falling back to the main thread');
+    (this._bvhWorkers || []).forEach(function(w) { try { w.terminate(); } catch (e) {} });
+    this._bvhWorkers = null;
+    this._bvhNoWorker = true;
+    var jobs = this._bvhJobs || {};
+    this._bvhJobs = {};
+    Object.keys(jobs).forEach(function(k) { jobs[k].mesh.userData._bvhPending = false; });
+    this._bvhReady = false; // let _ensureBVH build the rest synchronously
+  };
+
+  SpatialViewerApp.prototype._onBvhResult = function(m) {
+    var job = this._bvhJobs && this._bvhJobs[m.id];
+    if (!job) return;
+    delete this._bvhJobs[m.id];
+    var mesh = job.mesh, geo = mesh.geometry;
+    mesh.userData._bvhPending = false;
+    if (job.gen !== this._bvhGen) return; // layers were reloaded meanwhile
+    if (m.type === 'done') {
+      try {
+        geo.boundsTree = window.MeshBVHLib.MeshBVH.deserialize({ roots: m.roots, index: m.index }, geo, { setIndex: true });
+      } catch (err) {
+        console.warn('[SpatialViewer] BVH deserialize failed:', err);
+        this._bvhReady = false;
+      }
+    } else {
+      console.warn('[SpatialViewer] BVH worker error:', m.error);
+      this._bvhReady = false; // sync fallback for this mesh
+    }
+    this._bvhPendingCount = Math.max(0, (this._bvhPendingCount || 1) - 1);
+    if (!this._bvhPendingCount) {
+      console.log('[SpatialViewer] BVH ready for all meshes (' + Math.round(performance.now() - this._bvhT0) + ' ms since start)');
+      if (this._bvhWaiters) { var w = this._bvhWaiters; this._bvhWaiters = []; w.forEach(function(f) { f(); }); }
+    }
+  };
+
+  // Start building the BVH of every pending mesh of a layer group (or of all
+  // layers). Returns true if work was queued.
+  SpatialViewerApp.prototype._buildBVHAsync = function(group) {
+    var pool = this._bvhPool();
+    if (!pool || this._bvhNoWorker || !window.MeshBVHLib) return false;
+    var self = this, queued = 0;
+    this._bvhGen = this._bvhGen || 0;
+    (this.modelMeshObjects || []).forEach(function(m) {
+      if (group && m.userData.layerVisibilityGroup !== group) return;
+      if (!m.isMesh || !m.geometry || m.geometry.boundsTree || m.userData._bvhPending) return;
+      var pos = m.geometry.attributes && m.geometry.attributes.position;
+      if (!pos || pos.isInterleavedBufferAttribute || !pos.array || !(pos.count > 30 && pos.count <= 9000000)) return;
+      var idx = m.geometry.index;
+      if (idx && idx.isInterleavedBufferAttribute) return;
+      var id = ++self._bvhSeq;
+      self._bvhJobs[id] = { mesh: m, gen: self._bvhGen };
+      m.userData._bvhPending = true;
+      if (!self._bvhPendingCount) self._bvhT0 = performance.now();
+      self._bvhPendingCount = (self._bvhPendingCount || 0) + 1;
+      queued++;
+      var pc = pos.array.slice();
+      var ic = idx && idx.array ? idx.array.slice() : null;
+      var transfer = [pc.buffer]; if (ic) transfer.push(ic.buffer);
+      pool[id % pool.length].postMessage({
+        type: 'build', id: id,
+        threeUrl: '/assets/openproject_spatial_viewer/vendor.bundle.js',
+        bvhUrl: '/assets/openproject_spatial_viewer/vendor/mesh-bvh.js',
+        position: pc, itemSize: pos.itemSize, normalized: !!pos.normalized, index: ic,
+        groups: (m.geometry.groups || []).map(function(g) { return { start: g.start, count: g.count, materialIndex: g.materialIndex }; })
+      }, transfer);
+    });
+    return queued > 0;
+  };
+
+  SpatialViewerApp.prototype._bvhIdle = function(fn) {
+    if (!this._bvhPendingCount) return fn();
+    (this._bvhWaiters = this._bvhWaiters || []).push(fn);
   };
