@@ -108,9 +108,11 @@ class SpatialAnnotationsController < ApplicationController
               params.dig(:spatial_annotation, :title).presence ||
               "3D annotation"
 
-    type = @project.types.find_by(id: params[:wp_type_id]) ||
-           @project.types.where(is_default: true).first ||
-           @project.types.order(:position).first
+    # OpenProject >= 17 replaced Project#types with Project#enabled_types.
+    types = @project.respond_to?(:enabled_types) ? @project.enabled_types : @project.types
+    type = types.find_by(id: params[:wp_type_id]) ||
+           (::Type.column_names.include?("is_default") ? types.where(is_default: true).first : nil) ||
+           types.reorder(:position).first
 
     attributes = {
       project: @project,

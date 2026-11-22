@@ -20,7 +20,8 @@ class SpatialModelsController < ApplicationController
     # Data for the inline "New Work Package" panel shown beside the viewer.
     # Mirrors the standard OpenProject work package form (as used by the BCF
     # module) so the same set of attributes can be filled in place.
-    @wp_types = @project.types.order(:position)
+    # OpenProject >= 17 replaced Project#types with Project#enabled_types.
+    @wp_types = (@project.respond_to?(:enabled_types) ? @project.enabled_types : @project.types).reorder(:position)
     @wp_statuses = Status.order(:position)
     @wp_priorities = IssuePriority.active.order(:position)
     @wp_assignees = Principal.possible_assignee(@project).ordered_by_name.limit(200)

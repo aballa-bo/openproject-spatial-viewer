@@ -336,7 +336,7 @@
                 <label>Type</label>
                 <select id="caType" class="form-select">
                   <% @wp_types.each do |t| %>
-                    <option value="<%= t.id %>" <%= 'selected' if t.is_default %>><%= t.name %></option>
+                    <option value="<%= t.id %>" <%= 'selected' if t.respond_to?(:is_default) && t.is_default %>><%= t.name %></option>
                   <% end %>
                 </select>
               </div>
