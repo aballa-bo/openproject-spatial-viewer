@@ -31,7 +31,15 @@ class AddAreaCustomFieldForAnnotations < ActiveRecord::Migration[7.1]
     # Enabled for every existing type -- a type created later needs it
     # enabled manually via Administration > Custom fields, same as any
     # other plugin-provided custom field.
-    (::Type.all.to_a - field.types.to_a).each { |t| field.types << t }
+    #
+    # OpenProject >= 17 links custom fields to type *variants*
+    # (custom_fields_types.type_variant_id) instead of types; older versions
+    # use WorkPackageCustomField#types.
+    if field.respond_to?(:type_variants)
+      (::TypeVariant.all.to_a - field.type_variants.to_a).each { |v| field.type_variants << v }
+    else
+      (::Type.all.to_a - field.types.to_a).each { |t| field.types << t }
+    end
   end
 
   def down
