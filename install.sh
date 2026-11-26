@@ -96,7 +96,13 @@ else
 fi
 
 # Cache directory for converted models (IFC -> GLB)
-STORAGE_ROOT="$(openproject run bundle exec rails runner 'print OpenProject::Configuration.attachments_storage_path' 2>/dev/null)"
+# Rails may print log lines before the value: keep only the last line and
+# require an absolute path, otherwise mkdir would create junk directories.
+STORAGE_ROOT="$(openproject run bundle exec rails runner 'puts OpenProject::Configuration.attachments_storage_path' 2>/dev/null | tail -n 1 | tr -d '\r')"
+case "$STORAGE_ROOT" in
+  /*) ;;
+  *) echo "[!] Could not determine the attachments storage path; using /var/db/openproject/files"; STORAGE_ROOT="/var/db/openproject/files" ;;
+esac
 CONV_DIR="$STORAGE_ROOT/spatial_viewer"
 mkdir -p "$CONV_DIR" 2>/dev/null && chown -R openproject:openproject "$CONV_DIR" 2>/dev/null || true
 
