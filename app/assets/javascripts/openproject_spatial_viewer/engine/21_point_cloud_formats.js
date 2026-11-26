@@ -36,7 +36,8 @@
     // A layer already downloaded (or downloading) by the prefetcher skips the
     // HEAD check and goes straight to _downloadModel, which uses it.
     var preDone = !!(this._prefetched && this._prefetched[url]);
-    (preDone ? Promise.reject(new Error('prefetched')) : fetch(url, { method: 'HEAD', credentials: 'same-origin' }))
+    // A layer already in the browser's layer cache is treated as prefetched too.
+    this._probeLayer(url, preDone)
       .then(function(head) {
         var ct = head.headers.get('content-type') || '';
         var lenHdr = head.headers.get('content-length');
@@ -150,6 +151,7 @@
       if (!response.body || !window.ReadableStream) {
         return response.arrayBuffer().then(function(b) {
           try { self._modelBlob = new Blob([b]); } catch (e) {}
+          self._layerCachePut(url, self._modelBlob, ct);
           return { buffer: b };
         });
       }
@@ -167,6 +169,7 @@
             var blob = new Blob(chunks);
             chunks.length = 0;
             self._modelBlob = blob;
+            self._layerCachePut(url, blob, ct);
             return blob.arrayBuffer().then(function(b) { return { buffer: b }; });
           }
           chunks.push(r.value);

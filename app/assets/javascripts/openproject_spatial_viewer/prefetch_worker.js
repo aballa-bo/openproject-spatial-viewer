@@ -29,7 +29,7 @@ self.onmessage = function (e) {
       });
     };
     return pump().then(function () {
-      self.postMessage({ type: 'done', id: id, blob: new Blob(chunks), total: total });
+      self.postMessage({ type: 'done', id: id, blob: new Blob(chunks), total: total, contentType: ct });
     });
   }).catch(fail);
 };

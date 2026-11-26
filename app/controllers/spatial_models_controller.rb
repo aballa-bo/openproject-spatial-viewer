@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 class SpatialModelsController < ApplicationController
+  include SpatialViewerCachedFiles
+
   before_action :find_project_by_project_id
   before_action :authorize
   before_action :find_model, only: %i[show edit update destroy api_data model_file set_start_view set_saved_view download_exe]
@@ -171,7 +173,7 @@ class SpatialModelsController < ApplicationController
     end
 
     file_url = if @spatial_model.model_attachment.present?
-                 model_file_project_spatial_model_path(@project, @spatial_model)
+                 model_file_project_spatial_model_path(@project, @spatial_model, v: spatial_file_version(@spatial_model))
                end
 
     # Real uncompressed byte size. The front-end can't rely on the Content-Length
@@ -223,7 +225,7 @@ class SpatialModelsController < ApplicationController
         source_format: @spatial_model.model_format,
         format: @spatial_model.viewer_format,
         visible: true,
-        url: model_file_project_spatial_model_path(@project, @spatial_model),
+        url: model_file_project_spatial_model_path(@project, @spatial_model, v: spatial_file_version(@spatial_model)),
         conversion: conversion_payload,
         file_size: (converted ? @spatial_model.converted_file_path.size : @spatial_model.model_attachment.filesize)
       }
@@ -244,7 +246,7 @@ class SpatialModelsController < ApplicationController
         selection_layer_id: layer.selection_layer_id,
         exposure: layer.exposure,
         scale: layer.scale,
-        url: file_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer),
+        url: file_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer, v: spatial_file_version(layer)),
         conversion: layer.conversion_payload,
         file_size: (converted ? layer.converted_file_path.size : layer.file_attachment.filesize),
         octree_url: (layer.octree_ready? ? octree_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer, v: layer.file_attachment.id) : nil)
@@ -301,6 +303,8 @@ class SpatialModelsController < ApplicationController
   def serve_raw_attachment
     attachment = @spatial_model.model_attachment
     if attachment.present? && File.exist?(attachment.diskfile.path)
+      return if spatial_file_not_modified?(@spatial_model, attachment.diskfile.path)
+
       zip = File.extname(attachment.filename.to_s).casecmp(".zip").zero?
       type = if zip
                "application/zip"
@@ -318,6 +322,8 @@ class SpatialModelsController < ApplicationController
 
   def serve_converted_model
     if @spatial_model.converted_file_ready?
+      return if spatial_file_not_modified?(@spatial_model, @spatial_model.converted_file_path)
+
       send_file @spatial_model.converted_file_path.to_s,
                 filename: "#{@spatial_model.title.parameterize.presence || 'model'}.glb",
                 type: 'model/gltf-binary',

@@ -11,6 +11,8 @@
 # Frame-ancestors defaults to any origin; restrict with the environment
 # variable SPATIAL_VIEWER_EMBED_ORIGINS="https://moodle.example.edu https://…".
 class SpatialEmbedController < ApplicationController
+  include SpatialViewerCachedFiles
+
   skip_before_action :check_if_login_required
   # Access is decided by the secret share token (find_share), not by roles.
   no_authorization_required! :show, :api_data, :model_file, :layer_file, :layer_octree
@@ -49,7 +51,7 @@ class SpatialEmbedController < ApplicationController
       description: nil,
       model_format: model.viewer_format,
       source_format: model.model_format,
-      model_url: (model.model_attachment.present? ? spatial_embed_model_file_path(token: params[:token]) : nil),
+      model_url: (model.model_attachment.present? ? spatial_embed_model_file_path(token: params[:token], v: spatial_file_version(model)) : nil),
       file_size:,
       conversion: conversion_payload(model),
       layers: layers_payload(model),
@@ -68,9 +70,12 @@ class SpatialEmbedController < ApplicationController
 
     if model.needs_conversion?
       return serve_pending(model) unless model.converted_file_ready?
+      return if spatial_file_not_modified?(model, model.converted_file_path)
 
       send_file model.converted_file_path.to_s, filename: "model.glb", type: "model/gltf-binary", disposition: "inline"
     elsif File.exist?(attachment.diskfile.path)
+      return if spatial_file_not_modified?(model, attachment.diskfile.path)
+
       zip = File.extname(attachment.filename.to_s).casecmp(".zip").zero?
       type = zip ? "application/zip" : (SpatialModelsController::MODEL_CONTENT_TYPES[model.model_format] || "application/octet-stream")
       send_file attachment.diskfile.path, filename: attachment.filename, type:, disposition: "inline"
@@ -86,12 +91,14 @@ class SpatialEmbedController < ApplicationController
     types = SpatialLayersController::LAYER_CONTENT_TYPES
     if layer.needs_conversion?
       return serve_pending(layer) unless layer.converted_file_ready?
+      return if spatial_file_not_modified?(layer, layer.converted_file_path)
 
       send_file layer.converted_file_path.to_s, filename: "layer-#{layer.id}.#{layer.viewer_format}",
                                                   type: types[layer.viewer_format] || "application/octet-stream", disposition: "inline"
     else
       attachment = layer.file_attachment
       return render_404 unless attachment && File.exist?(attachment.diskfile.path)
+      return if spatial_file_not_modified?(layer, attachment.diskfile.path)
 
       zip = File.extname(attachment.filename.to_s).casecmp(".zip").zero?
       send_file attachment.diskfile.path, filename: attachment.filename,
@@ -155,7 +162,7 @@ class SpatialEmbedController < ApplicationController
       out << {
         id: "model", title: model.title, kind: SpatialLayer.kind_for(model.model_format),
         source_format: model.model_format, format: model.viewer_format, visible: true,
-        url: spatial_embed_model_file_path(token: params[:token]),
+        url: spatial_embed_model_file_path(token: params[:token], v: spatial_file_version(model)),
         conversion: conversion_payload(model),
         file_size: (converted ? model.converted_file_path.size : model.model_attachment.filesize)
       }
@@ -168,7 +175,7 @@ class SpatialEmbedController < ApplicationController
       out << {
         id: layer.id, title: layer.title, kind: layer.kind, source_format: layer.source_format,
         format: layer.viewer_format, visible: layer.visible, selection_layer_id: layer.selection_layer_id, exposure: layer.exposure, scale: layer.scale,
-        url: spatial_embed_layer_file_path(token: params[:token], layer_id: layer.id),
+        url: spatial_embed_layer_file_path(token: params[:token], layer_id: layer.id, v: spatial_file_version(layer)),
         conversion: layer.conversion_payload,
         file_size: (converted ? layer.converted_file_path.size : layer.file_attachment.filesize),
         octree_url: (layer.octree_ready? ? spatial_embed_layer_octree_path(token: params[:token], layer_id: layer.id, v: layer.file_attachment.id) : nil)

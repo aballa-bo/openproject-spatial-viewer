@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 class SpatialLayersController < ApplicationController
+  include SpatialViewerCachedFiles
+
   before_action :find_project_by_project_id
   before_action :authorize
   before_action :find_model
@@ -174,6 +176,8 @@ class SpatialLayersController < ApplicationController
   def serve_raw
     attachment = @layer.file_attachment
     if attachment && File.exist?(attachment.diskfile.path)
+      return if spatial_file_not_modified?(@layer, attachment.diskfile.path)
+
       zip = File.extname(attachment.filename.to_s).casecmp(".zip").zero?
       type = zip ? "application/zip" : (LAYER_CONTENT_TYPES[@layer.source_format] || "application/octet-stream")
       send_file attachment.diskfile.path, filename: attachment.filename, type:, disposition: "inline"
@@ -184,6 +188,8 @@ class SpatialLayersController < ApplicationController
 
   def serve_converted
     if @layer.converted_file_ready?
+      return if spatial_file_not_modified?(@layer, @layer.converted_file_path)
+
       send_file @layer.converted_file_path.to_s,
                 filename: "layer-#{@layer.id}.#{@layer.viewer_format}",
                 type: LAYER_CONTENT_TYPES[@layer.viewer_format] || "application/octet-stream",
@@ -214,7 +220,7 @@ class SpatialLayersController < ApplicationController
       selection_layer_id: layer.selection_layer_id,
       exposure: layer.exposure,
       scale: layer.scale,
-      url: file_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer),
+      url: file_project_spatial_model_spatial_layer_path(@project, @spatial_model, layer, v: spatial_file_version(layer)),
       conversion: layer.conversion_payload,
       file_size: (layer.needs_conversion? && layer.converted_file_ready? ? layer.converted_file_path.size : layer.file_attachment&.filesize),
       octree_url: octree_url_for(layer)

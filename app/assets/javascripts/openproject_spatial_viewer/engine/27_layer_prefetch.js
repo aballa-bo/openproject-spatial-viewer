@@ -7,6 +7,88 @@
   // is picked up from memory by _downloadModel instead of being fetched again.
   var PREFETCH_PARALLEL = 3;
 
+  // ---- Persistent layer cache (browser Cache Storage) ----------------------
+  // Layer URLs carry ?v=<version of the served file> (SpatialViewer::FileVersion).
+  // A layer whose URL (= version) is already in the cache is read from disk
+  // instead of being downloaded again; a changed layer has a new URL, misses,
+  // is downloaded and replaces its older versions. Cache Storage is used rather
+  // than the HTTP cache because browsers do not keep files of hundreds of MB
+  // there (Firefox: 50 MB per entry). Needs a secure context (HTTPS).
+  var LAYER_CACHE = 'spatial-viewer-layers-v1';
+  var LAYER_CACHE_MAX_AGE_MS = 60 * 24 * 3600 * 1000; // drop entries not refreshed for 60 days
+
+  function layerCacheUsable(url) {
+    return !!url && typeof caches !== 'undefined' && window.isSecureContext && /[?&]v=[0-9a-f]+/.test(url);
+  }
+  function layerCacheKey(url) { return new URL(url, window.location.href).href; }
+
+  // Resolves to { blob, total, cached: true } or null.
+  SpatialViewerApp.prototype._layerCacheGet = function(url) {
+    if (!layerCacheUsable(url)) return Promise.resolve(null);
+    return caches.open(LAYER_CACHE).then(function(c) {
+      return c.match(layerCacheKey(url));
+    }).then(function(resp) {
+      if (!resp) return null;
+      return resp.blob().then(function(b) { return b.size ? { blob: b, total: b.size, cached: true } : null; });
+    }).catch(function(err) {
+      console.warn('[SpatialViewer] layer cache read failed:', err && err.message || err);
+      return null;
+    });
+  };
+
+  // Stores a downloaded layer and removes the older versions of the same file.
+  SpatialViewerApp.prototype._layerCachePut = function(url, blob, contentType) {
+    if (!layerCacheUsable(url) || !blob || !blob.size) return;
+    var key = layerCacheKey(url), path = new URL(key).pathname;
+    caches.open(LAYER_CACHE).then(function(c) {
+      return c.keys().then(function(reqs) {
+        return Promise.all(reqs.filter(function(r) {
+          return r.url !== key && new URL(r.url).pathname === path;
+        }).map(function(r) { return c.delete(r); }));
+      }).then(function() {
+        return c.put(key, new Response(blob, { headers: {
+          'Content-Type': contentType || 'application/octet-stream',
+          'X-SV-Cached-At': String(Date.now())
+        } }));
+      });
+    }).catch(function(err) {
+      // Quota exceeded or private mode: the viewer just keeps downloading.
+      console.warn('[SpatialViewer] layer cache write failed:', err && err.message || err);
+    });
+  };
+
+  // Once per page: drop entries that were not refreshed for a long time.
+  SpatialViewerApp.prototype._layerCachePrune = function() {
+    if (this._layerCachePruned || typeof caches === 'undefined' || !window.isSecureContext) return;
+    this._layerCachePruned = true;
+    var now = Date.now();
+    caches.open(LAYER_CACHE).then(function(c) {
+      return c.keys().then(function(reqs) {
+        return Promise.all(reqs.map(function(r) {
+          return c.match(r).then(function(resp) {
+            var at = resp && parseInt(resp.headers.get('X-SV-Cached-At'), 10);
+            if (!at || now - at > LAYER_CACHE_MAX_AGE_MS) return c.delete(r);
+          });
+        }));
+      });
+    }).catch(function() {});
+  };
+
+  // load3DModel's first step: a cached layer is handed to _downloadModel as if
+  // prefetched (no HEAD request, no size confirmation); otherwise HEAD as before.
+  SpatialViewerApp.prototype._probeLayer = function(url, preDone) {
+    var self = this;
+    if (preDone) return Promise.reject(new Error('prefetched'));
+    return this._layerCacheGet(url).then(function(hit) {
+      if (hit) {
+        self._prefetched = self._prefetched || {};
+        self._prefetched[url] = { promise: Promise.resolve(hit) };
+        throw new Error('prefetched');
+      }
+      return fetch(url, { method: 'HEAD', credentials: 'same-origin' });
+    });
+  };
+
   SpatialViewerApp.prototype._layerProg = function(id, patch) {
     if (id == null) return;
     this._layerProgress = this._layerProgress || {};
@@ -68,6 +150,7 @@
   SpatialViewerApp.prototype._prefetchLayers = function(queue) {
     var self = this;
     this._installLongTaskLog();
+    this._layerCachePrune();
     var warnBytes = (parseInt(this.container.dataset.maxModelMb, 10) || 250) * 1048576;
     this._prefetched = {};
     var todo = [];
@@ -101,7 +184,8 @@
     if (this._pfWorker) return this._pfWorker;
     var self = this;
     try {
-      var w = new Worker('/assets/openproject_spatial_viewer/prefetch_worker.js');
+      // bump ?v= when the worker changes: static assets are cached for a year
+      var w = new Worker('/assets/openproject_spatial_viewer/prefetch_worker.js?v=2');
       this._pfJobs = {};
       w.onmessage = function(e) {
         var m = e.data || {}, job = self._pfJobs[m.id];
@@ -112,6 +196,7 @@
           delete self._pfJobs[m.id];
           if (job.gen !== self._loadGen) { job.entry.resolve(null); job.finish(); return; }
           self._layerProg(job.l.id, { state: 'ready', loaded: m.blob.size, total: m.blob.size });
+          self._layerCachePut(job.l.url, m.blob, m.contentType);
           job.entry.resolve({ blob: m.blob, total: m.total });
           job.finish();
         } else if (m.type === 'fail') {
@@ -130,6 +215,15 @@
   };
 
   SpatialViewerApp.prototype._prefetchOne = function(l, entry, gen) {
+    var self = this;
+    return this._layerCacheGet(l.url).then(function(hit) {
+      if (!hit) return self._prefetchOneNetwork(l, entry, gen);
+      if (gen === self._loadGen) self._layerProg(l.id, { state: 'ready', loaded: hit.total, total: hit.total });
+      entry.resolve(hit);
+    });
+  };
+
+  SpatialViewerApp.prototype._prefetchOneNetwork = function(l, entry, gen) {
     var self = this, w = this._prefetchWorker();
     if (!w) return this._prefetchOneMain(l, entry, gen);
     return new Promise(function(finish) {
@@ -168,6 +262,7 @@
         var blob = new Blob(chunks); chunks.length = 0;
         if (gen !== self._loadGen) { entry.resolve(null); return; }
         self._layerProg(l.id, { state: 'ready', loaded: blob.size, total: blob.size });
+        self._layerCachePut(l.url, blob, ct);
         entry.resolve({ blob: blob, total: total });
       });
     }).catch(function(err) {
